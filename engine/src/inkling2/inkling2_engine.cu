@@ -207,40 +207,21 @@ struct PhysLayer {
     std::vector<double> score;           // [n_expert]
 };
 
-struct Model {
-    std::unique_ptr<strata::GgufModel> gguf;
-    Hparams hp;
-    int main_device = 0;
-    int split_device = -1;     // < 0: the unchanged single-device placement
-
-    int layer_device(int ip) const {
-        return split_device >= 0 && hp.num_loops > 1 && ip >= hp.core_start && ip < hp.core_end
-                   ? split_device : main_device;
-    }
-
-    const uint8_t* host_tok_embd = nullptr;    // [vocab_padded, n_embd] on host (mmap)
-    int tok_embd_type = -1;
-    size_t tok_embd_row_bytes = 0;
-    float* tok_embd_norm = nullptr;
-    float* loop_res_query = nullptr;
-    float* loop_kv_res_query = nullptr;
-    float* output_res_query = nullptr;
-    float* output_norm = nullptr;
-    DenseMat output_weight;                    // [vocab_unpadded, n_embd] in VRAM
+struct GpuWeightStore {
     bool has_quant_dense = false;
-
-    std::vector<PhysLayer> layers;
     struct Allocation { void* p; int device; };
     std::vector<Allocation> gpu_allocs;
     std::vector<void*> host_allocs;
     std::vector<void*> host_pinned_allocs;
     std::vector<void*> q8_packed_keys;
 
-    ~Model() {
+    virtual ~GpuWeightStore() = default;
+    void free_store() {
         for (void* p : q8_packed_keys) K::native_q8_0_packed_unregister(p);
         for (const auto& a : gpu_allocs) { DeviceScope owner(a.device); cudaFree(a.p); }
         for (void* p : host_pinned_allocs) cudaFreeHost(p);
         for (void* p : host_allocs) std::free(p);
+        q8_packed_keys.clear(); gpu_allocs.clear(); host_pinned_allocs.clear(); host_allocs.clear();
     }
 
     template <typename T>
@@ -257,12 +238,7 @@ struct Model {
         gpu_allocs.push_back({p, device});
     }
 
-    const uint8_t* find_tensor(const char* name, const strata::TensorInfo** out = nullptr) const {
-        size_t shard = 0;
-        const strata::TensorInfo* t = gguf->find(name, &shard);
-        if (out) *out = t;
-        return t ? gguf->shard(shard).tensor_data(*t) : nullptr;
-    }
+    virtual const uint8_t* find_tensor(const char* name, const strata::TensorInfo** out = nullptr) const = 0;
 
     float* upload_f32(const char* name, size_t expected_elems = 0) {
         const strata::TensorInfo* t = nullptr;
@@ -338,6 +314,54 @@ struct Model {
         return DenseMat{(int) t->type, ne0, ne1, d, bytes};
     }
 };
+
+
+struct Model : GpuWeightStore {
+    std::unique_ptr<strata::GgufModel> gguf;
+    Hparams hp;
+    int main_device = 0;
+    int split_device = -1;     // < 0: the unchanged single-device placement
+
+    int layer_device(int ip) const {
+        return split_device >= 0 && hp.num_loops > 1 && ip >= hp.core_start && ip < hp.core_end
+                   ? split_device : main_device;
+    }
+
+    const uint8_t* host_tok_embd = nullptr;    // [vocab_padded, n_embd] on host (mmap)
+    int tok_embd_type = -1;
+    size_t tok_embd_row_bytes = 0;
+    float* tok_embd_norm = nullptr;
+    float* loop_res_query = nullptr;
+    float* loop_kv_res_query = nullptr;
+    float* output_res_query = nullptr;
+    float* output_norm = nullptr;
+    DenseMat output_weight;                    // [vocab_unpadded, n_embd] in VRAM
+
+    std::vector<PhysLayer> layers;
+    ~Model() override { free_store(); }
+
+    const uint8_t* find_tensor(const char* name, const strata::TensorInfo** out = nullptr) const override {
+        size_t shard = 0;
+        const strata::TensorInfo* t = gguf->find(name, &shard);
+        if (out) *out = t;
+        return t ? gguf->shard(shard).tensor_data(*t) : nullptr;
+    }
+
+    void dequant_tok(int32_t tok, float* dst) const {
+        const int N = (int) hp.n_embd;
+        const uint8_t* row = host_tok_embd + (size_t) tok * tok_embd_row_bytes;
+        if (tok_embd_type == 30) {
+            const uint16_t* bf = (const uint16_t*) row;
+            for (int i = 0; i < N; ++i) {
+                uint32_t u = (uint32_t) bf[i] << 16;
+                std::memcpy(&dst[i], &u, 4);
+            }
+        } else if (tok_embd_type == 0) std::memcpy(dst, row, (size_t) N * sizeof(float));
+        else strata::quant::dequant_row((strata::quant::Type) tok_embd_type, row, dst, N);
+    }
+};
+
+#include "inkling2_dspark.cuh"
 
 void build_expert_blob(const PhysLayer& L, int64_t e, uint8_t* dst) {
     const int64_t n_ff = L.L.n_ff, n_embd = L.L.n_embd;
@@ -690,6 +714,18 @@ struct Engine {
     std::vector<int> kv_cap;
     std::vector<float*> conv_hist;   // [48][n_sconv_channels * 3]
 
+    // DSpark is allocated on the outer/head device; the core only captures its local taps/undo state.
+    DsparkEngine* dspark = nullptr;
+    int verify_max_t = 1;
+    size_t layer_conv_floats = 0, local_conv_floats = 0;
+    std::vector<int> trace_slot;
+    SwaLayerPtrs swa_ptrs{};
+    int swa_ring_cap = 0;
+    uint8_t* swa_bak = nullptr;
+    float* d_conv_trace = nullptr;
+    float* d_tgt_feat[4] = {};
+    float* split_features = nullptr;   // portable host staging for the two core taps
+
     // Activation scratch (all allocated up to tmax rows)
     float *cur = nullptr, *ffn_inp = nullptr;
     float *in_q = nullptr, *in_k = nullptr, *in_v = nullptr, *in_ffn = nullptr;
@@ -814,6 +850,8 @@ struct Engine {
     // Cached decode CUDA Graph for the contiguous 36-layer core (il = 6..41) when blk.6..17 are 100% in VRAM,
     // plus per-layer pre-route graphs (attn + mix + ffn_norm + route).
     cudaGraphExec_t core_graph = nullptr;
+    cudaGraphExec_t capture_core_graph = nullptr;  // T=1 with DSpark feature taps
+    cudaGraphExec_t verify_core_graph = nullptr;   // fixed verify_max_t, feature taps and conv trace
     std::vector<cudaGraphExec_t> layer_pre_graph;
     bool core_all_gpu = false;
     bool split_core_graph = false;     // opt-in for the Core runtime; All keeps its existing graph policy
@@ -823,6 +861,7 @@ struct Engine {
     struct StateCheckpoint {
         std::vector<int32_t> tokens;
         std::vector<uint8_t> data;
+        std::vector<uint8_t> dspark_data;
     };
 
     StateCheckpoint save_checkpoint(const std::vector<int32_t>& tokens) {
@@ -861,6 +900,11 @@ struct Engine {
                 pull(lane.vc[(size_t) il], cap * (size_t) hp.kv_dim * sizeof(__half));
             }
         }
+        if (dspark && role != Role::Core) {
+            DeviceScope owner(device);
+            cp.dspark_data.resize(dspark->checkpoint_bytes());
+            dspark->save_checkpoint(cp.dspark_data.data(), st);
+        }
         { DeviceScope owner(device); CK(cudaStreamSynchronize(st)); }
         if (split_peer) { DeviceScope owner(split_peer->device); CK(cudaStreamSynchronize(split_peer->st)); }
         return cp;
@@ -893,6 +937,10 @@ struct Engine {
             }
         }
         pos = (int64_t) cp.tokens.size();
+        if (dspark && role != Role::Core && !cp.dspark_data.empty()) {
+            DeviceScope owner(device);
+            dspark->restore_checkpoint(cp.dspark_data.data(), (int) pos, st);
+        }
         if (split_peer) {
             split_peer->pos = pos;
             { DeviceScope owner(device); CK(cudaStreamSynchronize(st)); }
@@ -903,6 +951,8 @@ struct Engine {
     ~Engine() {
         DeviceScope owner(device);
         if (core_graph) cudaGraphExecDestroy(core_graph);
+        if (capture_core_graph) cudaGraphExecDestroy(capture_core_graph);
+        if (verify_core_graph) cudaGraphExecDestroy(verify_core_graph);
         for (auto g : layer_pre_graph) if (g) cudaGraphExecDestroy(g);
         for (auto* p : kc) cudaFree(p);
         for (auto* p : vc) cudaFree(p);
@@ -911,6 +961,9 @@ struct Engine {
         for (auto* p : ks) cudaFree(p);
         for (auto* p : vs) cudaFree(p);
         for (auto* p : conv_hist) cudaFree(p);
+        cudaFree(swa_bak); cudaFree(d_conv_trace);
+        for (auto* p : d_tgt_feat) cudaFree(p);
+        cudaFreeHost(split_features);
         for (auto* p : norm_blk_buf) cudaFree(p);
         cudaFree(prelude_cur_buf);
         cudaFree(norm_cur);
@@ -946,21 +999,24 @@ struct Engine {
         if (st) cudaStreamDestroy(st);
     }
 
-    bool init(Model& model, int max_ctx, int max_t, bool use_kv_q8, std::string& err) {
+    bool init(Model& model, int max_ctx, int max_t, bool use_kv_q8, std::string& err,
+              int max_verify_t = 1, bool draft_quant = false, int draft_ff = 0) {
         m = &model;
         if (device < 0) CK(cudaGetDevice(&device));
         DeviceScope owner(device);
         ctx = max_ctx;
-        tmax = max_t;
+        verify_max_t = std::max(1, max_verify_t);
+        tmax = std::max(max_t, verify_max_t);
         kv_q8 = use_kv_q8;
         const auto& hp = m->hp;
         const int64_t N = hp.n_embd;
+        const int64_t projection_in = std::max<int64_t>(2 * N, draft_ff);
 
         CK(cudaStreamCreate(&st));
         CKB(cublasCreate(&blas));
         CKB(cublasSetStream(blas, st));
         gemm = std::make_unique<strata::prefill::Gemm>();
-        if (!gemm->init(st, m->has_quant_dense ? (size_t) (8 * 1024 * 1024) : 4096, err)) return false;
+        if (!gemm->init(st, m->has_quant_dense || draft_quant ? (size_t) (8 * 1024 * 1024) : 4096, err)) return false;
 
         // Allocate KV caches & recurrent history per virtual layer
         layer_pre_graph.assign((size_t) hp.n_layer, nullptr);
@@ -973,10 +1029,16 @@ struct Engine {
         vs.resize((size_t) hp.n_layer, nullptr);
         kv_cap.resize((size_t) hp.n_layer);
         conv_hist.resize((size_t) hp.n_layer);
+        layer_conv_floats = (size_t) hp.n_sconv_channels() * 3;
+        trace_slot.assign((size_t) hp.n_layer, -1);
         for (int il = 0; il < hp.n_layer; ++il) {
-            const int cap = hp.is_swa(il) ? (int) hp.n_swa : ctx;
+            // All T rows are stored before attention. Keep the union needed by the earliest
+            // and latest query: window + T - 1 positions, while attention still uses window.
+            const int cap = hp.is_swa(il) ? (int) hp.n_swa + tmax - 1 : ctx;
             kv_cap[(size_t) il] = cap;
             if (!owns_virtual(il)) continue;
+            trace_slot[(size_t) il] = (int) (local_conv_floats / layer_conv_floats);
+            local_conv_floats += layer_conv_floats;
             if (kv_q8) {
                 CK(cudaMalloc(&kq[(size_t) il], (size_t) cap * hp.kv_dim * sizeof(int8_t)));
                 CK(cudaMalloc(&vq[(size_t) il], (size_t) cap * hp.kv_dim * sizeof(int8_t)));
@@ -1031,12 +1093,12 @@ struct Engine {
         d_f32(&ewts, (size_t) max_ent);
         d_f32(&eparts, (size_t) max_ent * N);
         d_f32(&moe_raw, (size_t) tmax * N);
-        d_f32(&logits, (size_t) hp.vocab_unpadded);
+        d_f32(&logits, (size_t) verify_max_t * hp.vocab_unpadded);
 
         CK(cudaMallocHost(&h_tok_buf, (size_t) tmax * N * sizeof(float)));
-        CK(cudaMalloc(&act_bf16, (size_t) tmax * 2 * N * sizeof(uint16_t)));
+        CK(cudaMalloc(&act_bf16, (size_t) tmax * projection_in * sizeof(uint16_t)));
 
-        CK(cudaMalloc(&xq, (size_t) tmax * ((2 * N) / 32) * 36));
+        CK(cudaMalloc(&xq, (size_t) tmax * (projection_in / 32) * 36));
         CK(cudaMalloc(&xq_k, (size_t) tmax * ((2 * N) / 32) * 36));
         CK(cudaMalloc(&xq_v, (size_t) tmax * ((2 * N) / 32) * 36));
         CK(cudaMalloc(&escr, K::native_expert_scratch_bytes(max_ent, hp.n_ff)));
@@ -1085,6 +1147,59 @@ struct Engine {
             CK(cudaMemsetAsync(conv_hist[(size_t) il], 0, (size_t) m->hp.n_sconv_channels() * 3 * sizeof(float), st));
         }
         if (role == Role::Outer && split_peer) split_peer->reset_state();
+        if (dspark && role != Role::Core) dspark->reset(st);
+    }
+
+    void enable_dspark(DsparkEngine* draft) {
+        DeviceScope owner(device);
+        dspark = draft;
+        for (auto& p : d_tgt_feat) CK(cudaMalloc(&p, (size_t) tmax * m->hp.n_embd * sizeof(float)));
+        CK(cudaMalloc(&d_conv_trace, (size_t) verify_max_t * local_conv_floats * sizeof(float)));
+        for (int il = 0; il < m->hp.n_layer; ++il) if (owns_virtual(il) && m->hp.is_swa(il)) {
+            const int s = swa_ptrs.n_swa_layers++;
+            swa_ptrs.kq[s] = kq[(size_t) il]; swa_ptrs.vq[s] = vq[(size_t) il];
+            swa_ptrs.ks[s] = ks[(size_t) il]; swa_ptrs.vs[s] = vs[(size_t) il];
+            swa_ptrs.kc[s] = kc[(size_t) il]; swa_ptrs.vc[s] = vc[(size_t) il];
+            swa_ring_cap = kv_cap[(size_t) il];
+        }
+        const size_t slot_bytes = (size_t) m->hp.kv_dim * 2 * (kv_q8 ? 1 : sizeof(__half)) +
+                                 (kv_q8 ? (size_t) m->hp.n_head_kv * 2 * sizeof(__half) : 0);
+        if (swa_ptrs.n_swa_layers > 0)
+            CK(cudaMalloc(&swa_bak, (size_t) std::max(1, verify_max_t - 1) * swa_ptrs.n_swa_layers * slot_bytes));
+        if (role == Role::Outer)
+            CK(cudaHostAlloc(&split_features, (size_t) 2 * tmax * m->hp.n_embd * sizeof(float), cudaHostAllocPortable));
+    }
+
+    void backup_verify(int K) {
+        DeviceScope owner(device);
+        if (K <= 0 || !swa_bak) return;
+        if (kv_q8)
+            k_swa_q8_bak<<<dim3((unsigned) K, (unsigned) swa_ptrs.n_swa_layers), 256, 0, st>>>(
+                swa_ptrs, swa_bak, (int) m->hp.kv_dim, (int) m->hp.n_head_kv, swa_ring_cap, (int) pos + 1, 0, K, 0);
+        else
+            k_swa_f16_bak<<<dim3((unsigned) K, (unsigned) swa_ptrs.n_swa_layers), 256, 0, st>>>(
+                swa_ptrs, swa_bak, (int) m->hp.kv_dim, swa_ring_cap, (int) pos + 1, 0, K, 0);
+    }
+
+    void commit_verify(int accepted, int K, int pos_pre) {
+        DeviceScope owner(device);
+        if (accepted < K) {
+            for (int il = 0; il < m->hp.n_layer; ++il) if (owns_virtual(il))
+                CK(cudaMemcpyAsync(conv_hist[(size_t) il], d_conv_trace + (size_t) accepted * local_conv_floats +
+                                   (size_t) trace_slot[(size_t) il] * layer_conv_floats,
+                                   layer_conv_floats * sizeof(float), cudaMemcpyDeviceToDevice, st));
+            const int n = K - accepted;
+            if (swa_ptrs.n_swa_layers > 0) {
+                if (kv_q8)
+                    k_swa_q8_bak<<<dim3((unsigned) n, (unsigned) swa_ptrs.n_swa_layers), 256, 0, st>>>(
+                        swa_ptrs, swa_bak, (int) m->hp.kv_dim, (int) m->hp.n_head_kv, swa_ring_cap, pos_pre + 1, accepted, n, 1);
+                else
+                    k_swa_f16_bak<<<dim3((unsigned) n, (unsigned) swa_ptrs.n_swa_layers), 256, 0, st>>>(
+                        swa_ptrs, swa_bak, (int) m->hp.kv_dim, swa_ring_cap, pos_pre + 1, accepted, n, 1);
+            }
+        }
+        pos = pos_pre + 1 + accepted;
+        if (role == Role::Outer && split_peer) split_peer->commit_verify(accepted, K, pos_pre);
     }
 
     void prep_q8(const float* X, void* q8_buf, int T, int64_t K_in) {
@@ -1491,6 +1606,7 @@ struct Engine {
         int T = 0;
         int next_blk_buf = 0;
         bool pp_prepared = false;
+        bool capture_dspark = false, save_conv_trace = false;
         std::vector<float*> norm_blocks, prelude_norm_blocks, norm_bank;
     };
 
@@ -1533,6 +1649,7 @@ struct Engine {
         const int N = (int) hp.n_embd;
         const int64_t kv_dim = hp.kv_dim, q_dim = hp.q_dim;
         const int64_t n_core = hp.num_loops > 1 ? hp.core_end - hp.core_start : 0;
+        const bool save_conv_trace = state.save_conv_trace;
         auto& norm_blocks = state.norm_blocks;
         int& next_blk_buf = state.next_blk_buf;
         auto push_block = [&](const float* src) {
@@ -1586,6 +1703,10 @@ struct Engine {
 
             const float* ink_src = in_k;
             const float* inv_src = in_v;
+            if (state.capture_dspark && dspark) {
+                for (int ti = 0; ti < 3; ++ti) if (il == dspark->dm->hp.target_layers[(size_t) ti])
+                    CK(cudaMemcpyAsync(d_tgt_feat[ti], cur, (size_t) T * N * sizeof(float), cudaMemcpyDeviceToDevice, st));
+            }
             if (L.attn_res_query) {
                 float* outs[3] = {in_q, in_k, in_v};
                 run_mix_normed(norm_blocks, cur, false, L.attn_res_query, outs, is_swa ? 1 : 3, T, is_swa ? 1 : 0);
@@ -1685,8 +1806,12 @@ struct Engine {
             }
 
             float* hst = conv_hist[(size_t) il];
+            float* h_tr = save_conv_trace ? d_conv_trace + (size_t) trace_slot[(size_t) il] * layer_conv_floats : nullptr;
             if (prof_detail) { CK(cudaStreamSynchronize(st)); p_d_qkv += ms_since(tp_d1); }
             const auto tp_d2 = Clock::now();
+            if (save_conv_trace)
+                k_shortconv_kv_trace<<<(unsigned) ((2 * kv_dim + 255) / 256), 256, 0, st>>>(
+                    pK, pV, hst, (int) kv_dim, T, h_tr, local_conv_floats);
             k_shortconv_kv<<<(unsigned) ((2 * kv_dim + 255) / 256), 256, 0, st>>>(
                 pK, pV, L.attn_k_conv, L.attn_v_conv, is_swa ? nullptr : pDynK, is_swa ? nullptr : pDynV,
                 hst, K_conv, V_conv, (int) kv_dim, (int) hp.n_head_kv, T);
@@ -1743,6 +1868,9 @@ struct Engine {
             }
             project(att, L.attn_output, wo, T, N, q_dim);
             const bool do_push = (ip % hp.attn_res_block_size == 0);
+            if (save_conv_trace)
+                k_shortconv_trace<<<(unsigned) ((N + 255) / 256), 256, 0, st>>>(
+                    wo, hst, N, 2 * (int) kv_dim, T, h_tr, local_conv_floats);
             k_shortconv<<<(unsigned) ((N + 255) / 256), 256, 0, st>>>(wo, L.attn_post_conv, nullptr, hst, ffn_inp, N, 2 * (int) kv_dim, 0, T, do_push ? nullptr : cur);
             if (do_push) push_block(cur);
 
@@ -1777,9 +1905,13 @@ struct Engine {
             const int ip = hp.loop_layer(il);
             PhysLayer& L = m->layers[(size_t) ip];
             float* hst = conv_hist[(size_t) il];
+            float* h_tr = save_conv_trace ? d_conv_trace + (size_t) trace_slot[(size_t) il] * layer_conv_floats : nullptr;
             const bool is_hy = (L.n_slots < hp.n_expert);
             run_moe(L, il, in_ffn, T);
             const auto tp_mp0 = Clock::now();
+            if (save_conv_trace)
+                k_shortconv_trace<<<(unsigned) ((N + 255) / 256), 256, 0, st>>>(
+                    moe_raw, hst, N, 2 * (int) kv_dim + N, T, h_tr, local_conv_floats);
             k_shortconv<<<(unsigned) ((N + 255) / 256), 256, 0, st>>>(moe_raw, L.ffn_post_conv, nullptr, hst, cur, N, 2 * (int) kv_dim + N, 0, T, ffn_inp);
             if (prof) {
                 CK(cudaStreamSynchronize(st));
@@ -1800,8 +1932,10 @@ struct Engine {
                 std::exit(1);
             }
             const bool core_graph_allowed = role == Role::All || (role == Role::Core && split_core_graph);
-            if (core_graph_allowed && T == 1 && core_all_gpu && !prof_detail && il == hp.core_start && n_core > 0) {
-                if (!core_graph) {
+            const bool graph_shape = T == 1 || (T == verify_max_t && state.capture_dspark && save_conv_trace);
+            if (core_graph_allowed && graph_shape && core_all_gpu && !prof_detail && il == hp.core_start && n_core > 0) {
+                cudaGraphExec_t& cg = T != 1 ? verify_core_graph : (state.capture_dspark ? capture_core_graph : core_graph);
+                if (!cg) {
                     cudaGraph_t g = nullptr;
                     auto graph_check = [&](cudaError_t status, const char* phase) {
                         if (status != cudaSuccess && role == Role::Core)
@@ -1815,20 +1949,20 @@ struct Engine {
                         run_layer_post(cl);
                     }
                     graph_check(cudaStreamEndCapture(st, &g), "end capture");
-                    graph_check(cudaGraphInstantiate(&core_graph, g, nullptr, nullptr, 0), "instantiate");
+                    graph_check(cudaGraphInstantiate(&cg, g, nullptr, nullptr, 0), "instantiate");
                     CK(cudaGraphDestroy(g));
                 } else {
                     norm_blocks = {norm_blk_buf[0], norm_blk_buf[5], norm_blk_buf[6]};
                     next_blk_buf = 7;
                 }
                 const auto tp_cg0 = Clock::now();
-                CK(cudaGraphLaunch(core_graph, st));
+                CK(cudaGraphLaunch(cg, st));
                 if (prof) { CK(cudaStreamSynchronize(st)); p_core_ms += ms_since(tp_cg0); }
                 il = core_end_virt - 1;
                 continue;
             }
             const bool is_outer = (il < hp.core_start || il >= core_end_virt);
-            const bool use_pre_graph = (role == Role::All && T == 1 && hybrid && !prof_detail && !pp_streaming);
+            const bool use_pre_graph = (role == Role::All && T == 1 && hybrid && !prof_detail && !pp_streaming && !state.capture_dspark);
             const auto tp_ly0 = Clock::now();
             if (use_pre_graph && (layer_pre_graph[(size_t) il] || !graph_oom)) {
                 if (!layer_pre_graph[(size_t) il]) {
@@ -1874,7 +2008,8 @@ struct Engine {
 
     }
 
-    int32_t finish_head(ForwardState& state, bool copy_logits, std::vector<float>* out_logits) {
+    int32_t finish_head(ForwardState& state, bool copy_logits, std::vector<float>* out_logits,
+                        bool all_row_logits = false, std::vector<int32_t>* out_picks = nullptr) {
         DeviceScope owner(device);
         const int T = state.T;
         const auto& hp = m->hp;
@@ -1885,18 +2020,23 @@ struct Engine {
         float* out_head[1] = {in_ffn};
         run_mix_normed(norm_blocks, cur, false, m->output_res_query, out_head, 1, T, 0);
         k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(in_ffn, m->output_norm, cur, N, hp.rms_eps);
-        // Only compute logits for the last row unless needed? Actually compute all if small or last row:
-        const float* last_h = cur + (size_t) (T - 1) * N;
-        project(last_h, m->output_weight, logits, 1, hp.vocab_unpadded, N);
-        k_softcap<<<(unsigned) ((hp.vocab_unpadded + 255) / 256), 256, 0, st>>>(logits, hp.vocab_unpadded, hp.softcap);
-        k_argmax<<<1, 256, 0, st>>>(logits, pick_d, (int) hp.vocab_unpadded);
-        int32_t next_id = 0;
+        if (state.capture_dspark && dspark)
+            CK(cudaMemcpyAsync(d_tgt_feat[3], cur, (size_t) T * N * sizeof(float), cudaMemcpyDeviceToDevice, st));
+        const int rows = all_row_logits || out_picks ? T : 1;
+        const float* head_h = rows == T ? cur : cur + (size_t) (T - 1) * N;
+        project(head_h, m->output_weight, logits, rows, hp.vocab_unpadded, N);
+        const int64_t total_logits = (int64_t) rows * hp.vocab_unpadded;
+        k_softcap<<<(unsigned) ((total_logits + 255) / 256), 256, 0, st>>>(logits, total_logits, hp.softcap);
+        k_argmax<<<(unsigned) rows, 256, 0, st>>>(logits, pick_d, (int) hp.vocab_unpadded);
+        std::vector<int32_t> picks((size_t) rows);
         if (copy_logits && out_logits) {
-            out_logits->resize((size_t) hp.vocab_unpadded);
-            CK(cudaMemcpyAsync(out_logits->data(), logits, (size_t) hp.vocab_unpadded * sizeof(float), cudaMemcpyDeviceToHost, st));
+            out_logits->resize((size_t) total_logits);
+            CK(cudaMemcpyAsync(out_logits->data(), logits, (size_t) total_logits * sizeof(float), cudaMemcpyDeviceToHost, st));
         }
-        CK(cudaMemcpyAsync(&next_id, pick_d, sizeof(int32_t), cudaMemcpyDeviceToHost, st));
+        CK(cudaMemcpyAsync(picks.data(), pick_d, (size_t) rows * sizeof(int32_t), cudaMemcpyDeviceToHost, st));
         CK(cudaStreamSynchronize(st));
+        if (out_picks) *out_picks = picks;
+        const int32_t next_id = picks.back();
         if (prof) p_head_ms += ms_since(tp_h0);
         pos += T;
         return next_id;
@@ -1929,9 +2069,16 @@ struct Engine {
             CK(cudaMemcpyAsync(host, cur, elems * sizeof(float), cudaMemcpyDeviceToHost, st));
             for (size_t i = 0; i < block_ids.size(); ++i)
                 CK(cudaMemcpyAsync(host + (i + 1) * elems, norm_blk_buf[block_ids[i]], elems * sizeof(float), cudaMemcpyDeviceToHost, st));
+            if (role == Role::Core && source.capture_dspark && dspark) {
+                float* features = destination.split_features;
+                for (int i = 0; i < 2; ++i)
+                    CK(cudaMemcpyAsync(features + (size_t) i * elems, d_tgt_feat[i + 1], elems * sizeof(float), cudaMemcpyDeviceToHost, st));
+            }
             CK(cudaStreamSynchronize(st));
         }
         target.T = T;
+        target.capture_dspark = source.capture_dspark;
+        target.save_conv_trace = source.save_conv_trace;
         target.next_blk_buf = source.next_blk_buf;
         target.norm_blocks.clear();
         // Prelude/bank data only lives inside the core range; both boundaries are outside it.
@@ -1948,11 +2095,26 @@ struct Engine {
             }
             const int32_t pos32 = (int32_t) pos;
             CK(cudaMemcpyAsync(destination.pos0_d, &pos32, sizeof pos32, cudaMemcpyHostToDevice, destination.st));
+            if (role == Role::Core && source.capture_dspark && dspark) {
+                for (int i = 0; i < 2; ++i)
+                    CK(cudaMemcpyAsync(destination.d_tgt_feat[i + 1], destination.split_features + (size_t) i * elems,
+                                       elems * sizeof(float), cudaMemcpyHostToDevice, destination.st));
+            }
             CK(cudaStreamSynchronize(destination.st));
         }
     }
 
-    int32_t forward(const int32_t* tokens, int T, bool copy_logits = false, std::vector<float>* out_logits = nullptr) {
+    int32_t forward(const int32_t* tokens, int T, bool copy_logits = false, std::vector<float>* out_logits = nullptr,
+                    bool all_row_logits = false, bool capture_dspark = false, int verify_k_save = 0,
+                    std::vector<int32_t>* out_picks = nullptr) {
+        if (T <= 0 || T > tmax || pos < 0 || pos + T > ctx || ((all_row_logits || out_picks) && T > verify_max_t) ||
+            (verify_k_save > 0 && (!dspark || verify_k_save != T - 1 || T > verify_max_t))) {
+            std::fprintf(stderr, "strata-inkling2: invalid forward/verify extent\n"); std::exit(1);
+        }
+        if (verify_k_save > 0) {
+            backup_verify(verify_k_save);
+            if (role == Role::Outer && split_peer) split_peer->backup_verify(verify_k_save);
+        }
         if (role == Role::Outer && split_peer) {
             split_peer->prof = prof;
             split_peer->prof_detail = prof_detail;
@@ -1960,6 +2122,8 @@ struct Engine {
         }
         ForwardState state;
         begin_forward(tokens, T, state);
+        state.capture_dspark = capture_dspark;
+        state.save_conv_trace = verify_k_save > 0;
         if (role == Role::Outer && split_peer) {
             const int begin = (int) m->hp.core_start;
             const int end = (int) (m->hp.core_start + m->hp.num_loops * (m->hp.core_end - m->hp.core_start));
@@ -1972,7 +2136,7 @@ struct Engine {
         } else {
             run_layers(state, 0, (int) m->hp.n_layer);
         }
-        const int32_t next = finish_head(state, copy_logits, out_logits);
+        const int32_t next = finish_head(state, copy_logits, out_logits, all_row_logits, out_picks);
         if (role == Role::Outer && split_peer) split_peer->pos = pos;
         return next;
     }
@@ -2220,10 +2384,211 @@ std::vector<int32_t> parse_id_list(const std::string& s) {
 }
 
 
+/// Shared autoregressive / DSpark speculative decode loop for both `--serve` and `--bench`/CLI.
+template <typename EmitFn, typename StopCheckFn>
+void decode_tokens_loop(Engine& E, DsparkEngine* dspark, int draft_max, int32_t first_tok, int limit,
+                        const SamplingParams& smp, std::mt19937_64& rng,
+                        std::vector<int32_t>& hist, std::vector<int32_t>& live_tokens,
+                        EmitFn&& on_emit, StopCheckFn&& is_stopped, bool* out_hit_eos = nullptr) {
+    const int V = (int) E.m->hp.vocab_unpadded;
+    const bool sample_on = smp.needs_logits();
+    int32_t next_tok = first_tok;
+    int emitted = 0;
+    std::vector<float> lg;
+    std::vector<int32_t> d_toks, vtoks, t_picks;
+    std::vector<std::vector<float>> d_logits;
+    std::vector<SamplingDist> q_dists;
+    if (out_hit_eos) *out_hit_eos = false;
+
+    auto feed_single = [&](int32_t tok) {
+        const int pos_pre = (int) E.pos;
+        next_tok = E.forward(&tok, 1, sample_on, &lg, false, dspark != nullptr, 0, nullptr);
+        live_tokens.push_back(tok);
+        if (dspark) dspark->inject(E, pos_pre, 1);
+        if (sample_on) next_tok = sample_logits(lg, hist, smp, rng);
+    };
+
+    while (emitted < limit && !is_stopped()) {
+        if (!on_emit(next_tok)) {
+            if (out_hit_eos) *out_hit_eos = true;
+            ++emitted;
+            break;
+        }
+        ++emitted;
+        const int rem = limit - emitted;
+        if (rem <= 0 || is_stopped()) break;
+
+        if (!dspark || rem < 2 || draft_max < 1) {
+            feed_single(next_tok);
+            if (E.any_hybrid() && (emitted % 8 == 0)) E.rebalance(E.core_all_gpu ? 4 : 6);
+            continue;
+        }
+
+        const int K = std::min(draft_max, rem - 1);
+        const int32_t anchor = next_tok;
+        if (sample_on) {
+            q_dists.resize((size_t) K);
+            dspark->draft(E, anchor, K, d_toks, &d_logits, [&](int step_i, std::vector<float>& row_lg) {
+                std::vector<int32_t> tmp_hist = hist;
+                tmp_hist.insert(tmp_hist.end(), d_toks.begin(), d_toks.begin() + step_i);
+                q_dists[(size_t) step_i] = build_sampling_dist(row_lg.data(), V, tmp_hist, smp);
+                return sample_from_dist(q_dists[(size_t) step_i], rng);
+            });
+        } else {
+            dspark->draft(E, anchor, K, d_toks, nullptr, [&](int, std::vector<float>&) -> int32_t { return 0; });
+        }
+
+        if (is_stopped()) break;   // no target state was advanced by drafting
+
+        vtoks.resize((size_t) (1 + K));
+        vtoks[0] = anchor;
+        for (int i = 0; i < K; ++i) vtoks[(size_t) (1 + i)] = d_toks[(size_t) i];
+
+        const int pos_pre = (int) E.pos;
+        lg.clear();
+        E.forward(vtoks.data(), 1 + K, sample_on, &lg, sample_on, true, K, &t_picks);
+
+        int m = 0;
+        bool hit_eos = false;
+        if (!sample_on) {
+            int matching = 0;
+            while (matching < K && t_picks[(size_t) matching] == d_toks[(size_t) matching]) ++matching;
+            for (int j = 0; j < matching && !is_stopped(); ++j) {
+                ++m;
+                if (!on_emit(d_toks[(size_t) j])) { hit_eos = true; break; }
+            }
+            if (!hit_eos && !is_stopped()) next_tok = t_picks[(size_t) m];
+        } else {
+            bool rejected = false;
+            for (int r = 0; r < K && !is_stopped(); ++r) {
+                const SamplingDist p_r = build_sampling_dist(lg.data() + (size_t) r * V, V, hist, smp);
+                const double p_x = p_r.prob_of(d_toks[(size_t) r]);
+                const double q_x = q_dists[(size_t) r].prob_of(d_toks[(size_t) r]);
+                const double u = std::uniform_real_distribution<double>(0.0, 1.0)(rng);
+                if (u * (double) q_x <= (double) p_x) {
+                    ++m;
+                    if (!on_emit(d_toks[(size_t) r])) {
+                        hit_eos = true;
+                        break;
+                    }
+                } else {
+                    next_tok = sample_residual_dist(p_r, q_dists[(size_t) r], rng);
+                    rejected = true;
+                    break;
+                }
+            }
+            if (!rejected && !hit_eos && !is_stopped()) {
+                const SamplingDist p_last = build_sampling_dist(lg.data() + (size_t) K * V, V, hist, smp);
+                next_tok = sample_from_dist(p_last, rng);
+            }
+        }
+
+        emitted += m;
+        E.commit_verify(m, K, pos_pre);
+        for (int i = 0; i < 1 + m; ++i) live_tokens.push_back(vtoks[(size_t) i]);
+        dspark->n_accepted += m;
+        dspark->inject(E, pos_pre, 1 + m);
+        if (is_stopped()) break;
+        if (hit_eos) {
+            if (out_hit_eos) *out_hit_eos = true;
+            break;
+        }
+        if (E.any_hybrid() && (emitted % 8 < (1 + m))) E.rebalance(E.core_all_gpu ? 4 : 6);
+    }
+}
+
+
+// Opt-in diagnostic only. The prefix is reconstructed with the original prompt chunking
+// followed by the requested singleton tail. The draft is loaded but never runs draft/inject.
+int verify_row0_oracle(Engine& E, const std::vector<int32_t>& prefix, const std::vector<int32_t>& tail,
+                      int force_t1, int chunk) {
+    if (!E.dspark || E.verify_max_t < 8 || E.tmax < 8 || tail.size() != 8 ||
+        force_t1 < 0 || (size_t) force_t1 > prefix.size() || chunk <= 0 ||
+        prefix.size() + 8 > (size_t) E.ctx) {
+        std::fprintf(stderr, "strata-inkling2: row0 oracle needs --draft, --spec 7, eight --verify-row0-oracle IDs and a valid --oracle-force-t1 extent\n");
+        return 2;
+    }
+    const int V = (int) E.m->hp.vocab_unpadded;
+    for (int32_t tok : tail) if (tok < 0 || tok >= V) {
+        std::fprintf(stderr, "strata-inkling2: row0 oracle token outside vocabulary\n"); return 2;
+    }
+    E.reset_state();
+    const size_t prompt_end = prefix.size() - (size_t) force_t1;
+    for (size_t off = 0; off < prompt_end; off += (size_t) chunk) {
+        const int n = (int) std::min<size_t>((size_t) chunk, prompt_end - off);
+        E.forward(prefix.data() + off, n);
+    }
+    for (size_t off = prompt_end; off < prefix.size(); ++off) E.forward(prefix.data() + off, 1);
+    const auto checkpoint = E.save_checkpoint(prefix);
+    auto restore = [&] {
+        E.restore_checkpoint(checkpoint);
+        { DeviceScope owner(E.device); CK(cudaStreamSynchronize(E.st)); }
+        if (E.split_peer) { DeviceScope owner(E.split_peer->device); CK(cudaStreamSynchronize(E.split_peer->st)); }
+    };
+    auto number = [](double x) {
+        if (!std::isfinite(x)) return std::string("null");
+        char text[64]; std::snprintf(text, sizeof text, "%.17g", x); return std::string(text);
+    };
+    auto compare = [&](const char* kind, int T, const std::vector<float>& row, const std::vector<float>& reference) {
+        double max_abs = 0, sum = 0, diff_sq = 0, ref_sq = 0;
+        int nonfinite = 0, best = 0, second = -1;
+        for (int i = 0; i < V; ++i) {
+            const double a = row[(size_t) i], b = reference[(size_t) i];
+            if (!std::isfinite(a) || !std::isfinite(b)) { ++nonfinite; continue; }
+            const double d = a - b;
+            max_abs = std::max(max_abs, std::fabs(d)); sum += d; diff_sq += d * d; ref_sq += b * b;
+            if (i != best) {
+                if (a > row[(size_t) best]) { second = best; best = i; }
+                else if (second < 0 || a > row[(size_t) second]) second = i;
+            }
+        }
+        const double l_a = V > 150759 ? row[150759] : NAN;
+        const double l_b = V > 150078 ? row[150078] : NAN;
+        std::printf("{\"diagnostic\":\"verify_row0\",\"case\":\"%s\",\"T\":%d,\"pos\":%lld,\"argmax\":%d,\"runner_up\":%d,"
+                    "\"argmax_margin\":%s,\"max_abs\":%s,\"mean_delta\":%s,\"rms_delta\":%s,\"rel_l2\":%s,\"nonfinite\":%d,"
+                    "\"logit_150759\":%s,\"logit_150078\":%s,\"probe_margin\":%s}\n",
+                    kind, T, (long long) prefix.size(), best, second,
+                    number(second >= 0 ? (double) row[(size_t) best] - row[(size_t) second] : NAN).c_str(),
+                    number(max_abs).c_str(), number(sum / V).c_str(), number(std::sqrt(diff_sq / V)).c_str(),
+                    number(std::sqrt(diff_sq / (ref_sq + 1e-30))).c_str(), nonfinite,
+                    number(l_a).c_str(), number(l_b).c_str(), number(l_a - l_b).c_str());
+        std::fflush(stdout);
+    };
+    std::printf("{\"diagnostic\":\"verify_row0_setup\",\"prompt_chunk_rows\":%zu,\"forced_t1_rows\":%d,\"chunk\":%d,"
+                "\"anchor\":%d,\"draft_called\":false,\"inject_called\":false,\"commit_verify_called\":false}\n",
+                prompt_end, force_t1, chunk, tail[0]);
+    std::vector<float> baseline, batch8;
+    for (int T : {1, 2, 4, 8}) {
+        restore();
+        std::vector<float> logits;
+        // Trace/backup run exactly as in the verifier; no commit follows. Checkpoint restore
+        // supplies the same pre-anchor state independently for every batch shape.
+        E.forward(tail.data(), T, true, &logits, true, true, T - 1);
+        logits.resize((size_t) V);
+        if (T == 1) baseline = logits;
+        if (T == 8) batch8 = logits;
+        compare("batch_vs_T1", T, logits, baseline);
+    }
+    auto alternate = tail;
+    for (int i = 1; i < 8; ++i) alternate[(size_t) i] = (int32_t) ((tail[(size_t) i] + 7919ll * i) % V);
+    restore();
+    std::vector<float> logits;
+    E.forward(alternate.data(), 8, true, &logits, true, true, 7);
+    logits.resize((size_t) V);
+    compare("future_tail_vs_T8", 8, logits, batch8);
+    restore();
+    return 0;
+}
+
+
 }  // namespace
 
 int run(int argc, char** argv) {
     std::string model_path;
+    std::string draft_path;
+    std::string oracle_tail;
+    int oracle_force_t1 = 0;
+    int draft_max = 3;
     std::string tokens_str = "1,2";
     std::string dump_logits_path;
     int max_ctx = 65536;
@@ -2249,6 +2614,10 @@ int run(int argc, char** argv) {
             return argv[++i];
         };
         if (a == "--native" || a == "--model") model_path = next_arg();
+        else if (a == "--verify-row0-oracle") oracle_tail = next_arg();
+        else if (a == "--oracle-force-t1") oracle_force_t1 = std::atoi(next_arg());
+        else if (a == "--draft" || a == "--draft-model") draft_path = next_arg();
+        else if (a == "--spec" || a == "--draft-max") draft_max = std::clamp(std::atoi(next_arg()), 1, 7);
         else if (a == "--max-context") max_ctx = std::atoi(next_arg());
         else if (a == "--chunk" || a == "--prefill") chunk = std::atoi(next_arg());
         else if (a == "--max-new" || a == "-n") max_new = std::atoi(next_arg());
@@ -2276,12 +2645,19 @@ int run(int argc, char** argv) {
     }
 
     if (model_path.empty()) {
-        std::fprintf(stderr, "usage: strata-inkling2 --model <file.gguf> [--max-context N] [--kv-q8|--kv-f16] [--tokens IDS] [--max-new N] [--dump-logits PATH] [--layer-split-device N [--split-core-graph]] [--bench] [--serve]\n");
+        std::fprintf(stderr, "usage: strata-inkling2 --model <file.gguf> [--max-context N] [--kv-q8|--kv-f16] [--tokens IDS] [--max-new N] [--dump-logits PATH] [--layer-split-device N [--split-core-graph]] [--draft DRAFT.gguf --spec K] [--bench] [--serve]\n");
         return 2;
     }
     if (split_core_graph && layer_split_device < 0) {
         std::fprintf(stderr, "strata-inkling2: --split-core-graph requires --layer-split-device N\n");
         return 2;
+    }
+
+    if (oracle_tail.empty() && oracle_force_t1 != 0) {
+        std::fprintf(stderr, "strata-inkling2: --oracle-force-t1 needs --verify-row0-oracle\n"); return 2;
+    }
+    if (!oracle_tail.empty() && serve) {
+        std::fprintf(stderr, "strata-inkling2: --verify-row0-oracle is a standalone CLI diagnostic, not a serve mode\n"); return 2;
     }
 
     Model m;
@@ -2301,10 +2677,21 @@ int run(int argc, char** argv) {
         return 1;
     }
 
+    std::unique_ptr<DsparkModel> dm;
+    std::unique_ptr<DsparkEngine> dspark;
+    if (!draft_path.empty()) {
+        dm = std::make_unique<DsparkModel>();
+        dm->device = m.main_device;
+        if (!load_dspark_model(draft_path, m.hp, *dm, err)) {
+            std::fprintf(stderr, "strata-inkling2: draft load failed: %s\n", err.c_str()); return 1;
+        }
+    }
+    const int runtime_t = dm ? std::max(chunk, dm->hp.block_size) : chunk;
+    const int verify_t = dm ? draft_max + 1 : 1;
     Engine E;
     E.device = m.main_device;
     E.role = layer_split_device >= 0 ? Engine::Role::Outer : Engine::Role::All;
-    if (!E.init(m, max_ctx, chunk, kv_q8, err)) {
+    if (!E.init(m, max_ctx, runtime_t, kv_q8, err, verify_t, dm && dm->has_quant_dense, dm ? dm->hp.n_ff : 0)) {
         std::fprintf(stderr, "strata-inkling2: engine init failed: %s\n", err.c_str());
         return 1;
     }
@@ -2319,7 +2706,7 @@ int run(int argc, char** argv) {
         split_core->device = layer_split_device;
         split_core->role = Engine::Role::Core;
         split_core->split_core_graph = split_core_graph;
-        if (!split_core->init(m, max_ctx, chunk, kv_q8, err)) {
+        if (!split_core->init(m, max_ctx, runtime_t, kv_q8, err, verify_t, false)) {
             std::fprintf(stderr, "strata-inkling2: split core init failed: %s\n", err.c_str()); return 1;
         }
         E.split_peer = split_core.get();
@@ -2330,6 +2717,13 @@ int run(int argc, char** argv) {
         }
         std::fprintf(stderr, "strata-inkling2: layer split main_device=%d virtual=0..5,42..47+head core_device=%d virtual=6..41 (physical=6..17 x3), context=262144 KV=Q8, host handoff=18/36 KiB per token, core_graph=%s\n",
                      E.device, split_core->device, split_core_graph ? "enabled" : "disabled (eager)");
+    }
+    if (dm) {
+        dspark = std::make_unique<DsparkEngine>();
+        dspark->init(*dm, max_ctx, E.tmax);
+        E.enable_dspark(dspark.get());
+        if (split_core) split_core->enable_dspark(dspark.get());
+        E.reset_state();
     }
     if (!place_experts(m, E, expert_vram, cpu_threads, err) ||
         (split_core && !place_experts(m, *split_core, expert_vram, cpu_threads, err))) {
@@ -2389,11 +2783,11 @@ int run(int argc, char** argv) {
             q_cv.notify_one();
         });
 
-        std::printf("INFO engine=0.2.17-inkling2 context=%d kv=%s kv_resident=%d expert_slots=%d experts=%lld expert_cache_mib=%lld vram_free_mib=%lld pool_workers=%d\n",
+        std::printf("INFO engine=0.2.17-inkling2 context=%d kv=%s kv_resident=%d expert_slots=%d experts=%lld expert_cache_mib=%lld vram_free_mib=%lld pool_workers=%d dspark=%s draft_max=%d\n",
                     max_ctx, kv_q8 ? "int8" : "fp16", max_ctx,
                     E.placed_slots, (long long) m.hp.n_phys * m.hp.n_expert,
                     (long long) (E.placed_bytes >> 20), (long long) (E.vram_free_after_place >> 20),
-                    E.pool_workers);
+                    E.pool_workers, dspark ? "on" : "off", dspark ? draft_max : 0);
         std::printf("READY %d stop\n", max_ctx);
         std::fflush(stdout);
 
@@ -2488,6 +2882,7 @@ int run(int argc, char** argv) {
 
                 const auto t_pp0 = Clock::now();
                 E.reset_hybrid_stats();
+                if (dspark) { dspark->n_draft_calls = dspark->n_drafted = dspark->n_accepted = 0; dspark->draft_ms = dspark->inject_ms = 0; }
                 hist = prompt;
                 const bool sample_on = smp.needs_logits();
                 int32_t next_tok = 0;
@@ -2495,7 +2890,9 @@ int run(int argc, char** argv) {
                 for (size_t off = reuse; off < prompt.size() && !stop_req.load(std::memory_order_acquire); off += (size_t) chunk) {
                     const int tc = (int) std::min<size_t>((size_t) chunk, prompt.size() - off);
                     const bool is_last = (off + (size_t) tc == prompt.size());
-                    next_tok = E.forward(prompt.data() + off, tc, is_last && sample_on, &lg);
+                    const int p0 = (int) E.pos;
+                    next_tok = E.forward(prompt.data() + off, tc, is_last && sample_on, &lg, false, dspark != nullptr);
+                    if (dspark) dspark->inject(E, p0, tc);
                     live_tokens.insert(live_tokens.end(), prompt.begin() + (ptrdiff_t) off, prompt.begin() + (ptrdiff_t) (off + (size_t) tc));
                     if (E.any_hybrid()) E.rebalance(8);
                     const double el_ms = ms_since(t_pp0);
@@ -2529,6 +2926,16 @@ int run(int argc, char** argv) {
                 const int limit = req_new > 0 ? std::min(req_new, avail) : avail;
                 if (stop_req.load(std::memory_order_acquire)) {
                     finish = "cancel";
+                } else if (dspark) {
+                    bool hit_eos = false;
+                    decode_tokens_loop(E, dspark.get(), draft_max, next_tok, limit, smp, rng, hist, live_tokens,
+                        [&](int32_t tok) -> bool {
+                            std::printf("T %d\n", (int) tok); std::fflush(stdout);
+                            ++emitted; hist.push_back(tok);
+                            return tok != eos_id && tok != 199999;
+                        }, [&] { return stop_req.load(std::memory_order_acquire); }, &hit_eos);
+                    if (stop_req.load(std::memory_order_acquire)) finish = "cancel";
+                    else if (hit_eos) finish = "stop";
                 } else {
                     for (int step = 0; step < limit; ++step) {
                         if (stop_req.load(std::memory_order_acquire)) {
@@ -2554,9 +2961,9 @@ int run(int argc, char** argv) {
                 }
                 const double tg_ms = ms_since(t_tg0);
                 const long long lookups = (long long) E.total_hy_gpu() + (long long) E.total_hy_cpu();
-                std::printf("DONE %d %zu %.2f %.2f %s 0 0 %zu %lld %lld 0 0 0.0 %zu\n",
+                std::printf("DONE %d %zu %.2f %.2f %s %lld %lld %zu %lld %lld 0 0 0.0 %zu\n",
                             emitted, prompt.size(), pp_ms, tg_ms, finish,
-                            reuse, (long long) E.total_hy_gpu(), lookups, fresh);
+                            dspark ? (long long) dspark->n_accepted : 0LL, dspark ? (long long) dspark->n_drafted : 0LL, reuse, (long long) E.total_hy_gpu(), lookups, fresh);
                 std::fflush(stdout);
             }
         }
@@ -2566,6 +2973,7 @@ int run(int argc, char** argv) {
 
     std::vector<int32_t> prompt = parse_id_list(tokens_str);
     if (prompt.empty()) prompt = {1};
+    if (!oracle_tail.empty()) return verify_row0_oracle(E, prompt, parse_id_list(oracle_tail), oracle_force_t1, chunk);
 
     if (bench) {
         // Warmup 1 pass
@@ -2573,11 +2981,14 @@ int run(int argc, char** argv) {
         int32_t w = 0;
         for (size_t off = 0; off < prompt.size(); off += (size_t) chunk) {
             const int tc = (int) std::min<size_t>((size_t) chunk, prompt.size() - off);
-            w = E.forward(prompt.data() + off, tc);
+            const int p0 = (int) E.pos;
+            w = E.forward(prompt.data() + off, tc, false, nullptr, false, dspark != nullptr);
+            if (dspark) dspark->inject(E, p0, tc);
         }
         if (max_new > 0) E.forward(&w, 1);
         E.reset_state();
         E.reset_hybrid_stats();
+        if (dspark) { dspark->n_draft_calls = dspark->n_drafted = dspark->n_accepted = 0; dspark->draft_ms = dspark->inject_ms = 0; }
     }
 
     E.prof = profile;
@@ -2589,7 +3000,9 @@ int run(int argc, char** argv) {
     for (size_t off = 0; off < prompt.size(); off += (size_t) chunk) {
         const int tc = (int) std::min<size_t>((size_t) chunk, prompt.size() - off);
         const bool is_last = (off + (size_t) tc == prompt.size());
-        next_tok = E.forward(prompt.data() + off, tc, is_last && !dump_logits_path.empty(), &dumped);
+        const int p0 = (int) E.pos;
+        next_tok = E.forward(prompt.data() + off, tc, is_last && !dump_logits_path.empty(), &dumped, false, dspark != nullptr);
+        if (dspark) dspark->inject(E, p0, tc);
         const auto tr0 = Clock::now();
         if (E.any_hybrid()) E.rebalance(8);
         if (profile) { CK(cudaStreamSynchronize(E.st)); E.p_rebal_ms += ms_since(tr0); }
@@ -2608,18 +3021,30 @@ int run(int argc, char** argv) {
 
     std::vector<int32_t> gen;
     gen.reserve((size_t) max_new);
-    if (max_new > 0) gen.push_back(next_tok);
+    if (max_new > 0 && !dspark) gen.push_back(next_tok);
 
     const auto t_tg0 = Clock::now();
-    for (int step = 1; step < max_new; ++step) {
-        next_tok = E.forward(&next_tok, 1);
-        gen.push_back(next_tok);
-        const auto tr0 = Clock::now();
-        if (E.any_hybrid() && (step % 8 == 0)) E.rebalance(E.core_all_gpu ? 4 : 6);
-        if (profile) { CK(cudaStreamSynchronize(E.st)); E.p_rebal_ms += ms_since(tr0); }
+    if (dspark) {
+        std::vector<int32_t> cli_hist = prompt, cli_live = prompt;
+        SamplingParams greedy;
+        std::mt19937_64 cli_rng(0x9e3779b97f4a7c15ULL);
+        decode_tokens_loop(E, dspark.get(), draft_max, next_tok, max_new, greedy, cli_rng, cli_hist, cli_live,
+            [&](int32_t tok) -> bool { gen.push_back(tok); cli_hist.push_back(tok); return true; }, [] { return false; });
+    } else {
+        for (int step = 1; step < max_new; ++step) {
+            next_tok = E.forward(&next_tok, 1);
+            gen.push_back(next_tok);
+            const auto tr0 = Clock::now();
+            if (E.any_hybrid() && (step % 8 == 0)) E.rebalance(E.core_all_gpu ? 4 : 6);
+            if (profile) { CK(cudaStreamSynchronize(E.st)); E.p_rebal_ms += ms_since(tr0); }
+        }
     }
     const double tg_ms = ms_since(t_tg0);
     if (profile) E.print_prof("tg");
+    if (dspark)
+        std::fprintf(stderr, "strata-inkling2: dspark accepted=%lld offered=%lld draft_calls=%lld draft_ms=%.1f inject_ms=%.1f\n",
+                     (long long) dspark->n_accepted, (long long) dspark->n_drafted, (long long) dspark->n_draft_calls,
+                     dspark->draft_ms, dspark->inject_ms);
 
     std::printf("tokens:");
     for (int32_t id : gen) std::printf(" %d", (int) id);

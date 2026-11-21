@@ -497,6 +497,22 @@ __global__ void k_shortconv(const float* __restrict__ cur, const float* __restri
     hc[2] = h2;
 }
 
+// DSpark records history bits before the original convolution. No floating arithmetic,
+// output write or history mutation occurs here; the original kernel always computes P.
+__global__ void k_shortconv_trace(const float* __restrict__ cur, const float* __restrict__ hist,
+                                  int n_ch, int hist_offset, int T,
+                                  float* __restrict__ trace, size_t trace_stride) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= n_ch) return;
+    const float* h = hist + (size_t) (hist_offset + c) * 3;
+    uint32_t h0 = __float_as_uint(h[0]), h1 = __float_as_uint(h[1]), h2 = __float_as_uint(h[2]);
+    for (int t = 0; t < T; ++t) {
+        h0 = h1; h1 = h2; h2 = __float_as_uint(cur[(size_t) t * n_ch + c]);
+        float* dst = trace + (size_t) t * trace_stride + (size_t) (hist_offset + c) * 3;
+        dst[0] = __uint_as_float(h0); dst[1] = __uint_as_float(h1); dst[2] = __uint_as_float(h2);
+    }
+}
+
 /// Fused shortconv for K [0..kv_dim-1] and V [kv_dim..2*kv_dim-1]: single launch of 2*kv_dim threads.
 __global__ void k_shortconv_kv(const float* __restrict__ K, const float* __restrict__ V,
                                const float* __restrict__ wk, const float* __restrict__ wv,
@@ -533,6 +549,24 @@ __global__ void k_shortconv_kv(const float* __restrict__ K, const float* __restr
     hc[0] = h0;
     hc[1] = h1;
     hc[2] = h2;
+}
+
+// DSpark records history bits before the original convolution. No floating arithmetic,
+// output write or history mutation occurs here; the original kernel always computes P.
+__global__ void k_shortconv_kv_trace(const float* __restrict__ K, const float* __restrict__ V,
+                                     const float* __restrict__ hist, int kv_dim, int T,
+                                     float* __restrict__ trace, size_t trace_stride) {
+    const int c_all = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c_all >= 2 * kv_dim) return;
+    const int c = c_all % kv_dim;
+    const float* x = c_all >= kv_dim ? V : K;
+    const float* h = hist + (size_t) c_all * 3;
+    uint32_t h0 = __float_as_uint(h[0]), h1 = __float_as_uint(h[1]), h2 = __float_as_uint(h[2]);
+    for (int t = 0; t < T; ++t) {
+        h0 = h1; h1 = h2; h2 = __float_as_uint(x[(size_t) t * kv_dim + c]);
+        float* dst = trace + (size_t) t * trace_stride + (size_t) c_all * 3;
+        dst[0] = __uint_as_float(h0); dst[1] = __uint_as_float(h1); dst[2] = __uint_as_float(h2);
+    }
 }
 
 /// clip(x, scale, thr) per [T][n_heads][D]. Also optionally multiplies by per-token tau if alpha > 0.
@@ -1471,6 +1505,66 @@ __global__ void k_argmax(const float* __restrict__ logits, int32_t* __restrict__
         __syncthreads();
     }
     if (threadIdx.x == 0) pick[blockIdx.x] = si[0];
+}
+
+struct SwaLayerPtrs {
+    int n_swa_layers = 0;
+    int8_t* kq[48] = {};
+    __half* ks[48] = {};
+    int8_t* vq[48] = {};
+    __half* vs[48] = {};
+    __half* kc[48] = {};
+    __half* vc[48] = {};
+};
+
+/// Save (`restore == 0`) or restore (`restore == 1`) `n_slots` SWA KV ring entries (`pos_base + si`) across all SWA layers.
+/// Grid: (n_slots, n_swa_layers), Block: 256. Each slot backup holds `[kq(kv_dim), vq(kv_dim), ks(nhkv), vs(nhkv)]` or `[kc, vc]`.
+__global__ void k_swa_q8_bak(SwaLayerPtrs swa, uint8_t* __restrict__ bak, int kv_dim, int n_head_kv, int cap,
+                             int pos_base, int first_si, int n_slots, int restore) {
+    const int si = first_si + blockIdx.x;
+    const int s = blockIdx.y;
+    if (s >= swa.n_swa_layers) return;
+    const int p = pos_base + si;
+    if (restore && p < cap) return;   // slot was empty prior to overwrite
+    const int slot = p % cap;
+    const size_t slot_bytes = (size_t) kv_dim * 2 + (size_t) n_head_kv * 2 * sizeof(__half);
+    uint8_t* b = bak + ((size_t) si * swa.n_swa_layers + s) * slot_bytes;
+    int8_t* bkq = (int8_t*) b;
+    int8_t* bvq = bkq + kv_dim;
+    __half* bks = (__half*) (bvq + kv_dim);
+    __half* bvs = bks + n_head_kv;
+    int8_t* dkq = swa.kq[s] + (size_t) slot * kv_dim;
+    int8_t* dvq = swa.vq[s] + (size_t) slot * kv_dim;
+    __half* dks = swa.ks[s] + (size_t) slot * n_head_kv;
+    __half* dvs = swa.vs[s] + (size_t) slot * n_head_kv;
+    for (int i = threadIdx.x; i < kv_dim; i += blockDim.x) {
+        if (restore) { dkq[i] = bkq[i]; dvq[i] = bvq[i]; }
+        else { bkq[i] = dkq[i]; bvq[i] = dvq[i]; }
+    }
+    if (threadIdx.x < n_head_kv) {
+        if (restore) { dks[threadIdx.x] = bks[threadIdx.x]; dvs[threadIdx.x] = bvs[threadIdx.x]; }
+        else { bks[threadIdx.x] = dks[threadIdx.x]; bvs[threadIdx.x] = dvs[threadIdx.x]; }
+    }
+}
+
+__global__ void k_swa_f16_bak(SwaLayerPtrs swa, uint8_t* __restrict__ bak, int kv_dim, int cap,
+                              int pos_base, int first_si, int n_slots, int restore) {
+    const int si = first_si + blockIdx.x;
+    const int s = blockIdx.y;
+    if (s >= swa.n_swa_layers) return;
+    const int p = pos_base + si;
+    if (restore && p < cap) return;
+    const int slot = p % cap;
+    const size_t slot_bytes = (size_t) kv_dim * 2 * sizeof(__half);
+    __half* b = (__half*) (bak + ((size_t) si * swa.n_swa_layers + s) * slot_bytes);
+    __half* bkc = b;
+    __half* bvc = b + kv_dim;
+    __half* dkc = swa.kc[s] + (size_t) slot * kv_dim;
+    __half* dvc = swa.vc[s] + (size_t) slot * kv_dim;
+    for (int i = threadIdx.x; i < kv_dim; i += blockDim.x) {
+        if (restore) { dkc[i] = bkc[i]; dvc[i] = bvc[i]; }
+        else { bkc[i] = dkc[i]; bvc[i] = dvc[i]; }
+    }
 }
 
 }  // namespace strata::inkling2
