@@ -9,7 +9,7 @@ import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from inkling_smoke import CAPACITY, NativeSession, arguments, gen_line, main, parse_done
+from inkling_smoke import CAPACITY, NativeSession, arguments, device_selection, gen_line, main, parse_done
 
 
 class InklingSmoke(unittest.TestCase):
@@ -27,6 +27,9 @@ class InklingSmoke(unittest.TestCase):
     def test_gen_defaults_are_explicit(self):
         self.assertEqual(gen_line([1, 2], 32, 42), "GEN 32 temperature=1 top_p=1 top_k=0 min_p=0 seed=42 1,2")
         self.assertIn("temperature=0", gen_line([1], 64, 42, greedy=True))
+        self.assertTrue(gen_line([1], 256, 42).startswith("GEN 256 "))
+        for n in (128, 512, 1000):
+            self.assertTrue(gen_line([1], n, 42).startswith(f"GEN {n} "))
         for ids, count, seed in (([], 32, 42), ([True], 32, 42), ([1], 1024, 42), ([1], 32, 0)):
             with self.assertRaises(ValueError):
                 gen_line(ids, count, seed)
@@ -34,11 +37,25 @@ class InklingSmoke(unittest.TestCase):
     def test_cli_rejects_indices_and_unbounded_timeouts(self):
         base = ["--gpu-uuid", "GPU-12345678-1234-1234-1234-123456789abc", "--artifact-dir", "unused"]
         args = arguments(base)
-        self.assertEqual((args.max_new, args.effort), (32, "none"))
+        self.assertEqual((args.max_new, args.effort, args.chunk), (128, "none", 64))
+        self.assertEqual(arguments(base + ["--lengths", "128", "512", "1000"]).lengths, [128, 512, 1000])
+        self.assertEqual(arguments(base + ["--chunk", "1"]).chunk, 1)
         for extra in (("--gpu-uuid", "0"), ("--load-timeout", "181"), ("--generate-timeout", "91"),
-                      ("--generate-timeout", "nan"), ("--seed", "0")):
+                      ("--generate-timeout", "nan"), ("--seed", "0"), ("--core-gpu-uuid", "1"), ("--split-core-graph",), ("--chunk", "0")):
             with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
                 arguments(base + list(extra))
+
+    def test_split_device_selection_preserves_main_and_excludes_other_cards(self):
+        outer = "GPU-12345678-1234-1234-1234-123456789abc"
+        core = "GPU-87654321-1234-1234-1234-123456789abc"
+        base = ["--gpu-uuid", outer, "--artifact-dir", "unused"]
+        self.assertEqual(device_selection(arguments(base)), (outer, []))
+        self.assertEqual(device_selection(arguments(base + ["--core-gpu-uuid", outer])),
+                         (outer, ["--layer-split-device", "0"]))
+        self.assertEqual(device_selection(arguments(base + ["--core-gpu-uuid", core])),
+                         (outer + "," + core, ["--layer-split-device", "1"]))
+        self.assertEqual(device_selection(arguments(base + ["--core-gpu-uuid", core, "--split-core-graph"])),
+                         (outer + "," + core, ["--layer-split-device", "1", "--split-core-graph"]))
 
     def test_fake_native_two_gen_same_child_and_cleanup(self):
         script = '''import sys

@@ -60,8 +60,8 @@ def parse_done(line):
 
 
 def gen_line(ids, max_new, seed, greedy=False):
-    if not ids or len(ids) >= CAPACITY or max_new not in (32, 64) or seed <= 0:
-        raise ValueError("GEN requires a nonempty prompt below capacity, max_new 32/64 and a positive seed")
+    if not ids or len(ids) >= CAPACITY or type(max_new) is not int or not 32 <= max_new <= 1000 or seed <= 0:
+        raise ValueError("GEN requires a nonempty prompt below capacity, max_new 32..1000 and a positive seed")
     if any(type(token) is not int or token < 0 for token in ids):
         raise ValueError("token IDs must be nonnegative integers")
     return f"GEN {max_new} temperature={0 if greedy else 1} top_p=1 top_k=0 min_p=0 seed={seed} " + ",".join(map(str, ids))
@@ -202,8 +202,10 @@ def machine_sample(gpu_uuid, phase, process=None):
             out["engine_memory"] = {"pid": process.pid, "rss_bytes": mem.rss, "vms_bytes": mem.vms}
         except psutil.Error as error:
             out["engine_memory_error"] = str(error)
-    command = ["nvidia-smi", "-i", gpu_uuid,
-               "--query-gpu=uuid,index,name,memory.total,memory.used,memory.free,utilization.gpu,temperature.gpu,power.draw",
+    # Observe the display card as well as both possible inference devices.
+    out["main_gpu_uuid"] = gpu_uuid
+    command = ["nvidia-smi",
+               "--query-gpu=uuid,index,name,memory.total,memory.used,memory.free,utilization.gpu,temperature.gpu,power.draw,clocks.current.sm,clocks.current.memory,pcie.link.gen.current,pcie.link.width.current",
                "--format=csv,noheader,nounits"]
     out["nvidia_smi_command"] = command
     try:
@@ -211,7 +213,8 @@ def machine_sample(gpu_uuid, phase, process=None):
                                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         out["nvidia_smi"] = {"returncode": result.returncode, "stdout": result.stdout, "stderr": result.stderr,
                               "columns": ["uuid", "index", "name", "memory.total MiB", "memory.used MiB", "memory.free MiB",
-                                          "utilization.gpu %", "temperature.gpu C", "power.draw W"]}
+                                          "utilization.gpu %", "temperature.gpu C", "power.draw W", "SM MHz",
+                                          "memory MHz", "PCIe generation", "PCIe width"]}
     except (OSError, subprocess.TimeoutExpired) as error:
         out["nvidia_smi"] = {"error": str(error)}
     out["sample_ended"] = stamp()
@@ -262,13 +265,19 @@ def bounded_seconds(maximum):
 def arguments(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--gpu-uuid", required=True, help="Full GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx UUID; never an index")
+    parser.add_argument("--core-gpu-uuid", help="Enable layer split; the same UUID selects same-device parity")
+    parser.add_argument("--split-core-graph", action="store_true", help="Use the opt-in split core decode graph")
     parser.add_argument("--artifact-dir", type=Path, required=True, help="Directory with no existing smoke artifact files")
     parser.add_argument("--exe", type=Path, default=ROOT / "build-windows-inkling/strata-inkling2.exe")
     parser.add_argument("--model", type=Path, default=Path("D:/ds4_work/inkling2/models/Inkling-2-Mini-UD-Q3_K_XL.gguf"))
     parser.add_argument("--tokenizer", type=Path, default=Path("D:/ds4_work/inkling2/models/tokenizer"))
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
     parser.add_argument("--effort", choices=("none", "minimal", "low", "medium", "high", "xhigh", "max"), default="none")
-    parser.add_argument("--max-new", type=int, choices=(32, 64), default=32)
+    parser.add_argument("--max-new", type=int, choices=(32, 64, 128, 256, 512, 1000), default=128)
+    parser.add_argument("--lengths", type=int, nargs="+", choices=(128, 256, 512, 1000),
+                        help="Output lengths to run in sequence without reloading the model")
+    parser.add_argument("--chunk", type=int, choices=(1, 64), default=64,
+                        help="1 isolates decode parity from architecture-dependent batched prefill")
     parser.add_argument("--seed", type=int, default=20261121)
     parser.add_argument("--greedy", action="store_true", help="Explicit temperature=0 parity run; still recorded as greedy")
     parser.add_argument("--runs", type=int, choices=(1, 2), default=1, help="Repeat the identical GEN in the same process")
@@ -280,6 +289,10 @@ def arguments(argv=None):
     args = parser.parse_args(argv)
     if not GPU_UUID.fullmatch(args.gpu_uuid):
         parser.error("--gpu-uuid must be a full GPU UUID, not a CUDA/nvidia-smi index")
+    if args.core_gpu_uuid is not None and not GPU_UUID.fullmatch(args.core_gpu_uuid):
+        parser.error("--core-gpu-uuid must be a full GPU UUID, not an index")
+    if args.split_core_graph and args.core_gpu_uuid is None:
+        parser.error("--split-core-graph requires --core-gpu-uuid")
     if args.seed <= 0 or args.seed > 2 ** 64 - 1:
         parser.error("--seed must be an integer in 1..2^64-1")
     if args.expert_vram is not None and (not math.isfinite(args.expert_vram) or args.expert_vram < 0):
@@ -287,6 +300,18 @@ def arguments(argv=None):
     if args.cpu_threads is not None and args.cpu_threads <= 0:
         parser.error("--cpu-threads must be positive")
     return args
+
+
+def device_selection(args):
+    visible = [args.gpu_uuid]
+    split_args = []
+    if args.core_gpu_uuid is not None:
+        if args.core_gpu_uuid != args.gpu_uuid:
+            visible.append(args.core_gpu_uuid)
+        split_args = ["--layer-split-device", str(visible.index(args.core_gpu_uuid))]
+        if args.split_core_graph:
+            split_args.append("--split-core-graph")
+    return ",".join(visible), split_args
 
 
 def main(argv=None):
@@ -297,7 +322,8 @@ def main(argv=None):
     if any((folder / name).exists() for name in names):
         raise SystemExit("artifact files already exist; use a new directory")
     report = {"schema": 1, "status": "preparing", "started": stamp(), "machine": platform.uname()._asdict(),
-              "gpu_uuid": args.gpu_uuid, "capacity": CAPACITY, "chunk": 64, "kv": "q8", "runs": [],
+              "gpu_uuid": args.gpu_uuid, "core_gpu_uuid": args.core_gpu_uuid,
+              "capacity": CAPACITY, "chunk": args.chunk, "kv": "q8", "runs": [],
               "measurement_notes": ["Timing fields come directly from native DONE, not request/HTTP wall time.",
                                     "First token is sampled after prefill; decode performs generated-1 forwards.",
                                     "Repeat is same-process RAM/resident-weight/KV reuse, not an SSD-cache benchmark.",
@@ -318,15 +344,20 @@ def main(argv=None):
         report["input"] = {"prompt": args.prompt, "effort": args.effort, "rendered_prompt": rendered, "input_token_ids": ids,
                            "max_new": args.max_new, "seed": args.seed, "temperature": 0 if args.greedy else 1,
                            "top_p": 1, "top_k": 0, "min_p": 0}
-        gen_line(ids, args.max_new, args.seed, args.greedy)
+        schedule = (args.lengths or [args.max_new]) * args.runs
+        report["input"]["max_new_schedule"] = schedule
+        for length in schedule:
+            gen_line(ids, length, args.seed, args.greedy)
         (folder / "input.json").write_text(json.dumps(report["input"], ensure_ascii=False, indent=2), encoding="utf-8")
         command = [str(args.exe.resolve()), "--model", str(args.model.resolve()), "--serve", "--max-context", str(CAPACITY),
-                   "--chunk", "64", "--kv-q8"]
+                   "--chunk", str(args.chunk), "--kv-q8"]
         if args.expert_vram is not None:
             command += ["--expert-vram", str(args.expert_vram)]
         if args.cpu_threads is not None:
             command += ["--cpu-threads", str(args.cpu_threads)]
-        env = {**os.environ, "CUDA_VISIBLE_DEVICES": args.gpu_uuid, "CUDA_DEVICE_ORDER": "PCI_BUS_ID"}
+        visible, split_args = device_selection(args)
+        command += split_args
+        env = {**os.environ, "CUDA_VISIBLE_DEVICES": visible, "CUDA_DEVICE_ORDER": "PCI_BUS_ID"}
         report["command"] = command
         report["cuda_environment"] = {key: env[key] for key in ("CUDA_VISIBLE_DEVICES", "CUDA_DEVICE_ORDER")}
         report["timeouts_s"] = {"load": args.load_timeout, "generate": args.generate_timeout}
@@ -357,10 +388,10 @@ def main(argv=None):
         report["startup_protocol"] = session.ready(args.load_timeout)
         report["ready"] = stamp()
         report["load_wall_s"] = report["ready"]["monotonic_s"] - report["load_started"]["monotonic_s"]
-        for index in range(args.runs):
-            record = {"index": index + 1}
+        for index, length in enumerate(schedule):
+            record = {"index": index + 1, "requested_max_new": length}
             report["runs"].append(record)
-            session.generate(ids, args.max_new, args.seed, args.generate_timeout, args.greedy, record)
+            session.generate(ids, length, args.seed, args.generate_timeout, args.greedy, record)
             record.update(output_channels(tokenizer, record["output_token_ids"]))
         report["status"] = "ok"
     except (Exception, KeyboardInterrupt) as error:
