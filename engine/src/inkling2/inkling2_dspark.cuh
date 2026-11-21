@@ -4,6 +4,71 @@
 
 namespace dspark_detail {
 
+// Opt-in diagnostic artifacts only. The caller atomically claims a new
+// directory, so existing captures are never overwritten. No files, copies or
+// synchronizations are added when INKLING2_DSPARK_DUMP_PREFIX is unset.
+struct DiagnosticCapture {
+    std::string directory;
+    std::FILE* manifest = nullptr;
+    bool first_tensor = true;
+
+    bool begin(const std::string& path, int64_t call, int pos, int anchor,
+               int n_draft, int vocab, const std::vector<int>& caps) {
+        std::error_code ec;
+        if (!std::filesystem::create_directory(path, ec)) {
+            std::fprintf(stderr, "strata-inkling2: DSpark dump needs a new directory %s (%s); dump skipped\n",
+                         path.c_str(), ec ? ec.message().c_str() : "already exists");
+            return false;
+        }
+        directory = path;
+        manifest = std::fopen((directory + "/manifest.json").c_str(), "wb");
+        if (!manifest) {
+            std::fprintf(stderr, "strata-inkling2: cannot create DSpark dump manifest in %s\n", path.c_str());
+            return false;
+        }
+        std::fprintf(manifest, "{\n\"version\":1,\"call\":%lld,\"pos\":%d,\"anchor\":%d,\"n_draft\":%d,\"vocab\":%d,\"kv_caps\":[",
+                     (long long) call, pos, anchor, n_draft, vocab);
+        for (size_t i = 0; i < caps.size(); ++i) std::fprintf(manifest, "%s%d", i ? "," : "", caps[i]);
+        std::fprintf(manifest, "],\n\"tensors\":{\n");
+        return true;
+    }
+
+    void write(const std::string& name, const void* source, const char* dtype,
+               size_t item_size, std::initializer_list<int> shape, cudaStream_t st, bool on_device = true) {
+        if (!manifest) return;
+        size_t count = 1;
+        for (int dim : shape) count *= (size_t) dim;
+        std::vector<uint8_t> host;
+        if (on_device) {
+            host.resize(count * item_size);
+            CK(cudaMemcpyAsync(host.data(), source, host.size(), cudaMemcpyDeviceToHost, st));
+            CK(cudaStreamSynchronize(st));
+            source = host.data();
+        }
+        const std::string file = name + ".bin";
+        std::FILE* out = std::fopen((directory + "/" + file).c_str(), "wb");
+        if (!out) { std::fprintf(stderr, "strata-inkling2: DSpark dump write failed: %s\n", file.c_str()); std::exit(1); }
+        const bool ok = std::fwrite(source, item_size, count, out) == count;
+        const int closed = std::fclose(out);
+        if (!ok || closed != 0) { std::fprintf(stderr, "strata-inkling2: DSpark dump incomplete: %s\n", file.c_str()); std::exit(1); }
+        std::fprintf(manifest, "%s\"%s\":{\"file\":\"%s\",\"dtype\":\"%s\",\"shape\":[",
+                     first_tensor ? "" : ",\n", name.c_str(), file.c_str(), dtype);
+        bool first_dim = true;
+        for (int dim : shape) { std::fprintf(manifest, "%s%d", first_dim ? "" : ",", dim); first_dim = false; }
+        std::fprintf(manifest, "]}");
+        first_tensor = false;
+    }
+
+    void finish() {
+        if (!manifest) return;
+        std::fprintf(manifest, "\n}}\n");
+        std::fclose(manifest);
+        manifest = nullptr;
+        std::fprintf(stderr, "strata-inkling2: DSpark diagnostic capture completed in %s\n", directory.c_str());
+    }
+    ~DiagnosticCapture() { if (manifest) std::fclose(manifest); }
+};
+
 __device__ __forceinline__ float bf16_to_f32_d(uint16_t u) {
     return __uint_as_float((uint32_t) u << 16);
 }
@@ -585,6 +650,11 @@ struct DsparkEngine {
     double draft_ms = 0.0;
     double inject_ms = 0.0;
 
+    std::string diagnostic_path;
+    int64_t diagnostic_call = 0;
+    bool diagnostic_attempted = false;
+    std::vector<float> diagnostic_features[4];
+
     ~DsparkEngine() {
         DeviceScope owner(device);
         for (auto* p : kq) cudaFree(p);
@@ -617,6 +687,11 @@ struct DsparkEngine {
         device = model.device;
         DeviceScope owner(device);
         dm = &model;
+        if (const char* path = std::getenv("INKLING2_DSPARK_DUMP_PREFIX")) {
+            diagnostic_path = path;
+            if (const char* call = std::getenv("INKLING2_DSPARK_DUMP_CALL"))
+                diagnostic_call = std::max<int64_t>(0, std::strtoll(call, nullptr, 10));
+        }
         ctx = max_ctx;
         tmax = std::max(max_t, 16);
         const auto& hp = dm->hp;
@@ -728,6 +803,15 @@ struct DsparkEngine {
         const float* f1 = E.d_tgt_feat[1];
         const float* f2 = E.d_tgt_feat[2];
         const float* f3 = E.d_tgt_feat[3];
+        if (!diagnostic_path.empty() && !diagnostic_attempted && n_draft_calls == diagnostic_call) {
+            const float* features[4] = {f0, f1, f2, f3};
+            for (int i = 0; i < 4; ++i) {
+                diagnostic_features[i].resize((size_t) hp.n_embd);
+                CK(cudaMemcpyAsync(diagnostic_features[i].data(), features[i] + (size_t) (T - 1) * hp.n_embd,
+                                   (size_t) hp.n_embd * sizeof(float), cudaMemcpyDeviceToHost, E.st));
+            }
+            CK(cudaStreamSynchronize(E.st));
+        }
         for (int il = 0; il < hp.n_layer; ++il) {
             const auto& L = dm->layers[(size_t) il];
             dspark_detail::k_dspark_mix_features<<<(unsigned) T, 256, 0, E.st>>>(
@@ -764,6 +848,31 @@ struct DsparkEngine {
         const int N = hp.n_embd;
         const int rank = hp.markov_rank;
 
+        dspark_detail::DiagnosticCapture diagnostic;
+        bool dump = false;
+        if (!diagnostic_path.empty() && !diagnostic_attempted && n_draft_calls == diagnostic_call) {
+            diagnostic_attempted = true;
+            dump = diagnostic.begin(diagnostic_path, n_draft_calls, pos, anchor, n_draft,
+                                    (int) hp.vocab_unpadded, kv_cap);
+        }
+        auto snap = [&](const std::string& name, const float* data, int rows, int cols) {
+            if (dump) diagnostic.write(name, data, "f32", sizeof(float), {rows, cols}, E.st);
+        };
+        if (dump) {
+            snap("f_rnn", f_rnn_last, 1, N);
+            for (int i = 0; i < 4; ++i) if (!diagnostic_features[i].empty())
+                diagnostic.write("target_last" + std::to_string(i), diagnostic_features[i].data(),
+                                 "f32", sizeof(float), {1, N}, E.st, false);
+            for (int il = 0; il < hp.n_layer; ++il) {
+                const int rows = std::min(pos, kv_cap[(size_t) il]);
+                const std::string tag = "layer" + std::to_string(il);
+                diagnostic.write(tag + ".cache_kq", kq[(size_t) il], "i8", sizeof(int8_t), {rows, hp.kv_dim}, E.st);
+                diagnostic.write(tag + ".cache_vq", vq[(size_t) il], "i8", sizeof(int8_t), {rows, hp.kv_dim}, E.st);
+                diagnostic.write(tag + ".cache_ks", ks[(size_t) il], "f16", sizeof(__half), {rows, hp.n_head_kv}, E.st);
+                diagnostic.write(tag + ".cache_vs", vs[(size_t) il], "f16", sizeof(__half), {rows, hp.n_head_kv}, E.st);
+            }
+        }
+
         out_tokens.resize((size_t) n_draft);
         if (out_logits) out_logits->resize((size_t) n_draft);
 
@@ -778,50 +887,77 @@ struct DsparkEngine {
         const float kq_scale = 1.0f / std::sqrt((float) hp.head_dim);
         for (int il = 0; il < hp.n_layer; ++il) {
             const auto& L = dm->layers[(size_t) il];
+            const std::string tag = dump ? "layer" + std::to_string(il) : std::string();
+            if (dump) snap(tag + ".input", block_cur, block_n, N);
             k_rms_norm<<<(unsigned) block_n, kThreads, 0, E.st>>>(block_cur, L.attn_norm, x_norm, N, hp.rms_eps);
+            if (dump) snap(tag + ".attn_norm", x_norm, block_n, N);
             E.prep_q8(x_norm, E.xq, block_n, N);
             E.project_preq(x_norm, E.xq, L.attn_q, Q, block_n, hp.q_dim, N);
             E.project_preq(x_norm, E.xq, L.attn_k, K, block_n, hp.kv_dim, N);
             E.project_preq(x_norm, E.xq, L.attn_v, V, block_n, hp.kv_dim, N);
+            if (dump) snap(tag + ".q_raw", Q, block_n, hp.q_dim);
+            if (dump) snap(tag + ".k_raw", K, block_n, hp.kv_dim);
+            if (dump) snap(tag + ".v_raw", V, block_n, hp.kv_dim);
             dspark_detail::k_dspark_qk_norm_rope<<<dim3((unsigned) (hp.n_head + hp.n_head_kv), (unsigned) block_n), 64, 0, E.st>>>(
                 Q, K, L.attn_q_norm, L.attn_k_norm, hp.n_head, hp.n_head_kv, pos, hp.rms_eps, hp.freq_base, hp.n_rot);
+            if (dump) snap(tag + ".q", Q, block_n, hp.q_dim);
+            if (dump) snap(tag + ".k", K, block_n, hp.kv_dim);
+            if (dump) snap(tag + ".v", V, block_n, hp.kv_dim);
             dspark_detail::k_dspark_attn_q8<<<dim3((unsigned) hp.n_head, (unsigned) block_n), 128, 0, E.st>>>(
                 Q, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], K, V, att,
                 hp.n_head, hp.n_head_kv, kv_cap[(size_t) il], hp.is_swa(il) ? 1 : 0, hp.n_swa, pos, block_n, kq_scale);
+            if (dump) snap(tag + ".att", att, block_n, hp.q_dim);
             E.project(att, L.attn_output, wo, block_n, N, hp.q_dim);
+            if (dump) snap(tag + ".wo", wo, block_n, N);
             dspark_detail::k_dspark_add<<<(unsigned) (((int64_t) block_n * N + 255) / 256), 256, 0, E.st>>>(
                 block_cur, block_cur, wo, (int64_t) block_n * N);
+            if (dump) snap(tag + ".after_attn", block_cur, block_n, N);
 
             k_rms_norm<<<(unsigned) block_n, kThreads, 0, E.st>>>(block_cur, L.ffn_norm, x_norm, N, hp.rms_eps);
+            if (dump) snap(tag + ".ffn_norm", x_norm, block_n, N);
             E.prep_q8(x_norm, E.xq, block_n, N);
             E.project_preq(x_norm, E.xq, L.ffn_gate, gate, block_n, hp.n_ff, N);
             E.project_preq(x_norm, E.xq, L.ffn_up, up, block_n, hp.n_ff, N);
+            if (dump) snap(tag + ".gate", gate, block_n, hp.n_ff);
+            if (dump) snap(tag + ".up", up, block_n, hp.n_ff);
             dspark_detail::k_dspark_swiglu<<<(unsigned) (((int64_t) block_n * hp.n_ff + 255) / 256), 256, 0, E.st>>>(
                 gate, up, gate, (int64_t) block_n * hp.n_ff);
+            if (dump) snap(tag + ".swiglu", gate, block_n, hp.n_ff);
             E.project(gate, L.ffn_down, wo, block_n, N, hp.n_ff);
+            if (dump) snap(tag + ".down", wo, block_n, N);
             dspark_detail::k_dspark_add<<<(unsigned) (((int64_t) block_n * N + 255) / 256), 256, 0, E.st>>>(
                 block_cur, block_cur, wo, (int64_t) block_n * N);
+            if (dump) snap(tag + ".output", block_cur, block_n, N);
         }
         k_rms_norm<<<(unsigned) block_n, kThreads, 0, E.st>>>(block_cur, dm->output_norm, block_cur, N, hp.rms_eps);
+        if (dump) snap("hidden", block_cur, block_n, N);
 
         // 3. Recurrent Markov chain for i = 1 .. n_draft
         CK(cudaMemsetAsync(rnn_state, 0, (size_t) rank * sizeof(float), E.st));
         int32_t prev_id = anchor;
         const int joint_tot = 2 * rank + 2 * N;
         for (int i = 0; i < n_draft; ++i) {
+            const std::string tag = dump ? "rnn" + std::to_string(i) : std::string();
             const float* hi = block_cur + (size_t) (i + 1) * N;
             dspark_detail::k_dspark_prep_joint<<<(unsigned) ((joint_tot + 255) / 256), 256, 0, E.st>>>(
                 rnn_state, dm->markov_w1, dm->markov_w1_type, prev_id, hi, f_rnn_last, joint_inp, rank, N);
+            if (dump) snap(tag + ".joint_input", joint_inp, 1, joint_tot);
             E.project(joint_inp, dm->joint_proj, joint_out, 1, 3 * rank, joint_tot);
+            if (dump) snap(tag + ".joint_out", joint_out, 1, 3 * rank);
             dspark_detail::k_dspark_rnn_update<<<(unsigned) ((rank + 255) / 256), 256, 0, E.st>>>(
                 joint_out, dm->joint_proj_b, rnn_state, rnn_latent, rank);
+            if (dump) snap(tag + ".state", rnn_state, 1, rank);
+            if (dump) snap(tag + ".latent", rnn_latent, 1, rank);
             E.project(rnn_latent, dm->hidden_out, rnn_corr, 1, N, rank);
+            if (dump) snap(tag + ".correction", rnn_corr, 1, N);
             dspark_detail::k_dspark_add3<<<(unsigned) ((N + 255) / 256), 256, 0, E.st>>>(
                 h_pred, hi, rnn_corr, dm->hidden_out_b, N);
+            if (dump) snap(tag + ".prediction", h_pred, 1, N);
             E.project(h_pred, E.m->output_weight, E.logits, 1, hp.vocab_unpadded, N);
             if (out_logits) {
                 k_softcap<<<(unsigned) ((hp.vocab_unpadded + 255) / 256), 256, 0, E.st>>>(
                     E.logits, hp.vocab_unpadded, hp.softcap);
+                if (dump) snap(tag + ".logits", E.logits, 1, (int) hp.vocab_unpadded);
                 auto& row_lg = (*out_logits)[(size_t) i];
                 row_lg.resize((size_t) hp.vocab_unpadded);
                 CK(cudaMemcpyAsync(row_lg.data(), E.logits, (size_t) hp.vocab_unpadded * sizeof(float),
@@ -829,6 +965,7 @@ struct DsparkEngine {
                 CK(cudaStreamSynchronize(E.st));
                 prev_id = sample_fn(i, row_lg);
             } else {
+                if (dump) snap(tag + ".logits_raw", E.logits, 1, (int) hp.vocab_unpadded);
                 k_argmax<<<1, 256, 0, E.st>>>(E.logits, E.pick_d, (int) hp.vocab_unpadded);
                 int32_t next_id = 0;
                 CK(cudaMemcpyAsync(&next_id, E.pick_d, sizeof(int32_t), cudaMemcpyDeviceToHost, E.st));
@@ -836,6 +973,10 @@ struct DsparkEngine {
                 prev_id = next_id;
             }
             out_tokens[(size_t) i] = prev_id;
+        }
+        if (dump) {
+            diagnostic.write("proposed_ids", out_tokens.data(), "i32", sizeof(int32_t), {n_draft}, E.st, false);
+            diagnostic.finish();
         }
         ++n_draft_calls;
         n_drafted += n_draft;
