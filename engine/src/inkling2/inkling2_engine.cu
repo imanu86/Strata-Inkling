@@ -2562,6 +2562,7 @@ void decode_tokens_loop(Engine& E, DsparkEngine* dspark, int draft_max, int32_t 
         }
 
         emitted += m;
+        dspark->dump_verify_logits(pos_pre, K, V, lg, m);
         E.commit_verify(m, K, pos_pre);
         for (int i = 0; i < 1 + m; ++i) live_tokens.push_back(vtoks[(size_t) i]);
         dspark->n_accepted += m;

@@ -653,7 +653,32 @@ struct DsparkEngine {
     std::string diagnostic_path;
     int64_t diagnostic_call = 0;
     bool diagnostic_attempted = false;
+    bool diagnostic_capture_completed = false;
+    bool diagnostic_verify_attempted = false;
+    int diagnostic_anchor = -1;
     std::vector<float> diagnostic_features[4];
+    bool diagnostic_history_enabled = false;
+    int diagnostic_history_limit = 4096;
+    int diagnostic_history_rows = 0;
+    int diagnostic_history_generation = 0;
+    // 0=complete so far, 1=gap, 2=row limit, 3=checkpoint restore, 4=end mismatch.
+    int diagnostic_history_error = 0;
+    std::vector<float> diagnostic_history[4];
+
+    // Called once after the ordinary acceptance decision, just before commit.
+    // These logits already live on the host; diagnostic capture adds no GPU work.
+    void dump_verify_logits(int pos_pre, int K, int V, const std::vector<float>& logits, int accepted_prefix) {
+        if (diagnostic_path.empty() || !diagnostic_capture_completed || diagnostic_verify_attempted ||
+            n_draft_calls - 1 != diagnostic_call || K < 1 || V < 1 ||
+            logits.size() != (size_t) (K + 1) * (size_t) V || accepted_prefix < 0 || accepted_prefix > K) return;
+        diagnostic_verify_attempted = true;
+        dspark_detail::DiagnosticCapture verify;
+        if (!verify.begin(diagnostic_path + "/verify", n_draft_calls - 1, pos_pre,
+                          diagnostic_anchor, K, V, kv_cap)) return;
+        verify.write("target_logits", logits.data(), "f32", sizeof(float), {K + 1, V}, nullptr, false);
+        verify.write("accepted_prefix", &accepted_prefix, "i32", sizeof(int32_t), {1}, nullptr, false);
+        verify.finish();
+    }
 
     ~DsparkEngine() {
         DeviceScope owner(device);
@@ -691,6 +716,12 @@ struct DsparkEngine {
             diagnostic_path = path;
             if (const char* call = std::getenv("INKLING2_DSPARK_DUMP_CALL"))
                 diagnostic_call = std::max<int64_t>(0, std::strtoll(call, nullptr, 10));
+        }
+        if (!diagnostic_path.empty()) {
+            if (const char* history = std::getenv("INKLING2_DSPARK_DUMP_HISTORY"))
+                diagnostic_history_enabled = history[0] != '\0' && history[0] != '0';
+            if (const char* limit = std::getenv("INKLING2_DSPARK_DUMP_HISTORY_MAX_ROWS"))
+                diagnostic_history_limit = std::max(1, std::min(4096, std::atoi(limit)));
         }
         ctx = max_ctx;
         tmax = std::max(max_t, 16);
@@ -739,6 +770,12 @@ struct DsparkEngine {
     void reset(cudaStream_t st) {
         DeviceScope owner(device);
         pos = 0;
+        if (diagnostic_history_enabled && !diagnostic_attempted) {
+            for (auto& history : diagnostic_history) history.clear();
+            diagnostic_history_rows = 0;
+            diagnostic_history_error = 0;
+            ++diagnostic_history_generation;
+        }
         CK(cudaMemsetAsync(f_rnn_last, 0, (size_t) dm->hp.n_embd * sizeof(float), st));
     }
 
@@ -774,6 +811,13 @@ struct DsparkEngine {
 
     void restore_checkpoint(const uint8_t* src, int new_pos, cudaStream_t st) {
         DeviceScope owner(device);
+        // The model checkpoint has no target-feature history. Conservatively
+        // refuse a CPU history replay after restore; never infer missing rows.
+        if (diagnostic_history_enabled && !diagnostic_attempted) {
+            for (auto& history : diagnostic_history) history.clear();
+            diagnostic_history_rows = 0;
+            diagnostic_history_error = 3;
+        }
         const auto& hp = dm->hp;
         size_t off = 0;
         const size_t rnn_bytes = (size_t) hp.n_embd * sizeof(float);
@@ -803,6 +847,26 @@ struct DsparkEngine {
         const float* f1 = E.d_tgt_feat[1];
         const float* f2 = E.d_tgt_feat[2];
         const float* f3 = E.d_tgt_feat[3];
+        if (diagnostic_history_enabled && !diagnostic_attempted && diagnostic_history_error == 0) {
+            if (pos0 != diagnostic_history_rows || pos0 < 0) {
+                diagnostic_history_error = 1;
+            } else if (pos0 > diagnostic_history_limit || T > diagnostic_history_limit - pos0) {
+                diagnostic_history_error = 2;
+            } else {
+                // inject receives only the committed prefix (including anchor),
+                // never the discarded suffix of the target verify batch.
+                const float* features[4] = {f0, f1, f2, f3};
+                const size_t offset = (size_t) pos0 * hp.n_embd;
+                const size_t end = (size_t) (pos0 + T) * hp.n_embd;
+                for (int i = 0; i < 4; ++i) {
+                    diagnostic_history[i].resize(end);
+                    CK(cudaMemcpyAsync(diagnostic_history[i].data() + offset, features[i],
+                                       (size_t) T * hp.n_embd * sizeof(float), cudaMemcpyDeviceToHost, E.st));
+                }
+                CK(cudaStreamSynchronize(E.st));
+                diagnostic_history_rows = pos0 + T;
+            }
+        }
         if (!diagnostic_path.empty() && !diagnostic_attempted && n_draft_calls == diagnostic_call) {
             const float* features[4] = {f0, f1, f2, f3};
             for (int i = 0; i < 4; ++i) {
@@ -860,6 +924,16 @@ struct DsparkEngine {
         };
         if (dump) {
             snap("f_rnn", f_rnn_last, 1, N);
+            if (diagnostic_history_enabled) {
+                const int error = diagnostic_history_error != 0 ? diagnostic_history_error :
+                                  diagnostic_history_rows == pos ? 0 : 4;
+                const int32_t status[4] = {diagnostic_history_generation, diagnostic_history_rows,
+                                           error, diagnostic_history_limit};
+                diagnostic.write("target_history_status", status, "i32", sizeof(int32_t), {4}, E.st, false);
+                if (diagnostic_history_rows > 0) for (int i = 0; i < 4; ++i)
+                    diagnostic.write("target_history" + std::to_string(i), diagnostic_history[i].data(),
+                                     "f32", sizeof(float), {diagnostic_history_rows, N}, E.st, false);
+            }
             for (int i = 0; i < 4; ++i) if (!diagnostic_features[i].empty())
                 diagnostic.write("target_last" + std::to_string(i), diagnostic_features[i].data(),
                                  "f32", sizeof(float), {1, N}, E.st, false);
@@ -977,6 +1051,8 @@ struct DsparkEngine {
         if (dump) {
             diagnostic.write("proposed_ids", out_tokens.data(), "i32", sizeof(int32_t), {n_draft}, E.st, false);
             diagnostic.finish();
+            diagnostic_capture_completed = true;
+            diagnostic_anchor = anchor;
         }
         ++n_draft_calls;
         n_drafted += n_draft;
