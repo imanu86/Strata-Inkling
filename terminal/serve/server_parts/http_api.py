@@ -357,7 +357,10 @@ def clean_shared_defaults(d) -> dict:
             continue
         number = isinstance(value, (int, float)) and not isinstance(value, bool)
         if key == "reasoning_effort":
-            if value not in ("none", "low", "medium", "high"):
+            from serve import frontend
+            if frontend._EFFORT_FAMILY == "inkling2":
+                frontend.effort_kwargs(value)       # includes finite numeric levels, without accepting booleans
+            elif value not in ("none", "low", "medium", "high"):
                 raise ValueError("reasoning_effort: none, low, medium or high")
         elif key == "temperature":
             if not number or not 0 <= value <= 2:
@@ -366,8 +369,10 @@ def clean_shared_defaults(d) -> dict:
             if not number or not 0 < value <= 1:
                 raise ValueError("top_p: 0 < top_p <= 1")
         elif key == "top_k":
-            if not number or value != int(value) or not 1 <= value <= 64:
-                raise ValueError("top_k: an integer 1..64")
+            from serve import frontend
+            minimum = 0 if frontend._EFFORT_FAMILY == "inkling2" else 1
+            if not number or not minimum <= value <= 64 or value != int(value):
+                raise ValueError(f"top_k: an integer {minimum}..64")
             value = int(value)
         elif key in ("seed", "max_tokens"):
             if not number or value != int(value) or value <= 0:
@@ -523,8 +528,9 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
                 raise SystemExit(f"[strata] config sampling.min_p={value!r}: expected 0 <= min_p <= 1")
             out[key] = float(value)
         elif key == "top_k":
-            if not number or value != int(value) or not 1 <= value <= 64:
-                raise SystemExit(f"[strata] config sampling.top_k={value!r}: the sampled path takes an integer 1..64")
+            minimum = 0 if cfg.get("arch") == "inkling2" else 1
+            if not number or not minimum <= value <= 64 or value != int(value):
+                raise SystemExit(f"[strata] config sampling.top_k={value!r}: the sampled path takes an integer {minimum}..64")
             out[key] = int(value)
         elif key == "presence_penalty":
             if not number or value < 0:
@@ -613,6 +619,9 @@ MODEL_CARD_SAMPLING = {
     # Qwen3.6-35B-A3B: the general-task sets (the card's precise-coding set is temperature 0.6, presence_penalty 0)
     "qwen35moe": {"thinking": {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "presence_penalty": 1.5},
                   "instruct": {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "presence_penalty": 1.5}},
+    # Unsloth GGUF generation defaults. Zero top_k disables filtering in the Inkling engine.
+    "inkling2": {mode: {"temperature": 1.0, "top_p": 1.0, "top_k": 0, "min_p": 0.0}
+                 for mode in ("thinking", "instruct")},
 }
 
 

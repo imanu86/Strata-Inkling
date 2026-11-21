@@ -1269,7 +1269,9 @@ class StrataEngine:
         tk = sampling.get("top_k")
         if isinstance(tk, int) and not isinstance(tk, bool) and tk >= 0:
             # the engine's sampled path keeps at most 64 candidates: 0 ("off") and wider lists get all 64
-            keys += f" top_k={tk if 1 <= tk <= 64 else 64}"
+            # Inkling has its own full-vocabulary sampler; the internal family comes from Service, not the client.
+            inkling = sampling.get("_strata_arch") == "inkling2"
+            keys += f" top_k={tk if inkling or 1 <= tk <= 64 else 64}"
         mp = sampling.get("min_p")
         if isinstance(mp, (int, float)) and 0.0 < float(mp) <= 1.0:
             keys += f" min_p={float(mp)!r}"
@@ -3996,6 +3998,7 @@ class Service:
         self.family = family
         import serve.frontend as _frontend
         _frontend.use_family(family)
+        self._force_text = _frontend.inkling_force_text if family == "inkling2" else None
 
     _force_text = None
 
@@ -4652,21 +4655,23 @@ class Service:
                 print(f"[strata] could not save the shared settings: {e}", flush=True)
         return self.shared
 
-    def effort_default(self) -> str | None:
+    def effort_default(self) -> str | float | None:
         """The thinking level of a request that names none: the Chat settings shared with apps first, then the config's
         "reasoning_effort" (#1641).  Every API reads it here (the Responses API did not: 0.1.44.1)."""
-        return self.shared.get("reasoning_effort") or self.config_effort
+        effort = self.shared.get("reasoning_effort")
+        return effort if effort is not None and effort != "" else self.config_effort
 
     def with_shared(self, req: dict, api: str) -> dict:
         """The request with the shared thinking level and max tokens filled in where it has none of its own."""
         s = self.shared
         effort = self.effort_default()
-        if not s and not effort:
+        has_effort = effort is not None and effort != ""
+        if not s and not has_effort:
             return req
         req = dict(req)
         if "max_tokens" in s and not req.get("max_tokens") and not req.get("max_completion_tokens"):
             req["max_tokens"] = s["max_tokens"]
-        if effort:
+        if has_effort:
             if api == "openai":
                 ctk = req.get("chat_template_kwargs") if isinstance(req.get("chat_template_kwargs"), dict) else {}
                 if req.get("reasoning_effort") in (None, "") and not req.get("reasoning") and \
@@ -4931,7 +4936,7 @@ class Service:
         off = kwargs.get("enable_thinking") is False
         if off and "reasoning_effort" not in kwargs and isinstance(getattr(self, "parser_cls", None), type) and issubclass(self.parser_cls, InklingOutputParser):
             kwargs = {**kwargs, "reasoning_effort": "none"}
-        if not self.effort_end or (not off and effort in (None, "", "xhigh", "high")):
+        if self.family == "inkling2" or not self.effort_end or (not off and effort in (None, "", "xhigh", "high")):
             return self.template.render(messages, tools=tools, **kwargs)
         base = {k: v for k, v in kwargs.items() if k not in ("reasoning_effort", "enable_thinking")}
         history = self.template.render(messages, tools=tools, add_generation_prompt=False, **base)
@@ -5186,7 +5191,7 @@ class Service:
             effort = kwargs.get("reasoning_effort")
             off = kwargs.get("enable_thinking") is False        # render_prompt's rule for #458's effort_end
             kw = ({k: v for k, v in kwargs.items() if k not in ("reasoning_effort", "enable_thinking")}
-                  if self.effort_end and (off or effort not in (None, "", "xhigh", "high")) else dict(kwargs))
+                  if self.effort_end and self.family != "inkling2" and (off or effort not in (None, "", "xhigh", "high")) else dict(kwargs))
             kw["add_generation_prompt"] = False
             text = self.template.render(marked, tools=marked_tools, **kw)
             cut = text.find(self.PREFIX_END)
@@ -5293,6 +5298,10 @@ class Service:
         if defaults:                   # the request's own fields win (explicit 0 stays greedy)
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
             sampling = {**defaults, **req_values}
+        if self.model_arch == "inkling2":
+            sampling = {**(sampling or {}), "_strata_arch": "inkling2"}
+        elif sampling and "_strata_arch" in sampling:
+            sampling = {k: v for k, v in sampling.items() if k != "_strata_arch"}
         # #123: read after the merge, so a budget shared through POST /settings is seen like the other keys
         budget = self.reasoning_budget(sampling) if thinking else None
         if thinking and not budget and self.answer_room and max_new and max_new >= ANSWER_ROOM_MIN_CAP:
@@ -8515,7 +8524,7 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
     svc.queue_timeout_s = float(queue_timeout) if queue_timeout is not None else None
     if a.engine == "strata":                            # the model card's sampling when nothing else is said (see MODEL_CARD_SAMPLING)
         svc.model_arch = cfg.get("arch") or "qwen4exp"
-        svc.set_family(None)
+        svc.set_family(svc.model_arch if svc.model_arch == "inkling2" else None)
         requested = cfg.get("parallel")
         if requested is None:
             args = cfg.get("args", [])
@@ -8559,7 +8568,7 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
             svc.config_effort = clean_shared_defaults({"reasoning_effort": cfg["reasoning_effort"]}).get("reasoning_effort")
         except ValueError as e:
             raise SystemExit(f"[strata] config {e}")
-        if svc.config_effort:
+        if svc.config_effort is not None:
             print(f"[strata] thinking level: {svc.config_effort} (reasoning_effort in the config; a request, or the "
                   "Chat settings shared with other apps, can set its own)", flush=True)
     svc.codex_thread_titles = cfg.get("codex_thread_titles") is True    # #923: opt-in, off by default

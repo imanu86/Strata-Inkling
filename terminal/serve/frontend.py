@@ -28,6 +28,7 @@ from pathlib import Path
 
 import jinja2
 from jinja2.sandbox import ImmutableSandboxedEnvironment
+from jinja2.ext import Extension
 
 LOGGER = logging.getLogger(__name__)
 
@@ -36,6 +37,16 @@ LOGGER = logging.getLogger(__name__)
 class TemplateRequestError(jinja2.exceptions.TemplateError, ValueError):
     """The template refused the request's messages (e.g. "No user query found in messages."): a ValueError, so the
     client gets a 400 with the template's message instead of a dropped connection (#365)."""
+
+
+class _GenerationExtension(Extension):
+    """Render transformers' assistant-mask blocks normally; this server does not request token masks."""
+    tags = {"generation"}
+
+    def parse(self, parser):
+        line = next(parser.stream).lineno
+        body = parser.parse_statements(("name:endgeneration",), drop_needle=True)
+        return jinja2.nodes.Scope(body).set_lineno(line)
 
 
 class ChatTemplate:
@@ -48,7 +59,8 @@ class ChatTemplate:
         def tojson(x, ensure_ascii=False, indent=None, separators=None, sort_keys=False):
             return json.dumps(x, ensure_ascii=ensure_ascii, indent=indent, separators=separators, sort_keys=sort_keys)
 
-        env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True, extensions=["jinja2.ext.loopcontrols"])
+        env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True,
+                                           extensions=["jinja2.ext.loopcontrols", _GenerationExtension])
         env.filters["tojson"] = tojson
         env.globals["raise_exception"] = raise_exception
         self.source = Path(path).read_text(encoding="utf-8")
@@ -83,6 +95,7 @@ class ChatTemplate:
                   "parameters": {"type": "object", "properties": {"arg": {"type": "string"}}}}
                  for i in range(2)]
         tool_prompt = render([user], tools)
+        inkling = "<|content_invoke_tool_json|>" in self.source and "<|message_model|>" in self.source
 
         def calls_supported(count):
             calls = [{"name": f"strata_caps_call_{i}", "arguments": {"arg": f"strata_caps_arg_{i}"}}
@@ -92,6 +105,12 @@ class ChatTemplate:
             replies = [f"strata_caps_result_{i}" for i in range(count)]
             messages += [{"role": "tool", "content": reply} for reply in replies] + [user]
             prompt = render(messages, tools)
+            if inkling:
+                parser = InklingOutputParser(thinking=False, tools=tools)
+                events = parser.feed(prompt) + parser.finish()
+                parsed = [{"name": event.call.name, "arguments": event.call.arguments}
+                          for event in events if event.kind == "tool_call"]
+                return parsed == calls and all(reply in prompt for reply in replies)
             # Instructions include example XML and literal tag names, which are not model output. Parse only
             # complete calls to our probe functions, using the same body parser as OutputParser.
             bodies = re.findall(r"<tool_call>\s*(<function=strata_caps_call_\d+>.*?</function>)\s*</tool_call>",
@@ -105,8 +124,9 @@ class ChatTemplate:
 
         history = [user, {"role": "assistant", "content": "strata_caps_answer",
                           "reasoning_content": "strata_caps_reasoning"}, user]
+        tool_markers = ("tool_declare", "<|content_xml|>") if inkling else ("<tool_call>", "<function=")
         return {"supports_tools": all(s in tool_prompt for s in
-                                      ("strata_caps_call_0", "strata_caps_description", "<tool_call>", "<function=")),
+                                      ("strata_caps_call_0", "strata_caps_description", *tool_markers)),
                 "supports_tool_calls": calls_supported(1),
                 "supports_system_role": "strata_caps_system" in render(
                     [{"role": "system", "content": "strata_caps_system"}, user]),
@@ -137,24 +157,43 @@ EFFORT = {"none": None, "off": None, "minimal": None, "disabled": None, "false":
 
 
 _EFFORT_QWEN = dict(EFFORT)
+_EFFORT_INKLING = {"none": "none", "off": "none", "disabled": "none", "false": "none",
+                   "minimal": "minimal", "low": "low", "medium": "medium", "high": "high",
+                   "xhigh": "xhigh", "max": "max", "maximum": "max"}
+_EFFORT_FAMILY = None
 
 
 def use_family(family: str | None) -> None:
-    """The reasoning-effort words of the model family this server runs (module state, like ENV_TO_USER): the Qwen table."""
+    """Select the running model's effort vocabulary (module state, like ENV_TO_USER)."""
+    global _EFFORT_FAMILY
+    _EFFORT_FAMILY = family
     EFFORT.clear()
-    EFFORT.update(_EFFORT_QWEN)
+    EFFORT.update(_EFFORT_INKLING if family == "inkling2" else _EFFORT_QWEN)
 
 
 def effort_kwargs(value) -> dict:
     """A reasoning effort as given by a client -> the template's kwargs.  Unknown values are a 400, not a crash."""
     if value is None or value == "":
         return {}
+    if _EFFORT_FAMILY == "inkling2":
+        # The official template maps the named levels itself. In particular high is 0.9, while xhigh is 0.99;
+        # Qwen's historical high -> xhigh and minimal -> off aliases must not be applied here.
+        if isinstance(value, bool):
+            raise ValueError("reasoning effort must be a level or a finite number from 0 to 0.99, not a boolean")
+        if isinstance(value, (int, float)):
+            if not 0 <= value <= 0.99:
+                raise ValueError("reasoning effort must be a finite number from 0 to 0.99")
+            return {"reasoning_effort": float(value), **({"enable_thinking": False} if value == 0 else {})}
     if value is False:
         return {"enable_thinking": False}
     key = str(value).strip().lower()
     if key not in EFFORT:
-        raise ValueError(f"unknown reasoning effort {value!r}: use none, low, medium or high")
+        levels = "none, minimal, low, medium, high, xhigh, max or a number from 0 to 0.99" \
+            if _EFFORT_FAMILY == "inkling2" else "none, low, medium or high"
+        raise ValueError(f"unknown reasoning effort {value!r}: use {levels}")
     level = EFFORT[key]
+    if _EFFORT_FAMILY == "inkling2" and level == "none":
+        return {"reasoning_effort": "none", "enable_thinking": False}
     return {"enable_thinking": False} if level is None else {"reasoning_effort": level}
 
 
@@ -846,7 +885,7 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
         req["reasoning_budget_tokens"] = bt
     if isinstance(thinking, dict) and thinking.get("type") == "disabled":
         kwargs["enable_thinking"] = False
-    elif effort:
+    elif effort or (_EFFORT_FAMILY == "inkling2" and effort is not None and effort != ""):
         kwargs.update(effort_kwargs(effort))
     elif isinstance(thinking, dict) and thinking.get("budget_tokens"):
         kwargs.update(budget_effort(thinking["budget_tokens"]))
@@ -1303,6 +1342,17 @@ def forced_call(tool_choice, tools: list[dict] | None, callable_tools: list[dict
     print(f"[strata] tool_choice {json.dumps(tool_choice)[:200]} is not supported here (or names no tool of the "
           "request): the model decides, as with \"auto\"", flush=True)
     return None
+
+
+def inkling_force_text(force: str | None) -> str | None:
+    """Translate forced_call's validated opening into Inkling's native JSON tool channel."""
+    if force is None:
+        return None
+    match = re.search(r"<function=([^>]+)>", force)
+    if match:
+        name = match.group(1)
+        return _INK_MSG + name + _INK_TOOL_JSON + '{"name":' + json.dumps(name, ensure_ascii=False) + ',"args":'
+    return _INK_MSG + _INK_TOOL_JSON + '{"name":'
 
 
 PARAM_START = "<parameter="
