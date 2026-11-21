@@ -651,6 +651,10 @@ if(STRATA_NATIVE_EXPERTS)
     if(STRATA_ENABLE_CUDA)
       target_compile_definitions(inkling_q3_parity PRIVATE STRATA_INKLING_Q3_CUDA=1)
       target_link_libraries(inkling_q3_parity PRIVATE strata_kernels strata_kernels_cpu CUDA::cudart)
+      # Standalone GPU regression; invoke with --device N to select an inference card.
+      add_executable(inkling_swa_ring tests/quant/inkling_swa_ring.cu)
+      target_link_libraries(inkling_swa_ring PRIVATE CUDA::cudart)
+      set_target_properties(inkling_swa_ring PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
     endif()
     # GPU runs select an inference card explicitly with --device N.
     add_test(NAME inkling_q3_cpu COMMAND inkling_q3_parity --cpu-only)
