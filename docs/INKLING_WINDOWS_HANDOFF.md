@@ -551,3 +551,68 @@ CTest su Windows 2/2. Eseguibili CMake `inkling_gpu_pq` e `inkling_depth_split` 
 ### Controlli QKV multi-riga nella verifica
 
 Il prototipo in `C:/Users/imanu/Documents/Codex/inkling-mtp-verify-qkv-lab` applica le tre operazioni del controller Q/K/V usate a T1 a più righe indipendenti durante la verifica. Sul prompt greedy da 384 token il BAB dà **65,88 / 58,81 / 65,80 t/s**. I due B accettano 184/395 e A accetta 180/404. B coincide con il target singolo per i primi 166 token, A per i primi 120. Il testo cambia, quindi la differenza di velocità comprende anche il diverso lavoro di generazione. In italiano, con K2 fisso, il prototipo misura **72,70 / 55,01 / 42,13 t/s** a 128/512/1.000, contro 67,50 / 51,54 / 40,08 del preset fisso. Le prove italiane del prototipo sono pilot singoli. Il preset pubblicato usa il verificatore precedente; il prototipo e i log completi sono recuperabili in `astra-mtp-bench/control-*`. Alla fine delle prove la porta 8100 era libera, con 0 MiB usati sulle due GPU di inferenza.
+
+## Ricerca dei 150 t/s in chat singola e verifica Kuraneko Round 5
+
+21 novembre 2026. Dati di decode su Inkling-2-Mini. Le cifre pubblicate da altri sono separate dalle misure sulla workstation.
+
+**Risultati pubblicati.** Project Maya con una 3090 e UD-Q4_K_XL riporta 123/129 t/s sulla prosa (plain/DSpark), 123/161 sul codice con finestra fissa da 5 token e 121/211 in editing. La sua finestra dedicata verifica 5 posizioni in 15,6 ms, contro 40,8 passando per forward; un token plain richiede 7,8 ms. Il drafter della release richiede una sola GPU. La PR Windows #1106 misura 110-113 sulla prosa e 114-173 sul codice, greedy, thinking disattivato, una sola 3090, una corsa per build. NInfer con IQ4_XS riporta 154,5 sul task Python greedy e 136,5 a temperatura 1. Il port Ampere vLLM con checkpoint originale e sette proposte riporta 91 senza DSpark e 112-147 con DSpark, con capacità 131072. [Maya #1095](https://github.com/mw00/project-maya/pull/1095), [Windows #1106](https://github.com/mw00/project-maya/pull/1106), [NInfer](https://github.com/iamwavecut/ninfer-all/blob/8c6eed17e44e41041a96a8323fa41c7acca4a0c0/docs/inkling2.md), [vLLM Ampere](https://github.com/Hiutaky/vllm/blob/6e9d1cce3e/INKLING2-RTX3090.md).
+
+**Strata.** Le PR aperte #6506 e #6520 sono due implementazioni distinte. Nel sorgente #6506 a 5b272b2b60 la configurazione looped con draft viene rifiutata. #6520 carica il checkpoint ufficiale e riporta circa 92 t/s residenti su 3090; al momento della verifica era draft e monogpu. La segnalazione comunitaria sullo scambio delle norme del drafter è stata controllata: il nostro codice applica già output_norm al blocco finale e dspark_norm alle feature Markov. [PR #6506](https://github.com/Niko1221/Strata/pull/6506), [PR #6520](https://github.com/Niko1221/Strata/pull/6520), [segnalazione](https://github.com/Niko1221/Strata/pull/6506#issuecomment-7068154732).
+
+**Kuraneko.** Dal precedente controllo 602dbbc591 a 74bbd802af ci sono 15 commit. A 9056d598 la full attention Q8 ha un percorso dedicato per T=4, una posizione anchor e tre proposte. Su V100 Q4_K_M, greedy, 64 output, la serie pubblicata passa da 68,7 a 100,2 t/s al contesto realmente occupato di 262144; a 512 input passa da 130,5 a 130,2. [Tabella upstream](https://github.com/kuraneko1/Strata/blob/74bbd802af/docs/bench-results/2026-11-22-v100-inkling2-800k/README.md).
+
+**Prototipo locale.** Dal commit 9056d598 sono stati estratti il kernel verify4 e la riduzione degli split. Nel microbenchmark, con KV sintetica identica e scale diverse per testa, si riduce l'errore cambiando l'ordine della dequantizzazione: prima si recupera l'intero con segno, poi si moltiplica per la scala. A 10k la differenza L2 relativa dal percorso corrente passa dal 2,43% a circa 0,0255%. La versione corretta impiega 162 microsecondi contro 1779 sulla 2080 Ti, 92 contro 1414 sulla 3080 Ti per questa sola full attention, con 24 teste Q e 8 KV. Nel motore la prova usa questa versione corretta, solamente durante la verifica a quattro righe; stesso binario per A e B, stessa configurazione Q3, KV Q8, chunk64, due GPU, capacità 262144. Tutti i 3072 esperti sono residenti. Il banco usa warmup distinto e zero riuso di input; nessun restore SSD.
+
+| Prova, MTP fisso K3 | B1 nuovo | A corrente | B2 nuovo |
+|---|---:|---:|---:|
+| 10.000 input reali, 128 output, t/s | 50,11 | 43,30 | 49,74 |
+| 99 input, 512 output, t/s | 40,68 | 50,98 | 40,44 |
+
+Nelle due prove i B hanno gli stessi ID tra loro. Rispetto ad A la prima differenza è al token 19 sui 10k e al 56 sul prompt corto. Le accettazioni al contesto lungo sono 67/174 contro 71/163, sul corto 157/1056 contro 228/843. I delta end-to-end includono la diversa sequenza generata. Il kernel resta nel laboratorio.
+
+**Codice ed editing sulla build pubblicata ad37bc62 e sul prototipo QKV.** Il task Python LRU con TTL proviene da tools/bench/refbench.py di NInfer; l'identità con la singola corsa da 154,5 non è documentata. Il task di editing locale chiede una sola sostituzione in una nota tecnica. Prompt e confronto integrale con il testo atteso sono negli artefatti. Greedy, KV Q8, seed e lunghezze massime invariati fra varianti. Con effort high tutti i primi 384 token del task Python sono reasoning; 81,15 t/s senza DSpark e 68,86/68,30 con K4. Anche con il solo effort none, a 384 token il parser conta zero caratteri visibili sul task Python. La serie seguente precompila esplicitamente i due identificatori di apertura del testo visibile per misurare il codice e il documento emessi. Le cifre escludono il prefill. Le righe control-B1/B2 usano il prototipo QKV multi-riga della sessione precedente, control-A la build pubblicata. Nel confronto control il task di codice usa K4 e l'editing usa K7. K4 e K7 sono il numero di proposte oltre l'anchor.
+
+| Prova | Token emessi | Decode t/s | Accettati/offerti | Termine |
+|---|---:|---:|---:|---|
+| code-visible-AR | 384 | 81.46 | 0/0 | length |
+| code-visible-control-A | 384 | 81.43 | 260/491 | length |
+| code-visible-control-B1 | 384 | 87.95 | 262/484 | length |
+| code-visible-control-B2 | 384 | 87.86 | 262/484 | length |
+| code-visible-K4-B1 | 384 | 81.46 | 260/491 | length |
+| code-visible-K4-B2 | 384 | 81.51 | 260/491 | length |
+| edit-visible-AR | 206 | 85.69 | 0/0 | stop |
+| edit-visible-control-A | 206 | 156.80 | 178/189 | stop |
+| edit-visible-control-B1 | 206 | 159.30 | 178/189 | stop |
+| edit-visible-control-B2 | 206 | 159.00 | 178/189 | stop |
+| edit-visible-K4-B1 | 206 | 124.51 | 164/168 | stop |
+| edit-visible-K4-B2 | 206 | 124.42 | 164/168 | stop |
+| edit-visible-K7 | 206 | 157.55 | 178/189 | stop |
+
+Editing completo e conforme al testo atteso (spazi esterni ignorati): AR sì, control-A sì, control-B1 sì, control-B2 sì, K4-B1 sì, K4-B2 sì, K7 sì.
+
+I report con tempi di prefill, wall time, conteggi e ID dei token sono in D:/ds4_work/inkling2/astra-mtp-bench/. La sottocartella repo-scan-2046 contiene summary.json, le sorgenti del microbenchmark, il binario di laboratorio e gli script per ripetere le prove. La build del Daily e i suoi preset restano quelli del precedente checkpoint.
+
+### Preset operativo per l'editing diretto su HTTP
+
+Il preset separato `D:/ds4_work/inkling2/config/inkling-dual-edit-visible-k7.json` usa il binario pubblicato ad37bc62 e il normale endpoint `/v1/chat/completions`. Imposta temperatura zero, effort none e sette proposte. Una copia del tokenizer in `D:/ds4_work/inkling2/pack/tokenizer-edit-visible-v1` usa gli stessi file di vocabolario e tokenizzazione del preset. Il solo template, su un turno utente senza strumenti e a effort zero, aggiunge i due marcatori `<|message_model|><|content_text|>` al prompt. Questo avvia direttamente la risposta visibile. Controllati cinque casi di rendering, inclusi effort high, strumenti e render senza apertura generazione. Il chiamante può richiedere altri valori di temperatura ed effort; i dati sotto sono per i default del preset.
+
+Banco HTTP B-A-B con un processo per passaggio, stesso binario e stesso template. La richiesta di editing seguiva un warmup distinto. Il client ha omesso temperatura ed effort, ha permesso fino a 1.000 token e ha ricevuto il documento completo con stop naturale in tutti i casi. Input 262 ID, zero riuso al turno misurato, 206 token emessi. Verificata la corrispondenza integrale del testo, ignorando solo gli spazi esterni. Al secondo turno il server ha risposto «archive directory». La metrica storica del banco usa 205 intervalli di decode; il server divide 206 token per lo stesso tempo.
+
+| Passaggio | Decode banco t/s | API t/s | HTTP completo | Proposte accettate/offerte |
+|---|---:|---:|---:|---:|
+| B1, DSpark K7 | 160.55 | 161.3 | 1.938 s | 178/189 |
+| A, senza MTP | 88.56 | 89.0 | 3.063 s | 0/0 |
+| B2, DSpark K7 | 160.52 | 161.3 | 1.938 s | 178/189 |
+
+Con il template ordinario e K7 il modello svolge anche il ragionamento: stessa modifica esatta, 524 token generati in 5,25 s HTTP completi, 114,23 t/s secondo la metrica del banco. Senza MTP, 524 token in 6,875 s HTTP e 84,92 t/s. Il distinto guadagno dovuto al template e quello dovuto alla speculazione sono quindi misurabili.
+
+Per il lancio dalla directory terminal del fork Inkling:
+
+```powershell
+python -m serve.server --engine strata --config D:/ds4_work/inkling2/config/inkling-dual-edit-visible-k7.json --host 127.0.0.1 --port 8100
+```
+
+Il task Python con apertura visibile dà 81,46 t/s senza draft e 81,46/81,51 a K4 sulla build pubblicata, con tutti i 384 ID identici. Le 260 proposte accettate implicano 3,11 token per round e circa 38,2 ms per round compresa la proposta. A parità di accettazione servirebbero 20,8 ms per 150 t/s. La traccia più pertinente da portare da Maya è il suo verificatore dedicato alle finestre corte, con graph per larghezza e rollback delle convoluzioni in un lancio. [Codice del verificatore Maya](https://github.com/mw00/project-maya/blob/v1.1.72/src/ik2/ik2_main.cu#L2490).
+
+I processi HTTP di prova sulla porta 18166 sono stati scaricati e terminati. Preset originari e daily Qwen restano disponibili.
