@@ -101,6 +101,21 @@ QWEN2_PATTERN = (
 )
 
 
+# Exact Split.Regex in thinkingmachines/Inkling-2-Mini tokenizer.json,
+# revision ed40e7da625f594fc9c4990f5f66be24873c22d7. The following ByteLevel stage has use_regex=false.
+# This is one O200k-style pattern, not DeepSeek's sequence of number/CJK/word patterns.
+INKLING2_PATTERN = (
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?"
+    r"|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?"
+    r"|\p{N}{1,3}"
+    r"| ?[^\s\p{L}\p{N}]+[\r\n/]*"
+    r"|\s*[\r\n]+"
+    r"|\s+(?!\S)"
+    r"|\s+"
+)
+INKLING2_PATTERN_SOURCE = "thinkingmachines/Inkling-2-Mini@ed40e7da625f594fc9c4990f5f66be24873c22d7 tokenizer.json pre_tokenizer.Split.Regex"
+
+
 def _sequence_findall(patterns, text: str) -> list[str]:
     """llama.cpp's unicode_regex_split: the pieces of `text` after each pattern in turn splits every piece into its
     matches and the unmatched spans between them."""
@@ -125,13 +140,13 @@ class UnknownPreTokenizer(ValueError):
 
 
 def pre_tokenizer_kind(pre) -> str | None:
-    """The splitting rule `pre` (the GGUF's tokenizer.ggml.pre, or a pack's tokenizer.json "pre") stands for: "qwen35", "qwen2", "deepseek3", or
+    """The splitting rule `pre` (the GGUF's tokenizer.ggml.pre, or a pack's tokenizer.json "pre") stands for: "qwen35", "qwen2", "deepseek3", "inkling2", or
     None for a type this file does not know.  An empty or missing value is the qwen35 default, as it always was."""
     p = "qwen35" if pre is None or pre == "" else str(pre)
     if p == "qwen35":
         return "qwen35"
     if p == "inkling2":
-        return "deepseek3"
+        return "inkling2"
     if p == "qwen2":
         return "qwen2"
     if p.startswith("deepseek"):
@@ -171,6 +186,9 @@ class Tokenizer:
             self._split = lambda text: _sequence_findall(seq, text)
         elif pre_tokenizer_kind(pre) == "qwen2":
             self._re = regex.compile(QWEN2_PATTERN)
+            self._split = self._re.findall
+        elif pre_tokenizer_kind(pre) == "inkling2":
+            self._re = regex.compile(INKLING2_PATTERN)
             self._split = self._re.findall
         else:
             self._re = regex.compile(QWEN35_PATTERN)
@@ -528,8 +546,9 @@ def extract(gguf_path, out_dir) -> dict:
         "add_bos_token": False,
         # The pattern is SHIPPED, not recomputed by the reader: it is transcribed from llama.cpp for the
         # declared `pre` type, and a C++ port that re-derived it would be free to get `\p{M}` wrong again.
-        "pre_pattern": QWEN35_PATTERN,
-        "pre_pattern_source": ".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)",
+        "pre_pattern": INKLING2_PATTERN if pre_tokenizer_kind(tk.pre) == "inkling2" else QWEN35_PATTERN,
+        "pre_pattern_source": INKLING2_PATTERN_SOURCE if pre_tokenizer_kind(tk.pre) == "inkling2" else
+                              ".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)",
     }
     (out / "vocab.json").write_text(json.dumps(tk.ids, ensure_ascii=False), encoding="utf-8")
     (out / "merges.txt").write_text("\n".join("%s %s" % k for k, _ in
