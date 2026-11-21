@@ -1,6 +1,7 @@
 // src/inkling2/inkling2_engine.cu - Standalone / integrated CUDA + AVX2 hybrid engine for Inkling-2-Mini (arch inkling2).
 #include "strata/inkling2/engine.hpp"
 #include "strata/inkling2/sampling.hpp"
+#include "strata/inkling2/replica_policy.hpp"
 #include "inkling2_kernels.cuh"
 
 #include "strata/artifact/gguf_reader.hpp"
@@ -83,6 +84,40 @@ struct DeviceScope {
     ~DeviceScope() { if (changed) cudaSetDevice(previous); }
     DeviceScope(const DeviceScope&) = delete;
     DeviceScope& operator=(const DeviceScope&) = delete;
+};
+
+// Opt-in replica storage: full residency is independent of compute ownership.
+struct ExpertReplica {
+    int device = -1;
+    cudaStream_t stream = nullptr;
+    std::vector<void*> allocs;
+    std::vector<uint8_t*> blobs;
+    std::vector<int32_t*> maps;
+    std::vector<std::vector<int32_t>> cold_of;
+    void *xq = nullptr, *scratch = nullptr;
+    int32_t *ids = nullptr, *starts = nullptr, *groups = nullptr, *dst = nullptr, *tok = nullptr;
+    unsigned long long* ptrs = nullptr;
+    float* parts = nullptr;
+    int32_t *host_ids = nullptr, *host_miss = nullptr;
+    uint8_t* host_xq = nullptr;
+    float* host_parts = nullptr;
+    int32_t* local_miss = nullptr;
+    float* local_parts = nullptr;
+    int64_t local_hits = 0, remote_hits = 0, relay_bytes = 0;
+    int64_t duplicate_entries = 0, missing_entries = 0;
+    double join_ms = 0;
+    size_t full_bytes = 0, hot_bytes = 0;
+    template<class T> void alloc(T** p, size_t bytes) {
+        CK(cudaMalloc((void**) p, bytes)); allocs.push_back(*p);
+    }
+    ~ExpertReplica() {
+        DeviceScope owner(device);
+        if (stream) cudaStreamSynchronize(stream);
+        for (void* p : allocs) cudaFree(p);
+        if (stream) cudaStreamDestroy(stream);
+        cudaFreeHost(host_ids); cudaFreeHost(host_miss);
+        cudaFreeHost(host_xq); cudaFreeHost(host_parts);
+    }
 };
 
 struct Hparams {
@@ -794,6 +829,8 @@ struct Engine {
     std::vector<strata::kernels::cpu::ExpertJobMulti> jobs;
 #endif
 
+    std::unique_ptr<ExpertReplica> replica;
+
     // Stats
     int64_t hy_gpu = 0, hy_cpu = 0;
     double hy_cpu_ms = 0.0;
@@ -802,8 +839,22 @@ struct Engine {
     size_t vram_free_after_place = 0;
     int pool_workers = 0;
 
+    void print_replica_stats(const char* event) const {
+        if (!replica) return;
+        std::fprintf(stderr, "REPLICA {\"event\":\"%s\",\"local_hits\":%lld,\"remote_hits\":%lld,\"computed_entries\":%lld,\"duplicate_entries\":%lld,\"missing_entries\":%lld,\"ownership_scope\":\"per_entry_plan\",\"relay_bytes\":%lld,\"join_ms\":%.3f}\n",
+            event, (long long) replica->local_hits, (long long) replica->remote_hits,
+                (long long) (replica->local_hits + replica->remote_hits),
+                (long long) replica->duplicate_entries, (long long) replica->missing_entries,
+                (long long) replica->relay_bytes, replica->join_ms);
+    }
+
     void reset_hybrid_stats() {
         hy_gpu = hy_cpu = 0; hy_cpu_ms = 0;
+        if (replica) {
+            replica->local_hits = replica->remote_hits = replica->relay_bytes = 0;
+            replica->join_ms = 0;
+            replica->duplicate_entries = replica->missing_entries = 0;
+        }
         if (role == Role::Outer && split_peer) split_peer->reset_hybrid_stats();
     }
     int64_t total_hy_gpu() const { return hy_gpu + (role == Role::Outer && split_peer ? split_peer->hy_gpu : 0); }
@@ -966,6 +1017,12 @@ struct Engine {
 
     ~Engine() {
         DeviceScope owner(device);
+        if (replica) {
+            cudaStreamSynchronize(st);
+            print_replica_stats("FINAL");
+            cudaFree(replica->local_miss); cudaFree(replica->local_parts);
+            replica.reset();
+        }
         if (core_graph) cudaGraphExecDestroy(core_graph);
         if (capture_core_graph) cudaGraphExecDestroy(capture_core_graph);
         if (verify_core_graph) cudaGraphExecDestroy(verify_core_graph);
@@ -1163,6 +1220,7 @@ struct Engine {
 
     void reset_state() {
         DeviceScope owner(device);
+        if (replica) refresh_replica_hot();
         pos = 0;
         for (int il = 0; il < m->hp.n_layer; ++il) {
             if (!owns_virtual(il)) continue;
@@ -1404,6 +1462,96 @@ struct Engine {
         for (int k = 0; k < 2 && pp_kick_idx < pp_tasks.size(); ++k) pp_kick_next();
     }
 
+    // Only called at request reset, after the previous request has completed.
+    // Scores contain actual routed entries, including all three core visits.
+    void refresh_replica_hot() {
+        auto& r = *replica;
+        CK(cudaStreamSynchronize(st));
+        { DeviceScope remote(r.device); CK(cudaStreamSynchronize(r.stream)); }
+        const int ne = (int) m->hp.n_expert;
+        std::vector<uint8_t> blob;
+        int loaded = 0;
+        for (size_t ip = 0; ip < m->layers.size(); ++ip) {
+            auto& L = m->layers[ip];
+            const auto order = replica_hot_order(L.score, L.n_slots);
+            std::fill(L.slot_of.begin(), L.slot_of.end(), -1);
+            std::vector<int32_t> cold((size_t) ne);
+            for (int e = 0; e < ne; ++e) cold[e] = e;
+            blob.resize(L.L.bytes);
+            for (int slot = 0; slot < (int) order.size(); ++slot) {
+                const int e = order[slot];
+                build_expert_blob(L, e, blob.data());
+                CK(cudaMemcpy(L.d_blobs + (size_t) slot * L.stride, blob.data(), L.L.bytes, cudaMemcpyHostToDevice));
+                L.slot_of[e] = slot;
+                cold[e] = -1;
+                ++loaded;
+            }
+            CK(cudaMemcpy(L.d_slot_of, L.slot_of.data(), (size_t) ne * sizeof(int32_t), cudaMemcpyHostToDevice));
+            r.cold_of[ip] = cold;
+            { DeviceScope remote(r.device);
+              CK(cudaMemcpy(r.maps[ip], cold.data(), (size_t) ne * sizeof(int32_t), cudaMemcpyHostToDevice)); }
+        }
+        std::fprintf(stderr, "REPLICA {\"event\":\"RESET\",\"hot_loaded\":%d,\"source\":\"observed_router_counts\",\"update\":\"request_reset\"}\n", loaded);
+    }
+
+    void run_replica_moe(PhysLayer& L, int il, const float* x_norm, int T) {
+        auto& r = *replica;
+        const auto& hp = m->hp;
+        const int N = (int) hp.n_embd, top = (int) hp.n_expert_used, ne = (int) hp.n_expert;
+        const int entries = T * top;
+        const size_t qbytes = (size_t) T * (N / 32) * 36;
+        const size_t pbytes = (size_t) entries * N * sizeof(float);
+        K::quantize_q8_1_rows(x_norm, T, N, xq, st);
+        CK(cudaMemcpyAsync(r.host_ids, ids, (size_t) entries * sizeof(int32_t), cudaMemcpyDeviceToHost, st));
+        CK(cudaMemcpyAsync(r.host_xq, xq, qbytes, cudaMemcpyDeviceToHost, st));
+        CK(cudaStreamSynchronize(st)); // portable pinned host relay, never peer/UVA
+        int misses = 0;
+        const int ip = hp.loop_layer(il);
+        for (int e = 0; e < entries; ++e) {
+            const int x = r.host_ids[e];
+            if (x < 0 || x >= ne) { std::fprintf(stderr, "strata-inkling2: invalid replica router ID\n"); std::exit(1); }
+            const int owners = (L.slot_of[x] >= 0) + (r.cold_of[ip][x] >= 0);
+            r.duplicate_entries += owners > 1;
+            r.missing_entries += owners == 0;
+            if (owners != 1) { std::fprintf(stderr, "strata-inkling2: replica ownership partition failed\n"); std::exit(1); }
+            L.score[x] += 1.0;
+            r.host_miss[e] = L.slot_of[x] < 0;
+            misses += r.host_miss[e];
+        }
+        hy_gpu += entries;
+        r.local_hits += entries - misses;
+        r.remote_hits += misses;
+        const auto join_start = Clock::now();
+        // Launch cold work first; host switches context while this stream computes.
+        if (misses) {
+            DeviceScope remote(r.device);
+            CK(cudaMemcpyAsync(r.ids, r.host_ids, (size_t) entries * sizeof(int32_t), cudaMemcpyHostToDevice, r.stream));
+            CK(cudaMemcpyAsync(r.xq, r.host_xq, qbytes, cudaMemcpyHostToDevice, r.stream));
+            k_group_experts<<<1,128,0,r.stream>>>(r.ids, r.maps[ip], r.blobs[ip], L.stride, entries, ne, ne,
+                r.ptrs, r.starts, r.groups, r.dst, r.tok, top);
+            K::native_expert_grouped(L.L, r.ptrs, r.starts, r.groups, r.dst, r.tok,
+                std::min(entries, ne), entries, r.xq, r.scratch, r.parts, r.stream);
+            CK(cudaMemcpyAsync(r.host_parts, r.parts, pbytes, cudaMemcpyDeviceToHost, r.stream));
+        }
+        if (entries > misses) {
+            k_group_experts<<<1,128,0,st>>>(ids, L.d_slot_of, L.d_blobs, L.stride, entries, ne, L.n_slots,
+                grp_ptr, grp_start, n_groups, ent_dst, ent_tok, top);
+            K::native_expert_grouped(L.L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok,
+                std::min(entries, ne), entries, xq, escr, eparts, st);
+        }
+        if (misses) {
+            { DeviceScope remote(r.device); CK(cudaStreamSynchronize(r.stream)); }
+            CK(cudaMemcpyAsync(r.local_parts, r.host_parts, pbytes, cudaMemcpyHostToDevice, st));
+            CK(cudaMemcpyAsync(r.local_miss, r.host_miss, (size_t) entries * sizeof(int32_t), cudaMemcpyHostToDevice, st));
+            k_merge_cpu<<<(unsigned) entries,kThreads,0,st>>>(eparts, r.local_parts, r.local_miss, N);
+            r.relay_bytes += (int64_t) 2 * (qbytes + (size_t) entries * sizeof(int32_t) + pbytes);
+        }
+        // Original top-k entry order and combine arithmetic are preserved.
+        k_combine_experts<<<dim3((unsigned)((N+255)/256),(unsigned)T),256,0,st>>>(eparts, ewts, moe_raw, N, top);
+        CK(cudaStreamSynchronize(st)); // staging reused on the next physical visit
+        r.join_ms += ms_since(join_start);
+    }
+
     void run_moe(PhysLayer& L, int il, const float* x_norm, int T) {
         const auto& hp = m->hp;
         const int N = (int) hp.n_embd, Kp = (int) hp.n_expert_used;
@@ -1413,6 +1561,7 @@ struct Engine {
         k_route_inkling2<<<(unsigned) T, 32, 0, st>>>(router_logits, L.exp_probs_b, ids, ewts, (int) hp.n_expert, Kp, hp.expert_weights_scale);
         if (prof_detail) { CK(cudaStreamSynchronize(st)); p_d_route += ms_since(tp_moe_r0); }
 
+        if (replica) { run_replica_moe(L, il, x_norm, T); return; }
         const bool has_gpu = L.n_slots > 0;
         const bool need_cpu = L.n_slots < hp.n_expert;
         const bool is_q5 = (L.L.gu_type == 13);
@@ -1590,7 +1739,7 @@ struct Engine {
     void rebalance(int max_swaps) {
         DeviceScope owner(device);
         if (role == Role::Outer && split_peer) split_peer->rebalance(max_swaps);
-        if (!hybrid) return;
+        if (replica || !hybrid) return;
         const int64_t ne = m->hp.n_expert;
         struct Cand {
             double gain;
@@ -2251,6 +2400,82 @@ struct Engine {
 
 };
 
+bool place_replica_experts(Model& m, Engine& E, int remote_device, size_t hot_budget, std::string& err) {
+    DeviceScope owner(E.device);
+    auto r = std::make_unique<ExpertReplica>();
+    r->device = remote_device;
+    const int ne = (int) m.hp.n_expert;
+    const size_t entries = (size_t) E.tmax * m.hp.n_expert_used;
+    const size_t qbytes = (size_t) E.tmax * (m.hp.n_embd / 32) * 36;
+    const size_t pbytes = entries * m.hp.n_embd * sizeof(float);
+    const size_t scratch_bytes = K::native_expert_scratch_bytes(entries, m.hp.n_ff);
+    const size_t reserve = (size_t) 512 << 20;
+    size_t strides = 0, full_bytes = 0;
+    for (const auto& L : m.layers) {
+        if (L.gu_type == 30 || !L.stride) { err = "replica requires native GPU expert layouts for every physical layer"; return false; }
+        strides += L.stride;
+        full_bytes += (size_t) ne * L.stride;
+    }
+    size_t free_bytes = 0, total = 0;
+    CK(cudaMemGetInfo(&free_bytes, &total));
+    const size_t local_extra = pbytes + entries * sizeof(int32_t) + m.layers.size() * ne * sizeof(int32_t);
+    if (free_bytes < reserve + local_extra) { err = "replica dense GPU lacks workspace reserve after full-capacity KV allocation"; return false; }
+    hot_budget = std::min(hot_budget, free_bytes - reserve - local_extra);
+    const int slots = (int) std::min<size_t>(ne, hot_budget / strides);
+    r->hot_bytes = (size_t) slots * strides;
+    r->full_bytes = full_bytes;
+    const size_t remote_extra = qbytes + pbytes + scratch_bytes + entries * 3 * sizeof(int32_t) +
+        (m.layers.size() * ne + ne + 2) * sizeof(int32_t) + ne * sizeof(unsigned long long);
+    { DeviceScope remote(remote_device);
+      CK(cudaMemGetInfo(&free_bytes, &total));
+      if (free_bytes < full_bytes + remote_extra + reserve) {
+          err = "replica GPU cannot hold all experts plus scratch and 512 MiB reserve"; return false;
+      }
+      CK(cudaStreamCreateWithFlags(&r->stream, cudaStreamNonBlocking));
+      r->alloc(&r->xq, qbytes); r->alloc(&r->scratch, scratch_bytes);
+      r->alloc(&r->ids, entries * sizeof(int32_t));
+      r->alloc(&r->starts, (ne+1) * sizeof(int32_t)); r->alloc(&r->groups, sizeof(int32_t));
+      r->alloc(&r->dst, entries * sizeof(int32_t)); r->alloc(&r->tok, entries * sizeof(int32_t));
+      r->alloc(&r->ptrs, ne * sizeof(unsigned long long)); r->alloc(&r->parts, pbytes);
+      std::vector<uint8_t> tmp;
+      std::vector<int32_t> identity((size_t) ne);
+      for (int e = 0; e < ne; ++e) identity[e] = e;
+      for (auto& L : m.layers) {
+          uint8_t* blobs = nullptr; int32_t* map = nullptr;
+          r->alloc(&blobs, (size_t) ne * L.stride); r->alloc(&map, ne * sizeof(int32_t));
+          r->blobs.push_back(blobs); r->maps.push_back(map); r->cold_of.push_back(identity);
+          tmp.resize(L.L.bytes);
+          for (int e = 0; e < ne; ++e) {
+              build_expert_blob(L, e, tmp.data());
+              CK(cudaMemcpy(blobs + (size_t) e * L.stride, tmp.data(), L.L.bytes, cudaMemcpyHostToDevice));
+          }
+          CK(cudaMemcpy(map, identity.data(), ne * sizeof(int32_t), cudaMemcpyHostToDevice));
+      }
+    }
+    CK(cudaHostAlloc(&r->host_ids, entries * sizeof(int32_t), cudaHostAllocPortable));
+    CK(cudaHostAlloc(&r->host_miss, entries * sizeof(int32_t), cudaHostAllocPortable));
+    CK(cudaHostAlloc(&r->host_xq, qbytes, cudaHostAllocPortable));
+    CK(cudaHostAlloc(&r->host_parts, pbytes, cudaHostAllocPortable));
+    CK(cudaMalloc(&r->local_miss, entries * sizeof(int32_t)));
+    CK(cudaMalloc(&r->local_parts, pbytes));
+    for (auto& L : m.layers) {
+        L.n_slots = slots;
+        L.score.assign(ne, 0); L.slot_of.assign(ne, -1);
+        CK(cudaMalloc(&L.d_slot_of, ne * sizeof(int32_t))); m.record_alloc(L.d_slot_of);
+        CK(cudaMemcpy(L.d_slot_of, L.slot_of.data(), ne * sizeof(int32_t), cudaMemcpyHostToDevice));
+        if (slots) { CK(cudaMalloc(&L.d_blobs, (size_t) slots * L.stride)); m.record_alloc(L.d_blobs); }
+    }
+    E.placed_slots = (int) m.layers.size() * ne;
+    E.placed_bytes = full_bytes + r->hot_bytes;
+    E.core_all_gpu = false; // no layer graphs: routing and pinned relay remain eager
+    CK(cudaMemGetInfo(&E.vram_free_after_place, &total));
+    std::fprintf(stderr, "REPLICA {\"event\":\"READY\",\"dense_device\":%d,\"replica_device\":%d,\"full_experts\":%d,\"hot_capacity\":%d,\"hot_loaded\":0,\"full_bytes\":%llu,\"hot_bytes\":%llu,\"reserve_bytes\":%llu,\"kv_capacity\":%d,\"cold_start\":true}\n",
+        E.device, remote_device, E.placed_slots, slots * (int) m.layers.size(),
+        (unsigned long long) full_bytes, (unsigned long long) r->hot_bytes, (unsigned long long) reserve, E.ctx);
+    E.replica = std::move(r);
+    return true;
+}
+
 bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::string& err) {
     DeviceScope owner(E.device);
     const auto t0 = Clock::now();
@@ -2705,6 +2930,8 @@ int run(int argc, char** argv) {
     int max_new = 32;
     int cpu_threads = 0;
     int layer_split_device = -1;
+    int expert_replica_device = -1, expert_dense_device = -1;
+    int expert_hot_mib = 4096;
     bool split_core_graph = false;
     bool split_outer_graph = false;
     bool batch_qkv_control_t1 = false;
@@ -2733,6 +2960,17 @@ int run(int argc, char** argv) {
         else if (a == "--chunk" || a == "--prefill") chunk = std::atoi(next_arg());
         else if (a == "--max-new" || a == "-n") max_new = std::atoi(next_arg());
         else if (a == "--tokens") tokens_str = next_arg();
+        else if (a == "--expert-replica-device" || a == "--expert-dense-device" || a == "--expert-hot-mib") {
+            const char* text = next_arg(); char* tail = nullptr;
+            const long value = std::strtol(text, &tail, 10);
+            const long limit = a == "--expert-hot-mib" ? 1048576 : 63;
+            if (!text[0] || *tail || value < 0 || value > limit) {
+                std::fprintf(stderr, "strata-inkling2: invalid value for %s\n", a.c_str()); return 2;
+            }
+            if (a == "--expert-replica-device") expert_replica_device = (int) value;
+            else if (a == "--expert-dense-device") expert_dense_device = (int) value;
+            else expert_hot_mib = (int) value;
+        }
         else if (a == "--expert-vram") expert_vram = std::atof(next_arg());
         else if (a == "--cpu-threads" || a == "--pool-workers") cpu_threads = std::atoi(next_arg());
         else if (a == "--dump-logits") dump_logits_path = next_arg();
@@ -2758,7 +2996,7 @@ int run(int argc, char** argv) {
     }
 
     if (model_path.empty()) {
-        std::fprintf(stderr, "usage: strata-inkling2 --model <file.gguf> [--max-context N] [--kv-q8|--kv-f16] [--tokens IDS] [--max-new N] [--dump-logits PATH] [--layer-split-device N [--split-core-graph] [--split-outer-graph]] [--batch-qkv-control-t1] [--draft DRAFT.gguf --spec K] [--bench] [--serve]\n");
+        std::fprintf(stderr, "usage: strata-inkling2 --model <file.gguf> [--max-context N] [--kv-q8|--kv-f16] [--tokens IDS] [--max-new N] [--dump-logits PATH] [--layer-split-device N [--split-core-graph] [--split-outer-graph]] [--batch-qkv-control-t1] [--expert-dense-device N --expert-replica-device N --expert-hot-mib MiB] [--draft DRAFT.gguf --spec K] [--bench] [--serve]\n");
         return 2;
     }
     if (split_core_graph && layer_split_device < 0) {
@@ -2774,6 +3012,17 @@ int run(int argc, char** argv) {
     }
     if (!oracle_tail.empty() && serve) {
         std::fprintf(stderr, "strata-inkling2: --verify-row0-oracle is a standalone CLI diagnostic, not a serve mode\n"); return 2;
+    }
+
+    if (expert_replica_device >= 0 || expert_dense_device >= 0) {
+        int count = 0; CK(cudaGetDeviceCount(&count));
+        if (expert_replica_device < 0 || expert_dense_device < 0 || expert_replica_device == expert_dense_device ||
+            expert_replica_device >= count || expert_dense_device >= count || layer_split_device >= 0 ||
+            !draft_path.empty() || max_ctx != 262144 || !kv_q8 || chunk < 1 || chunk > 64 || expert_vram >= 0 ||
+            split_core_graph || split_outer_graph || !oracle_tail.empty()) {
+            std::fprintf(stderr, "strata-inkling2: expert replica requires distinct available --expert-dense-device and --expert-replica-device, --max-context 262144 --kv-q8 --chunk 1..64 (operational:64); draft/MTP, layer split, split graphs, oracle and --expert-vram are incompatible\n"); return 2;
+        }
+        CK(cudaSetDevice(expert_dense_device));
     }
 
     Model m;
@@ -2845,7 +3094,9 @@ int run(int argc, char** argv) {
         if (split_core) split_core->enable_dspark(dspark.get());
         E.reset_state();
     }
-    if (!place_experts(m, E, expert_vram, cpu_threads, err) ||
+    if (!(expert_replica_device >= 0
+              ? place_replica_experts(m, E, expert_replica_device, (size_t) expert_hot_mib << 20, err)
+              : place_experts(m, E, expert_vram, cpu_threads, err)) ||
         (split_core && !place_experts(m, *split_core, expert_vram, cpu_threads, err))) {
         std::fprintf(stderr, "strata-inkling2: expert placement failed: %s\n", err.c_str());
         return 1;
@@ -2931,6 +3182,13 @@ int run(int argc, char** argv) {
                 q_lines.pop_front();
             }
             if (line == "QUIT" || line == "EXIT") break;
+            if (line == "RESET" && E.replica) {
+                E.reset_state();
+                E.reset_hybrid_stats();
+                live_tokens.clear(); snaps.clear(); hist.clear();
+                std::printf("RESET_OK\n"); std::fflush(stdout);
+                continue;
+            }
             if (line.rfind("GEN ", 0) == 0 || line == "GEN") {
                 stop_req.store(false, std::memory_order_release);
                 std::istringstream iss(line.size() > 4 ? line.substr(4) : "");
@@ -3088,6 +3346,7 @@ int run(int argc, char** argv) {
                             emitted, prompt.size(), pp_ms, tg_ms, finish,
                             dspark ? (long long) dspark->n_accepted : 0LL, dspark ? (long long) dspark->n_drafted : 0LL, reuse, (long long) E.total_hy_gpu(), lookups, fresh);
                 std::fflush(stdout);
+                E.print_replica_stats("DONE");
             }
         }
         if (reader.joinable()) reader.join();
@@ -3163,6 +3422,7 @@ int run(int argc, char** argv) {
         }
     }
     const double tg_ms = ms_since(t_tg0);
+    E.print_replica_stats("DONE");
     if (profile) E.print_prof("tg");
     if (dspark)
         std::fprintf(stderr, "strata-inkling2: dspark accepted=%lld offered=%lld draft_calls=%lld draft_ms=%.1f inject_ms=%.1f\n",
