@@ -68,6 +68,22 @@ inline double ms_since(Clock::time_point t0) {
         }                                                                                                         \
     } while (0)
 
+// CUDA's current device is thread-local. Every runtime, weight allocation and destruction
+// uses its owner explicitly; no peer access or UVA dereference is needed by the split path.
+struct DeviceScope {
+    int previous = -1;
+    bool changed = false;
+    explicit DeviceScope(int device) {
+        if (device < 0) return;
+        CK(cudaGetDevice(&previous));
+        changed = previous != device;
+        if (changed) CK(cudaSetDevice(device));
+    }
+    ~DeviceScope() { if (changed) cudaSetDevice(previous); }
+    DeviceScope(const DeviceScope&) = delete;
+    DeviceScope& operator=(const DeviceScope&) = delete;
+};
+
 struct Hparams {
     int64_t n_layer = 48;       // virtual layers
     int64_t n_phys = 24;        // physical layers
@@ -125,6 +141,7 @@ struct DenseMat {
 };
 
 struct PhysLayer {
+    int device = -1;
     bool is_swa = true;
     bool has_loop = false;
 
@@ -193,6 +210,13 @@ struct PhysLayer {
 struct Model {
     std::unique_ptr<strata::GgufModel> gguf;
     Hparams hp;
+    int main_device = 0;
+    int split_device = -1;     // < 0: the unchanged single-device placement
+
+    int layer_device(int ip) const {
+        return split_device >= 0 && hp.num_loops > 1 && ip >= hp.core_start && ip < hp.core_end
+                   ? split_device : main_device;
+    }
 
     const uint8_t* host_tok_embd = nullptr;    // [vocab_padded, n_embd] on host (mmap)
     int tok_embd_type = -1;
@@ -206,14 +230,15 @@ struct Model {
     bool has_quant_dense = false;
 
     std::vector<PhysLayer> layers;
-    std::vector<void*> gpu_allocs;
+    struct Allocation { void* p; int device; };
+    std::vector<Allocation> gpu_allocs;
     std::vector<void*> host_allocs;
     std::vector<void*> host_pinned_allocs;
     std::vector<void*> q8_packed_keys;
 
     ~Model() {
         for (void* p : q8_packed_keys) K::native_q8_0_packed_unregister(p);
-        for (void* p : gpu_allocs) cudaFree(p);
+        for (const auto& a : gpu_allocs) { DeviceScope owner(a.device); cudaFree(a.p); }
         for (void* p : host_pinned_allocs) cudaFreeHost(p);
         for (void* p : host_allocs) std::free(p);
     }
@@ -222,8 +247,14 @@ struct Model {
     T* gpu_alloc(size_t count) {
         T* p = nullptr;
         CK(cudaMalloc(&p, count * sizeof(T)));
-        gpu_allocs.push_back(p);
+        record_alloc(p);
         return p;
+    }
+
+    void record_alloc(void* p) {
+        int device = 0;
+        CK(cudaGetDevice(&device));
+        gpu_allocs.push_back({p, device});
     }
 
     const uint8_t* find_tensor(const char* name, const strata::TensorInfo** out = nullptr) const {
@@ -327,6 +358,7 @@ void build_expert_blob(const PhysLayer& L, int64_t e, uint8_t* dst) {
 }
 
 bool load_model(const std::string& path, Model& m, std::string& err) {
+    DeviceScope owner(m.main_device);
     const auto t0 = Clock::now();
     try {
         m.gguf = std::make_unique<strata::GgufModel>(strata::gguf_split_paths(path));
@@ -410,6 +442,7 @@ bool load_model(const std::string& path, Model& m, std::string& err) {
     }
     m.tok_embd_norm = m.upload_f32("token_embd_norm.weight", (size_t) hp.n_embd);
     if (hp.num_loops > 1) {
+        DeviceScope core_owner(m.split_device >= 0 ? m.split_device : m.main_device);
         m.loop_res_query = m.upload_f32("loop_res_query.weight", (size_t) hp.n_embd * 2 * n_core);
         m.loop_kv_res_query = m.upload_f32("loop_kv_res_query.weight", (size_t) hp.n_embd * 2 * n_core);
     }
@@ -422,6 +455,8 @@ bool load_model(const std::string& path, Model& m, std::string& err) {
     char nm[128];
     for (int ip = 0; ip < hp.n_phys; ++ip) {
         PhysLayer& L = m.layers[(size_t) ip];
+        L.device = m.layer_device(ip);
+        DeviceScope layer_owner(L.device);
         L.is_swa = hp.is_swa(ip);
         L.has_loop = (hp.num_loops > 1 && ip >= hp.core_start && ip < hp.core_end);
         const bool pack_core = L.has_loop;
@@ -625,13 +660,27 @@ bool load_model(const std::string& path, Model& m, std::string& err) {
 
 struct Engine {
     Model* m = nullptr;
+    enum class Role { All, Outer, Core };
+    Role role = Role::All;
+    int device = -1;
+    Engine* split_peer = nullptr;       // non-owning; the two runtimes share one Model
+    float* split_handoff = nullptr;     // portable pinned host memory, owned by Outer
     cudaStream_t st = nullptr;
     cublasHandle_t blas = nullptr;
-    strata::prefill::Gemm gemm;
+    std::unique_ptr<strata::prefill::Gemm> gemm;
+
+    bool owns_phys(int ip) const {
+        const bool core = m->hp.num_loops > 1 && ip >= m->hp.core_start && ip < m->hp.core_end;
+        return role == Role::All || (role == Role::Core ? core : !core);
+    }
+    bool owns_virtual(int il) const { return owns_phys(m->hp.loop_layer(il)); }
+    Engine& runtime_for(int il) { return !owns_virtual(il) && split_peer ? *split_peer : *this; }
+    bool any_hybrid() const { return hybrid || (role == Role::Outer && split_peer && split_peer->hybrid); }
 
     int ctx = 16384;
     int tmax = 512;
     int64_t pos = 0;
+    int32_t pos0_host = 0;      // survives begin_forward's asynchronous upload until finish_head synchronizes
 
     // KV caches & shortconv state (per virtual layer il = 0..47)
     bool kv_q8 = true;
@@ -715,6 +764,14 @@ struct Engine {
     size_t vram_free_after_place = 0;
     int pool_workers = 0;
 
+    void reset_hybrid_stats() {
+        hy_gpu = hy_cpu = 0; hy_cpu_ms = 0;
+        if (role == Role::Outer && split_peer) split_peer->reset_hybrid_stats();
+    }
+    int64_t total_hy_gpu() const { return hy_gpu + (role == Role::Outer && split_peer ? split_peer->hy_gpu : 0); }
+    int64_t total_hy_cpu() const { return hy_cpu + (role == Role::Outer && split_peer ? split_peer->hy_cpu : 0); }
+    double total_hy_cpu_ms() const { return hy_cpu_ms + (role == Role::Outer && split_peer ? split_peer->hy_cpu_ms : 0); }
+
     bool prof = false;
     bool prof_detail = false;
     double p_embd_ms = 0, p_attn_ms = 0, p_moe_gpu_ms = 0, p_moe_wait_ms = 0, p_moe_cpu_ms = 0;
@@ -724,6 +781,7 @@ struct Engine {
     int64_t p_miss_nv = 0, p_miss_q5 = 0, p_hit_nv = 0, p_hit_q5 = 0;
     int p_calls = 0;
     void reset_prof() {
+        if (role == Role::Outer && split_peer) split_peer->reset_prof();
         p_embd_ms = p_attn_ms = p_moe_gpu_ms = p_moe_wait_ms = p_moe_cpu_ms = 0;
         p_moe_up_ms = p_moe_post_ms = p_core_ms = p_head_ms = p_rebal_ms = 0;
         p_d_mix = p_d_qkv = p_d_attn = p_d_out = p_d_route = 0;
@@ -750,6 +808,7 @@ struct Engine {
                          p_d_cpu_nv, (long long) p_miss_nv, (long long) p_hit_nv,
                          p_d_cpu_q5, (long long) p_miss_q5, (long long) p_hit_q5);
         }
+        if (role == Role::Outer && split_peer) split_peer->print_prof("core");
     }
 
     // Cached decode CUDA Graph for the contiguous 36-layer core (il = 6..41) when blk.6..17 are 100% in VRAM,
@@ -757,6 +816,7 @@ struct Engine {
     cudaGraphExec_t core_graph = nullptr;
     std::vector<cudaGraphExec_t> layer_pre_graph;
     bool core_all_gpu = false;
+    bool split_core_graph = false;     // opt-in for the Core runtime; All keeps its existing graph policy
     bool graph_oom = false;
 
     // Prefix cache checkpoint (stores conv_hist + circular SWA KV state in host RAM; full-attn KV stays append-only on GPU)
@@ -779,25 +839,30 @@ struct Engine {
         cp.tokens = tokens;
         cp.data.resize(total);
         size_t off = 0;
+        cudaStream_t copy_stream = st;
         auto pull = [&](const void* src, size_t n) {
-            CK(cudaMemcpyAsync(cp.data.data() + off, src, n, cudaMemcpyDeviceToHost, st));
+            CK(cudaMemcpyAsync(cp.data.data() + off, src, n, cudaMemcpyDeviceToHost, copy_stream));
             off += n;
         };
         for (int il = 0; il < hp.n_layer; ++il) {
-            pull(conv_hist[(size_t) il], conv_bytes);
+            Engine& lane = runtime_for(il);
+            DeviceScope owner(lane.device);
+            copy_stream = lane.st;
+            pull(lane.conv_hist[(size_t) il], conv_bytes);
             if (!hp.is_swa(il)) continue;
             const size_t cap = (size_t) kv_cap[(size_t) il];
             if (kv_q8) {
-                pull(kq[(size_t) il], cap * (size_t) hp.kv_dim);
-                pull(vq[(size_t) il], cap * (size_t) hp.kv_dim);
-                pull(ks[(size_t) il], cap * (size_t) hp.n_head_kv * sizeof(__half));
-                pull(vs[(size_t) il], cap * (size_t) hp.n_head_kv * sizeof(__half));
+                pull(lane.kq[(size_t) il], cap * (size_t) hp.kv_dim);
+                pull(lane.vq[(size_t) il], cap * (size_t) hp.kv_dim);
+                pull(lane.ks[(size_t) il], cap * (size_t) hp.n_head_kv * sizeof(__half));
+                pull(lane.vs[(size_t) il], cap * (size_t) hp.n_head_kv * sizeof(__half));
             } else {
-                pull(kc[(size_t) il], cap * (size_t) hp.kv_dim * sizeof(__half));
-                pull(vc[(size_t) il], cap * (size_t) hp.kv_dim * sizeof(__half));
+                pull(lane.kc[(size_t) il], cap * (size_t) hp.kv_dim * sizeof(__half));
+                pull(lane.vc[(size_t) il], cap * (size_t) hp.kv_dim * sizeof(__half));
             }
         }
-        CK(cudaStreamSynchronize(st));
+        { DeviceScope owner(device); CK(cudaStreamSynchronize(st)); }
+        if (split_peer) { DeviceScope owner(split_peer->device); CK(cudaStreamSynchronize(split_peer->st)); }
         return cp;
     }
 
@@ -805,28 +870,38 @@ struct Engine {
         const auto& hp = m->hp;
         const size_t conv_bytes = (size_t) hp.n_sconv_channels() * 3 * sizeof(float);
         size_t off = 0;
+        cudaStream_t copy_stream = st;
         auto push = [&](void* dst, size_t n) {
-            CK(cudaMemcpyAsync(dst, cp.data.data() + off, n, cudaMemcpyHostToDevice, st));
+            CK(cudaMemcpyAsync(dst, cp.data.data() + off, n, cudaMemcpyHostToDevice, copy_stream));
             off += n;
         };
         for (int il = 0; il < hp.n_layer; ++il) {
-            push(conv_hist[(size_t) il], conv_bytes);
+            Engine& lane = runtime_for(il);
+            DeviceScope owner(lane.device);
+            copy_stream = lane.st;
+            push(lane.conv_hist[(size_t) il], conv_bytes);
             if (!hp.is_swa(il)) continue;
             const size_t cap = (size_t) kv_cap[(size_t) il];
             if (kv_q8) {
-                push(kq[(size_t) il], cap * (size_t) hp.kv_dim);
-                push(vq[(size_t) il], cap * (size_t) hp.kv_dim);
-                push(ks[(size_t) il], cap * (size_t) hp.n_head_kv * sizeof(__half));
-                push(vs[(size_t) il], cap * (size_t) hp.n_head_kv * sizeof(__half));
+                push(lane.kq[(size_t) il], cap * (size_t) hp.kv_dim);
+                push(lane.vq[(size_t) il], cap * (size_t) hp.kv_dim);
+                push(lane.ks[(size_t) il], cap * (size_t) hp.n_head_kv * sizeof(__half));
+                push(lane.vs[(size_t) il], cap * (size_t) hp.n_head_kv * sizeof(__half));
             } else {
-                push(kc[(size_t) il], cap * (size_t) hp.kv_dim * sizeof(__half));
-                push(vc[(size_t) il], cap * (size_t) hp.kv_dim * sizeof(__half));
+                push(lane.kc[(size_t) il], cap * (size_t) hp.kv_dim * sizeof(__half));
+                push(lane.vc[(size_t) il], cap * (size_t) hp.kv_dim * sizeof(__half));
             }
         }
         pos = (int64_t) cp.tokens.size();
+        if (split_peer) {
+            split_peer->pos = pos;
+            { DeviceScope owner(device); CK(cudaStreamSynchronize(st)); }
+            { DeviceScope owner(split_peer->device); CK(cudaStreamSynchronize(split_peer->st)); }
+        }
     }
 
     ~Engine() {
+        DeviceScope owner(device);
         if (core_graph) cudaGraphExecDestroy(core_graph);
         for (auto g : layer_pre_graph) if (g) cudaGraphExecDestroy(g);
         for (auto* p : kc) cudaFree(p);
@@ -855,6 +930,7 @@ struct Engine {
         cudaFree(d_miss); cudaFree(ecpu);
         cudaFreeHost(h_tok_buf);
         cudaFreeHost(h_ids); cudaFreeHost(h_h); cudaFreeHost(cpu_out); cudaFreeHost(h_miss);
+        cudaFreeHost(split_handoff);
         std::free(acts);
         if (ev_route) cudaEventDestroy(ev_route);
         for (int b = 0; b < 2; ++b) {
@@ -864,12 +940,16 @@ struct Engine {
         }
         if (ev_rebal) cudaEventDestroy(ev_rebal);
         if (cst) cudaStreamDestroy(cst);
+        // Gemm owns CUDA allocations/handles too: destroy it while its owner's device is current.
+        gemm.reset();
         if (blas) cublasDestroy(blas);
         if (st) cudaStreamDestroy(st);
     }
 
     bool init(Model& model, int max_ctx, int max_t, bool use_kv_q8, std::string& err) {
         m = &model;
+        if (device < 0) CK(cudaGetDevice(&device));
+        DeviceScope owner(device);
         ctx = max_ctx;
         tmax = max_t;
         kv_q8 = use_kv_q8;
@@ -879,7 +959,8 @@ struct Engine {
         CK(cudaStreamCreate(&st));
         CKB(cublasCreate(&blas));
         CKB(cublasSetStream(blas, st));
-        if (!gemm.init(st, m->has_quant_dense ? (size_t) (8 * 1024 * 1024) : 4096, err)) return false;
+        gemm = std::make_unique<strata::prefill::Gemm>();
+        if (!gemm->init(st, m->has_quant_dense ? (size_t) (8 * 1024 * 1024) : 4096, err)) return false;
 
         // Allocate KV caches & recurrent history per virtual layer
         layer_pre_graph.assign((size_t) hp.n_layer, nullptr);
@@ -895,6 +976,7 @@ struct Engine {
         for (int il = 0; il < hp.n_layer; ++il) {
             const int cap = hp.is_swa(il) ? (int) hp.n_swa : ctx;
             kv_cap[(size_t) il] = cap;
+            if (!owns_virtual(il)) continue;
             if (kv_q8) {
                 CK(cudaMalloc(&kq[(size_t) il], (size_t) cap * hp.kv_dim * sizeof(int8_t)));
                 CK(cudaMalloc(&vq[(size_t) il], (size_t) cap * hp.kv_dim * sizeof(int8_t)));
@@ -982,6 +1064,7 @@ struct Engine {
     }
 
     void init_cpu_bufs(int cpu_t) {
+        DeviceScope owner(device);
         const int64_t N = m->hp.n_embd;
         const int64_t cpu_ent = (int64_t) cpu_t * m->hp.n_expert_used;
         CK(cudaMallocHost(&h_h, (size_t) cpu_t * N * sizeof(float)));
@@ -995,10 +1078,13 @@ struct Engine {
     }
 
     void reset_state() {
+        DeviceScope owner(device);
         pos = 0;
         for (int il = 0; il < m->hp.n_layer; ++il) {
+            if (!owns_virtual(il)) continue;
             CK(cudaMemsetAsync(conv_hist[(size_t) il], 0, (size_t) m->hp.n_sconv_channels() * 3 * sizeof(float), st));
         }
+        if (role == Role::Outer && split_peer) split_peer->reset_state();
     }
 
     void prep_q8(const float* X, void* q8_buf, int T, int64_t K_in) {
@@ -1015,7 +1101,7 @@ struct Engine {
         if (W.type == 1) {
             const int64_t tot = (int64_t) T * K_in;
             k_f32_to_f16<<<(unsigned) ((tot + 255) / 256), 256, 0, st>>>(X, act_bf16, tot);
-            gemm.f16(act_bf16, (const uint16_t*) W.d, Y, T, N_out, K_in);
+            gemm->f16(act_bf16, (const uint16_t*) W.d, Y, T, N_out, K_in);
             return;
         }
         if (W.type == 30) {
@@ -1025,7 +1111,7 @@ struct Engine {
             } else {
                 const int64_t tot = (int64_t) T * K_in;
                 k_f32_to_bf16<<<(unsigned) ((tot + 255) / 256), 256, 0, st>>>(X, act_bf16, tot);
-                gemm.bf16(act_bf16, wp, Y, T, N_out, K_in);
+                gemm->bf16(act_bf16, wp, Y, T, N_out, K_in);
             }
             return;
         }
@@ -1038,7 +1124,7 @@ struct Engine {
         }
         const int64_t tot = (int64_t) T * K_in;
         k_f32_to_f16<<<(unsigned) ((tot + 255) / 256), 256, 0, st>>>(X, act_bf16, tot);
-        gemm.native(act_bf16, W.type, W.d, Y, T, N_out, K_in);
+        gemm->native(act_bf16, W.type, W.d, Y, T, N_out, K_in);
     }
 
     void project(const float* X, const DenseMat& W, float* Y, int T, int64_t N_out, int64_t K_in) {
@@ -1120,6 +1206,7 @@ struct Engine {
         (void) core_all_gpu_flag;
         int missing[128];
         for (int il = 0; il < hp.n_layer; ++il) {
+            if (!owns_virtual(il)) continue;
             const int ip = hp.loop_layer(il);
             const PhysLayer& L = m->layers[(size_t) ip];
             if (L.n_slots >= ne || L.gu_type == 30 || !L.hblobs) continue;
@@ -1337,6 +1424,8 @@ struct Engine {
     }
 
     void rebalance(int max_swaps) {
+        DeviceScope owner(device);
+        if (role == Role::Outer && split_peer) split_peer->rebalance(max_swaps);
         if (!hybrid) return;
         const int64_t ne = m->hp.n_expert;
         struct Cand {
@@ -1351,6 +1440,7 @@ struct Engine {
         std::vector<int> order((size_t) ne);
         std::vector<int> victims;
         for (size_t li = 0; li < m->layers.size(); ++li) {
+            if (!owns_phys((int) li)) continue;
             PhysLayer& L = m->layers[li];
             const int S = L.n_slots;
             if (S <= 0 || S >= ne) continue;
@@ -1396,13 +1486,20 @@ struct Engine {
         has_pending_rebal = true;
     }
 
-    int32_t forward(const int32_t* tokens, int T, bool copy_logits = false, std::vector<float>* out_logits = nullptr) {
+    // The metadata is local to one runtime. Only logical residual-buffer IDs cross the split.
+    struct ForwardState {
+        int T = 0;
+        int next_blk_buf = 0;
+        bool pp_prepared = false;
+        std::vector<float*> norm_blocks, prelude_norm_blocks, norm_bank;
+    };
+
+    void begin_forward(const int32_t* tokens, int T, ForwardState& state) {
+        DeviceScope owner(device);
+        state = ForwardState{};
+        state.T = T;
         const auto& hp = m->hp;
         const int N = (int) hp.n_embd;
-        const int64_t kv_dim = hp.kv_dim;
-        const int64_t q_dim = hp.q_dim;
-        const int64_t n_core = hp.num_loops > 1 ? (hp.core_end - hp.core_start) : 0;
-
         // 1. Token embedding from host mmap + tok_embd_norm
         if (prof) ++p_calls;
         const auto tp_e0 = Clock::now();
@@ -1422,13 +1519,22 @@ struct Engine {
             }
         }
         CK(cudaMemcpyAsync(ffn_inp, h_tok_buf, (size_t) T * N * sizeof(float), cudaMemcpyHostToDevice, st));
-        const int32_t pos32 = (int32_t) pos;
-        CK(cudaMemcpyAsync(pos0_d, &pos32, sizeof(int32_t), cudaMemcpyHostToDevice, st));
+        pos0_host = (int32_t) pos;
+        CK(cudaMemcpyAsync(pos0_d, &pos0_host, sizeof(int32_t), cudaMemcpyHostToDevice, st));
         k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(ffn_inp, m->tok_embd_norm, cur, N, hp.rms_eps);
         if (prof) { CK(cudaStreamSynchronize(st)); p_embd_ms += ms_since(tp_e0); }
 
-        std::vector<float*> norm_blocks;
-        int next_blk_buf = 0;
+    }
+
+    void run_layers(ForwardState& state, int first_layer, int end_layer) {
+        DeviceScope owner(device);
+        const int T = state.T;
+        const auto& hp = m->hp;
+        const int N = (int) hp.n_embd;
+        const int64_t kv_dim = hp.kv_dim, q_dim = hp.q_dim;
+        const int64_t n_core = hp.num_loops > 1 ? hp.core_end - hp.core_start : 0;
+        auto& norm_blocks = state.norm_blocks;
+        int& next_blk_buf = state.next_blk_buf;
         auto push_block = [&](const float* src) {
             const int idx = next_blk_buf++;
             float* ndst = norm_blk_buf[idx];
@@ -1436,9 +1542,9 @@ struct Engine {
             norm_blocks.push_back(ndst);
         };
 
-        std::vector<float*> prelude_norm_blocks;
+        auto& prelude_norm_blocks = state.prelude_norm_blocks;
         float* prelude_cur = prelude_cur_buf;
-        std::vector<float*> norm_bank;
+        auto& norm_bank = state.norm_bank;
         float* bank_last_norm = norm_blk_buf[8];     // cached normalized bank_last
 
         auto run_layer_pre = [&](int il) {
@@ -1683,19 +1789,33 @@ struct Engine {
         };
 
         const int core_end_virt = (int) (hp.core_start + hp.num_loops * n_core);
-        pp_streaming = (hybrid && T >= pp_stream_t && pp_stage[0] != nullptr);
-        if (pp_streaming) pp_begin(core_end_virt, core_all_gpu ? 1 : 0);
-        for (int il = 0; il < hp.n_layer; ++il) {
-            if (T == 1 && core_all_gpu && !prof_detail && il == hp.core_start && n_core > 0) {
+        if (!state.pp_prepared) {
+            pp_streaming = (hybrid && T >= pp_stream_t && pp_stage[0] != nullptr);
+            if (pp_streaming) pp_begin(core_end_virt, core_all_gpu ? 1 : 0);
+            state.pp_prepared = true;
+        }
+        for (int il = first_layer; il < end_layer; ++il) {
+            if (!owns_virtual(il)) {
+                std::fprintf(stderr, "strata-inkling2: virtual layer %d belongs to the other split runtime\n", il);
+                std::exit(1);
+            }
+            const bool core_graph_allowed = role == Role::All || (role == Role::Core && split_core_graph);
+            if (core_graph_allowed && T == 1 && core_all_gpu && !prof_detail && il == hp.core_start && n_core > 0) {
                 if (!core_graph) {
                     cudaGraph_t g = nullptr;
-                    CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal));
+                    auto graph_check = [&](cudaError_t status, const char* phase) {
+                        if (status != cudaSuccess && role == Role::Core)
+                            std::fprintf(stderr, "strata-inkling2: split core graph %s failed on device %d: %s\n",
+                                         phase, device, cudaGetErrorString(status));
+                        CK(status);
+                    };
+                    graph_check(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal), "begin capture");
                     for (int cl = il; cl < core_end_virt; ++cl) {
                         run_layer_pre(cl);
                         run_layer_post(cl);
                     }
-                    CK(cudaStreamEndCapture(st, &g));
-                    CK(cudaGraphInstantiate(&core_graph, g, nullptr, nullptr, 0));
+                    graph_check(cudaStreamEndCapture(st, &g), "end capture");
+                    graph_check(cudaGraphInstantiate(&core_graph, g, nullptr, nullptr, 0), "instantiate");
                     CK(cudaGraphDestroy(g));
                 } else {
                     norm_blocks = {norm_blk_buf[0], norm_blk_buf[5], norm_blk_buf[6]};
@@ -1708,7 +1828,7 @@ struct Engine {
                 continue;
             }
             const bool is_outer = (il < hp.core_start || il >= core_end_virt);
-            const bool use_pre_graph = (T == 1 && hybrid && !prof_detail && !pp_streaming);
+            const bool use_pre_graph = (role == Role::All && T == 1 && hybrid && !prof_detail && !pp_streaming);
             const auto tp_ly0 = Clock::now();
             if (use_pre_graph && (layer_pre_graph[(size_t) il] || !graph_oom)) {
                 if (!layer_pre_graph[(size_t) il]) {
@@ -1752,6 +1872,14 @@ struct Engine {
             run_layer_post(il);
         }
 
+    }
+
+    int32_t finish_head(ForwardState& state, bool copy_logits, std::vector<float>* out_logits) {
+        DeviceScope owner(device);
+        const int T = state.T;
+        const auto& hp = m->hp;
+        const int N = (int) hp.n_embd;
+        const auto& norm_blocks = state.norm_blocks;
         // Output head
         const auto tp_h0 = Clock::now();
         float* out_head[1] = {in_ffn};
@@ -1773,9 +1901,86 @@ struct Engine {
         pos += T;
         return next_id;
     }
+
+    // A synchronization at each boundary makes the portable host buffer reusable on either
+    // device without peer access, cross-device event assumptions or foreign device pointers.
+    void handoff(ForwardState& source, Engine& destination, ForwardState& target) {
+        const int T = source.T;
+        const size_t elems = (size_t) T * m->hp.n_embd;
+        float* host = role == Role::Outer ? split_handoff : split_peer->split_handoff;
+        std::vector<int> block_ids;
+        for (float* p : source.norm_blocks) {
+            int id = -1;
+            for (int i = 0; i < 9; ++i) if (p == norm_blk_buf[i]) id = i;
+            if (id < 0) { std::fprintf(stderr, "strata-inkling2: split residual has no logical ID\n"); std::exit(1); }
+            block_ids.push_back(id);
+        }
+        if (!host || T <= 0 || T > tmax || T > destination.tmax || block_ids.size() > 3 || source.next_blk_buf > 8) {
+            std::fprintf(stderr, "strata-inkling2: invalid split residual metadata\n"); std::exit(1);
+        }
+        const std::vector<int> expected_ids = role == Role::Outer ? std::vector<int>{0} : std::vector<int>{0, 5, 6};
+        const int expected_next = role == Role::Outer ? 1 : 7;
+        if (block_ids != expected_ids || source.next_blk_buf != expected_next) {
+            std::fprintf(stderr, "strata-inkling2: split boundary residual IDs do not match the 6/36/6 layer schedule\n");
+            std::exit(1);
+        }
+        {
+            DeviceScope owner(device);
+            CK(cudaMemcpyAsync(host, cur, elems * sizeof(float), cudaMemcpyDeviceToHost, st));
+            for (size_t i = 0; i < block_ids.size(); ++i)
+                CK(cudaMemcpyAsync(host + (i + 1) * elems, norm_blk_buf[block_ids[i]], elems * sizeof(float), cudaMemcpyDeviceToHost, st));
+            CK(cudaStreamSynchronize(st));
+        }
+        target.T = T;
+        target.next_blk_buf = source.next_blk_buf;
+        target.norm_blocks.clear();
+        // Prelude/bank data only lives inside the core range; both boundaries are outside it.
+        target.prelude_norm_blocks.clear();
+        target.norm_bank.clear();
+        destination.pos = pos;
+        {
+            DeviceScope owner(destination.device);
+            CK(cudaMemcpyAsync(destination.cur, host, elems * sizeof(float), cudaMemcpyHostToDevice, destination.st));
+            for (size_t i = 0; i < block_ids.size(); ++i) {
+                float* p = destination.norm_blk_buf[block_ids[i]];
+                CK(cudaMemcpyAsync(p, host + (i + 1) * elems, elems * sizeof(float), cudaMemcpyHostToDevice, destination.st));
+                target.norm_blocks.push_back(p);
+            }
+            const int32_t pos32 = (int32_t) pos;
+            CK(cudaMemcpyAsync(destination.pos0_d, &pos32, sizeof pos32, cudaMemcpyHostToDevice, destination.st));
+            CK(cudaStreamSynchronize(destination.st));
+        }
+    }
+
+    int32_t forward(const int32_t* tokens, int T, bool copy_logits = false, std::vector<float>* out_logits = nullptr) {
+        if (role == Role::Outer && split_peer) {
+            split_peer->prof = prof;
+            split_peer->prof_detail = prof_detail;
+            if (prof) ++split_peer->p_calls;
+        }
+        ForwardState state;
+        begin_forward(tokens, T, state);
+        if (role == Role::Outer && split_peer) {
+            const int begin = (int) m->hp.core_start;
+            const int end = (int) (m->hp.core_start + m->hp.num_loops * (m->hp.core_end - m->hp.core_start));
+            run_layers(state, 0, begin);
+            ForwardState core_state;
+            handoff(state, *split_peer, core_state);
+            split_peer->run_layers(core_state, begin, end);
+            split_peer->handoff(core_state, *this, state);
+            run_layers(state, end, (int) m->hp.n_layer);
+        } else {
+            run_layers(state, 0, (int) m->hp.n_layer);
+        }
+        const int32_t next = finish_head(state, copy_logits, out_logits);
+        if (role == Role::Outer && split_peer) split_peer->pos = pos;
+        return next;
+    }
+
 };
 
 bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::string& err) {
+    DeviceScope owner(E.device);
     const auto t0 = Clock::now();
     const auto& hp = m.hp;
     const int ne = (int) hp.n_expert;
@@ -1790,6 +1995,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
     size_t max_exp_stride = 0;
     size_t all_exps_bytes = 0;
     for (int ip = 0; ip < hp.n_phys; ++ip) {
+        if (!E.owns_phys(ip)) continue;
         if (m.layers[(size_t) ip].gu_type == 30) continue;
         max_exp_stride = std::max(max_exp_stride, m.layers[(size_t) ip].stride);
         all_exps_bytes += (size_t) ne * m.layers[(size_t) ip].stride;
@@ -1832,6 +2038,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
     // Priority 1: Looped core NVFP4 layers (blk.6..17, executed 3x/token!)
     std::vector<int> tier1, tier2;
     for (int ip = 0; ip < hp.n_phys; ++ip) {
+        if (!E.owns_phys(ip)) continue;
         if (m.layers[(size_t) ip].gu_type == 30) continue;   // BF16 stays CPU-resident
         if (ip >= hp.core_start && ip < hp.core_end) tier1.push_back(ip);
         else tier2.push_back(ip);
@@ -1900,7 +2107,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
     for (int ip : tier1) alloc_order.push_back(ip);
     for (int ip : tier2) alloc_order.push_back(ip);
     for (int ip = 0; ip < hp.n_phys; ++ip) {
-        if (m.layers[(size_t) ip].gu_type == 30) alloc_order.push_back(ip);
+        if (E.owns_phys(ip) && m.layers[(size_t) ip].gu_type == 30) alloc_order.push_back(ip);
     }
     for (int ip : alloc_order) {
         PhysLayer& L = m.layers[(size_t) ip];
@@ -1916,9 +2123,9 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
             }
             if (s > 0 && dbl) {
                 L.d_blobs = (uint8_t*) dbl;
-                m.gpu_allocs.push_back(L.d_blobs);
+                m.record_alloc(L.d_blobs);
                 CK(cudaMalloc(&L.d_slot_of, (size_t) ne * sizeof(int32_t)));
-                m.gpu_allocs.push_back(L.d_slot_of);
+                m.record_alloc(L.d_slot_of);
                 actual_used += (size_t) s * L.stride;
             } else {
                 s = 0;
@@ -1992,7 +2199,7 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
     }
     std::fprintf(stderr,
                  "strata-inkling2: placed %d/%lld experts in VRAM (%.2f GiB, tier1=%d/128/layer, tier2=%d..%d/128/layer, free=%.0f MiB) in %.2f s\n",
-                 total_vram_experts, (long long) hp.n_phys * ne, (double) used / (1 << 30),
+                 total_vram_experts, (long long) alloc_order.size() * ne, (double) used / (1 << 30),
                  tier1.empty() ? 0 : slots[(size_t) tier1[0]],
                  tier2.empty() ? 0 : tier2_min, tier2.empty() ? 0 : tier2_max,
                  (double) fr_after / (1 << 20),
@@ -2023,6 +2230,8 @@ int run(int argc, char** argv) {
     int chunk = 256;
     int max_new = 32;
     int cpu_threads = 0;
+    int layer_split_device = -1;
+    bool split_core_graph = false;
     double expert_vram = -1.0;
     bool serve = false;
     bool bench = false;
@@ -2047,6 +2256,17 @@ int run(int argc, char** argv) {
         else if (a == "--expert-vram") expert_vram = std::atof(next_arg());
         else if (a == "--cpu-threads" || a == "--pool-workers") cpu_threads = std::atoi(next_arg());
         else if (a == "--dump-logits") dump_logits_path = next_arg();
+        else if (a == "--layer-split-device") {
+            const char* text = next_arg();
+            char* tail = nullptr;
+            const long value = std::strtol(text, &tail, 10);
+            if (!text[0] || *tail || value < 0 || value > 63) {
+                std::fprintf(stderr, "strata-inkling2: --layer-split-device requires a CUDA device index (0..63)\n");
+                return 2;
+            }
+            layer_split_device = (int) value;
+        }
+        else if (a == "--split-core-graph") split_core_graph = true;
         else if (a == "--kv-f16") kv_q8 = false;
         else if (a == "--kv-q8") kv_q8 = true;
         else if (a == "--serve") serve = true;
@@ -2056,11 +2276,25 @@ int run(int argc, char** argv) {
     }
 
     if (model_path.empty()) {
-        std::fprintf(stderr, "usage: strata-inkling2 --model <file.gguf> [--max-context N] [--kv-q8|--kv-f16] [--tokens IDS] [--max-new N] [--dump-logits PATH] [--bench] [--serve]\n");
+        std::fprintf(stderr, "usage: strata-inkling2 --model <file.gguf> [--max-context N] [--kv-q8|--kv-f16] [--tokens IDS] [--max-new N] [--dump-logits PATH] [--layer-split-device N [--split-core-graph]] [--bench] [--serve]\n");
+        return 2;
+    }
+    if (split_core_graph && layer_split_device < 0) {
+        std::fprintf(stderr, "strata-inkling2: --split-core-graph requires --layer-split-device N\n");
         return 2;
     }
 
     Model m;
+    CK(cudaGetDevice(&m.main_device));
+    m.split_device = layer_split_device;
+    if (layer_split_device >= 0) {
+        int device_count = 0;
+        CK(cudaGetDeviceCount(&device_count));
+        if (layer_split_device >= device_count || max_ctx != 262144 || !kv_q8) {
+            std::fprintf(stderr, "strata-inkling2: layer split requires an available CUDA device and --max-context 262144 --kv-q8\n");
+            return 2;
+        }
+    }
     std::string err;
     if (!load_model(model_path, m, err)) {
         std::fprintf(stderr, "strata-inkling2: load failed: %s\n", err.c_str());
@@ -2068,13 +2302,54 @@ int run(int argc, char** argv) {
     }
 
     Engine E;
+    E.device = m.main_device;
+    E.role = layer_split_device >= 0 ? Engine::Role::Outer : Engine::Role::All;
     if (!E.init(m, max_ctx, chunk, kv_q8, err)) {
         std::fprintf(stderr, "strata-inkling2: engine init failed: %s\n", err.c_str());
         return 1;
     }
-    if (!place_experts(m, E, expert_vram, cpu_threads, err)) {
+    std::unique_ptr<Engine> split_core;
+    if (layer_split_device >= 0) {
+        if (m.hp.n_layer != 48 || m.hp.n_phys != 24 || m.hp.core_start != 6 || m.hp.core_end != 18 ||
+            m.hp.num_loops != 3 || m.hp.attn_res_block_size != 6 || m.hp.n_embd != 2304 || m.hp.n_ff != 1152) {
+            std::fprintf(stderr, "strata-inkling2: layer split requires Inkling2's 48/24-layer, 3-loop 6..17 topology\n");
+            return 2;
+        }
+        split_core = std::make_unique<Engine>();
+        split_core->device = layer_split_device;
+        split_core->role = Engine::Role::Core;
+        split_core->split_core_graph = split_core_graph;
+        if (!split_core->init(m, max_ctx, chunk, kv_q8, err)) {
+            std::fprintf(stderr, "strata-inkling2: split core init failed: %s\n", err.c_str()); return 1;
+        }
+        E.split_peer = split_core.get();
+        split_core->split_peer = &E;
+        {
+            DeviceScope owner(E.device);
+            CK(cudaHostAlloc(&E.split_handoff, (size_t) 4 * E.tmax * m.hp.n_embd * sizeof(float), cudaHostAllocPortable));
+        }
+        std::fprintf(stderr, "strata-inkling2: layer split main_device=%d virtual=0..5,42..47+head core_device=%d virtual=6..41 (physical=6..17 x3), context=262144 KV=Q8, host handoff=18/36 KiB per token, core_graph=%s\n",
+                     E.device, split_core->device, split_core_graph ? "enabled" : "disabled (eager)");
+    }
+    if (!place_experts(m, E, expert_vram, cpu_threads, err) ||
+        (split_core && !place_experts(m, *split_core, expert_vram, cpu_threads, err))) {
         std::fprintf(stderr, "strata-inkling2: expert placement failed: %s\n", err.c_str());
         return 1;
+    }
+    if (split_core) {
+        std::fprintf(stderr, "strata-inkling2: split core graph requested=%d eligible=%d (T=1, fully resident core, profile-detail off)\n",
+                     (int) split_core_graph, (int) (split_core_graph && split_core->core_all_gpu && !profile_detail));
+        size_t total = 0;
+        { DeviceScope owner(E.device); CK(cudaMemGetInfo(&E.vram_free_after_place, &total)); }
+        { DeviceScope owner(split_core->device); CK(cudaMemGetInfo(&split_core->vram_free_after_place, &total)); }
+        // These fields describe the public model as a whole; each runtime's live counters
+        // and cache ownership remain separate.
+        E.placed_slots += split_core->placed_slots;
+        E.placed_bytes += split_core->placed_bytes;
+        E.pool_workers += split_core->pool_workers;
+        std::fprintf(stderr, "strata-inkling2: split VRAM free main=%.0f MiB core=%.0f MiB; %d/%lld experts resident\n",
+                     (double) E.vram_free_after_place / (1 << 20), (double) split_core->vram_free_after_place / (1 << 20),
+                     E.placed_slots, (long long) m.hp.n_phys * m.hp.n_expert);
     }
 
     if (serve) {
@@ -2212,9 +2487,7 @@ int run(int argc, char** argv) {
                 std::fflush(stdout);
 
                 const auto t_pp0 = Clock::now();
-                E.hy_gpu = 0;
-                E.hy_cpu = 0;
-                E.hy_cpu_ms = 0.0;
+                E.reset_hybrid_stats();
                 hist = prompt;
                 const bool sample_on = smp.needs_logits();
                 int32_t next_tok = 0;
@@ -2224,7 +2497,7 @@ int run(int argc, char** argv) {
                     const bool is_last = (off + (size_t) tc == prompt.size());
                     next_tok = E.forward(prompt.data() + off, tc, is_last && sample_on, &lg);
                     live_tokens.insert(live_tokens.end(), prompt.begin() + (ptrdiff_t) off, prompt.begin() + (ptrdiff_t) (off + (size_t) tc));
-                    if (E.hybrid) E.rebalance(8);
+                    if (E.any_hybrid()) E.rebalance(8);
                     const double el_ms = ms_since(t_pp0);
                     const double done_fresh = (double) (off + (size_t) tc - reuse);
                     const double pp_tps_now = done_fresh / std::max(1e-6, el_ms / 1000.0);
@@ -2275,15 +2548,15 @@ int run(int argc, char** argv) {
                             next_tok = E.forward(&fed, 1, sample_on, &lg);
                             live_tokens.push_back(fed);
                             if (sample_on) next_tok = sample_logits(lg, hist, smp, rng);
-                            if (E.hybrid && (step % 8 == 7)) E.rebalance(E.core_all_gpu ? 4 : 6);
+                            if (E.any_hybrid() && (step % 8 == 7)) E.rebalance(E.core_all_gpu ? 4 : 6);
                         }
                     }
                 }
                 const double tg_ms = ms_since(t_tg0);
-                const long long lookups = (long long) E.hy_gpu + (long long) E.hy_cpu;
+                const long long lookups = (long long) E.total_hy_gpu() + (long long) E.total_hy_cpu();
                 std::printf("DONE %d %zu %.2f %.2f %s 0 0 %zu %lld %lld 0 0 0.0 %zu\n",
                             emitted, prompt.size(), pp_ms, tg_ms, finish,
-                            reuse, (long long) E.hy_gpu, lookups, fresh);
+                            reuse, (long long) E.total_hy_gpu(), lookups, fresh);
                 std::fflush(stdout);
             }
         }
@@ -2304,8 +2577,7 @@ int run(int argc, char** argv) {
         }
         if (max_new > 0) E.forward(&w, 1);
         E.reset_state();
-        E.hy_gpu = E.hy_cpu = 0;
-        E.hy_cpu_ms = 0.0;
+        E.reset_hybrid_stats();
     }
 
     E.prof = profile;
@@ -2319,7 +2591,7 @@ int run(int argc, char** argv) {
         const bool is_last = (off + (size_t) tc == prompt.size());
         next_tok = E.forward(prompt.data() + off, tc, is_last && !dump_logits_path.empty(), &dumped);
         const auto tr0 = Clock::now();
-        if (E.hybrid) E.rebalance(8);
+        if (E.any_hybrid()) E.rebalance(8);
         if (profile) { CK(cudaStreamSynchronize(E.st)); E.p_rebal_ms += ms_since(tr0); }
     }
     const double pp_ms = ms_since(t_pp0);
@@ -2343,7 +2615,7 @@ int run(int argc, char** argv) {
         next_tok = E.forward(&next_tok, 1);
         gen.push_back(next_tok);
         const auto tr0 = Clock::now();
-        if (E.hybrid && (step % 8 == 0)) E.rebalance(E.core_all_gpu ? 4 : 6);
+        if (E.any_hybrid() && (step % 8 == 0)) E.rebalance(E.core_all_gpu ? 4 : 6);
         if (profile) { CK(cudaStreamSynchronize(E.st)); E.p_rebal_ms += ms_since(tr0); }
     }
     const double tg_ms = ms_since(t_tg0);
@@ -2357,7 +2629,7 @@ int run(int argc, char** argv) {
     const double tg_tps = max_new > 1 ? (double) (max_new - 1) / (tg_ms / 1000.0) : 0.0;
     std::fprintf(stderr, "strata-inkling2: pp %zu tok in %.1f ms (%.2f t/s) | tg %d tok in %.1f ms (%.2f t/s) | hits=%lld misses=%lld cpu_ms=%.1f\n",
                  prompt.size(), pp_ms, pp_tps, std::max(0, max_new - 1), tg_ms, tg_tps,
-                 (long long) E.hy_gpu, (long long) E.hy_cpu, E.hy_cpu_ms);
+                 (long long) E.total_hy_gpu(), (long long) E.total_hy_cpu(), E.total_hy_cpu_ms());
     return 0;
 }
 
