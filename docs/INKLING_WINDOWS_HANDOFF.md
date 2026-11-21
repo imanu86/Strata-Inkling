@@ -494,3 +494,60 @@ python -m serve.server --engine strata --config D:/ds4_work/inkling2/config/inkl
 ```
 
 Verifica HTTP finale del preset chat su porta 8100. Il primo turno ha risposto «Roma» in 1,422 s completi, con 31 token di input e 78 generati inclusi i token di ragionamento. Il secondo ha risposto «Parigi» in 1,391 s, con 54 token di input di cui 31 riusati e 105 generati. Entrambi hanno terminato con stop. I limiti di output erano 128 e 512. Uno script preliminare aveva alterato gli accenti del prompt Windows: la prova finale usa il testo UTF-8 verificato. Report `astra-placement-bench/http-full-vocab-final/report.json`. Il server di prova è stato chiuso. Verifica finale: 0 MiB sulla 3080 Ti e sulla 2080 Ti, 1.641 MiB sulla 3060.
+
+## DSpark adattivo e confronto con la RTX 3090, 21 novembre 2026
+
+Implementazione CUDA su `main` in `ac69771a3`. Il preset con DSpark carica la testa Unsloth Q8_0 sulla 2080 Ti. Il target Q3 usa il layer split 2080 Ti + 3080 Ti, con la 3060 dedicata al desktop. Le opzioni sono indipendenti dal preset Qwen.
+
+- `--dspark-gpu-pq` campiona le proposte, calcola il rapporto di accettazione e campiona la distribuzione residua sulla GPU. Il percorso qualificato usa temperatura 1, top-p 1, top-k 0, min-p 0 e penalità neutre. Gli altri sampler continuano a usare il verificatore precedente.
+- `--dspark-outer-graph` consente il replay dei blocchi esterni anche per la verifica speculativa, mantenendo i tap e i dati richiesti per il rollback.
+- `--dspark-adaptive` sceglie il metodo del round successivo dai millisecondi per token già committato. Mantiene la testa sincronizzata anche durante il decode singolo e torna periodicamente a misurarla. La policy adattiva richiede il sampler GPU a vocabolario completo. Con temperatura zero il preset segue la verifica greedy fissa.
+- `--split-depth-mix` distribuisce il calcolo delle somme pesate dei residui su più blocchi CUDA. Si può usare anche a draft spento.
+
+### Chat italiana, Q3 e capacità di 262.144 token
+
+Prompt storico di 99 ID, reasoning high, warmup distinto, seed 20261121, chunk 64, KV Q8. Ogni richiesta misurata ha letto tutto il prompt e prodotto la lunghezza indicata. Nessun ripristino SSD. Le cifre sono token/s di decode, pari a (token generati meno uno) diviso il tempo di decode. Le quattro configurazioni usano lo stesso eseguibile. Le due repliche adattive racchiudono la prova senza draft con depth mix.
+
+| Modalità | 128 output | 512 output | 1.000 output |
+|---|---:|---:|---:|
+| Senza MTP, sampler GPU precedente | 83,56 | 80,62 | 78,31 |
+| Senza MTP, depth mix distribuito | **88,58** | **82,08** | **79,27** |
+| DSpark fisso K2, p/q GPU, graph, depth mix | 67,50 | 51,54 | 40,08 |
+| DSpark adattivo, prima replica | 79,44 | 80,20 | 78,04 |
+| DSpark adattivo, seconda replica | 78,94 | 80,35 | 77,83 |
+
+Le due repliche adattive hanno gli stessi ID e contatori. A 1.000 token il primo arriva dal prefill. Dei 999 successivi, 973 arrivano da round singoli e 26 da 17 round speculativi, con 9 proposte accettate su 34. Forzando K2 si accettano 308 proposte su 1.379. Le due configurazioni senza draft producono gli stessi ID a tutte e tre le lunghezze. Il guadagno del depth mix è più marcato sul test corto e il dato a 1.000 deriva da una sola coppia.
+
+Nel BAB separato che isola il solo p/q GPU a K2 fisso, i tre passaggi producono gli stessi ID e le stesse accettazioni (67/118, 215/592, 308/1379).
+
+| Output | GPU B1 | CPU A | GPU B2 |
+|---:|---:|---:|---:|
+| 128 | 64,30 | 51,87 | 64,43 |
+| 512 | 49,63 | 40,96 | 49,77 |
+| 1.000 | 38,83 | 32,75 | 38,86 |
+
+Con **10.000 ID realmente occupati**, zero riuso e 128 output, il confronto nella medesima build ha dato 74,22 t/s senza MTP e 65,19 con DSpark adattivo (12/20). Prefill rispettivamente 27,68 e 27,81 s. Richiesta nativa intera 29,39 e 29,77 s. Nel BAB a contesto corto, la telemetria di B1 ha misurato picchi di 10.574 MiB sulla 3080 Ti (PCIe 4.0 x4) e 8.124 MiB sulla 2080 Ti (PCIe 3.0 x16).
+
+### Prosa greedy e confronto NInfer
+
+Sulla 3090 NInfer pubblica 113,5 t/s senza draft e 126,1 con DSpark, 2,03 token per round, con UD-Q3_K_XL in una singola prova da 384 output. Il dato spesso citato di 112 t/s riguarda un altro test e una quantizzazione diversa. [Misure NInfer per quantizzazione](https://github.com/iamwavecut/ninfer-all/blob/8c6eed17e44e41041a96a8323fa41c7acca4a0c0/docs/inkling2.md#smaller-quantizations).
+
+Sul nostro prompt inglese sulla stampa di Gutenberg, 42 ID formattati, greedy e 384 output, si misurano **82,23 t/s senza draft e 58,52 con K2 fisso** (180/404). Il testo proviene da `tools/bench/refbench.py` di NInfer, ma l'identità con il prompt della misura 3090 non è verificata. Differiscono anche runtime, GPU, placement e configurazione della KV. Nel vecchio binario gli stessi test danno 80,19 e 56,31. Ciascuna modalità nuova riproduce tutti i 384 ID della sua corrispondente precedente. Greedy con e senza draft divergono dal token 121 in entrambe le build. Il verificatore multi-riga ha quindi ancora un problema aperto di equivalenza con il target a una riga su questo banco.
+
+### Configurazioni e verifiche
+
+Binario `D:/ds4_work/inkling2/builds/mtp-adaptive-ad37bc62/strata-inkling2.exe`, SHA256 `ad37bc62db7e19063dcb7e73ff2bb9894e99c5b4693f935fe5fd8380cd070523`. Preset per la chat più veloce sul banco italiano `D:/ds4_work/inkling2/config/inkling-dual-depth-gpu-sampler.json`. Per la chat con la testa attiva, dalla directory `terminal` dello stesso checkout:
+
+```powershell
+python -m serve.server --engine strata --config D:/ds4_work/inkling2/config/inkling-dual-mtp-adaptive.json --host 127.0.0.1 --port 8100
+```
+
+HTTP reale in due turni sul preset adattivo: «Roma» in 1,406 s completi, 83 token di completamento; «Parigi» in 0,875 s, 61 token, 31 dei 54 token di input riusati. Entrambe le risposte terminano con stop. Il log nativo conferma 9/14 e 8/14 proposte accettate. Il processo di prova è stato chiuso dopo l'unload.
+
+Directory degli artefatti `D:/ds4_work/inkling2/astra-mtp-bench/`. Confronto completo in `release-*/report.json`, p/q isolato in `pq-clean-*/report.json`, contesto in `ctx10k-*/report.json`, prosa in `prose-*/report.json` e chat in `http-mtp-checked/report.json`. Ogni report nativo contiene gli ID, le opzioni e i tempi. I pilot con compilazione concorrente sono esclusi.
+
+CTest su Windows 2/2. Eseguibili CMake `inkling_gpu_pq` e `inkling_depth_split` ricompilati dai sorgenti e passati su entrambe le schede: 97 casi di campionamento e 96 casi bit-identici di depth mix per GPU. Suite Python mirata: 33 test passati, 6 saltati e 102 subtest passati.
+
+### Controlli QKV multi-riga nella verifica
+
+Il prototipo in `C:/Users/imanu/Documents/Codex/inkling-mtp-verify-qkv-lab` applica le tre operazioni del controller Q/K/V usate a T1 a più righe indipendenti durante la verifica. Sul prompt greedy da 384 token il BAB dà **65,88 / 58,81 / 65,80 t/s**. I due B accettano 184/395 e A accetta 180/404. B coincide con il target singolo per i primi 166 token, A per i primi 120. Il testo cambia, quindi la differenza di velocità comprende anche il diverso lavoro di generazione. In italiano, con K2 fisso, il prototipo misura **72,70 / 55,01 / 42,13 t/s** a 128/512/1.000, contro 67,50 / 51,54 / 40,08 del preset fisso. Le prove italiane del prototipo sono pilot singoli. Il preset pubblicato usa il verificatore precedente; il prototipo e i log completi sono recuperabili in `astra-mtp-bench/control-*`. Alla fine delle prove la porta 8100 era libera, con 0 MiB usati sulle due GPU di inferenza.
