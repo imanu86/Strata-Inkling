@@ -3,6 +3,7 @@
 #include "strata/inkling2/sampling.hpp"
 #include "strata/inkling2/replica_policy.hpp"
 #include "inkling2_kernels.cuh"
+#include "inkling2_replica_async.cuh"
 
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/artifact/gguf_split.hpp"
@@ -89,6 +90,9 @@ struct DeviceScope {
 // Opt-in replica storage: full residency is independent of compute ownership.
 struct ExpertReplica {
     int device = -1;
+    bool async = false;
+    cudaEvent_t input_ready = nullptr, remote_done = nullptr;
+    unsigned long long *frequencies = nullptr, *hits = nullptr; // primary-owned
     cudaStream_t stream = nullptr;
     std::vector<void*> allocs;
     std::vector<uint8_t*> blobs;
@@ -114,6 +118,7 @@ struct ExpertReplica {
         DeviceScope owner(device);
         if (stream) cudaStreamSynchronize(stream);
         for (void* p : allocs) cudaFree(p);
+        if (remote_done) cudaEventDestroy(remote_done);
         if (stream) cudaStreamDestroy(stream);
         cudaFreeHost(host_ids); cudaFreeHost(host_miss);
         cudaFreeHost(host_xq); cudaFreeHost(host_parts);
@@ -839,13 +844,36 @@ struct Engine {
     size_t vram_free_after_place = 0;
     int pool_workers = 0;
 
-    void print_replica_stats(const char* event) const {
+    void collect_replica_stats(bool scores) {
+        auto& r = *replica;
+        if (!r.async) return;
+        DeviceScope owner(device);
+        CK(cudaStreamSynchronize(st));
+        unsigned long long hits[3];
+        CK(cudaMemcpy(hits, r.hits, sizeof(hits), cudaMemcpyDeviceToHost));
+        if (hits[2]) { std::fprintf(stderr, "strata-inkling2: async replica invalid router ID\n"); std::exit(1); }
+        r.local_hits = (int64_t) hits[0]; r.remote_hits = (int64_t) hits[1];
+        if (scores) {
+            std::vector<unsigned long long> counts((size_t) m->hp.n_phys * m->hp.n_expert);
+            CK(cudaMemcpy(counts.data(), r.frequencies, counts.size() * sizeof(counts[0]), cudaMemcpyDeviceToHost));
+            for (size_t ip = 0; ip < m->layers.size(); ++ip)
+                for (int e = 0; e < m->hp.n_expert; ++e) m->layers[ip].score[e] = (double) counts[ip * m->hp.n_expert + e];
+        }
+    }
+
+    void print_replica_stats(const char* event) {
         if (!replica) return;
-        std::fprintf(stderr, "REPLICA {\"event\":\"%s\",\"local_hits\":%lld,\"remote_hits\":%lld,\"computed_entries\":%lld,\"duplicate_entries\":%lld,\"missing_entries\":%lld,\"ownership_scope\":\"per_entry_plan\",\"relay_bytes\":%lld,\"join_ms\":%.3f}\n",
+        collect_replica_stats(false);
+        char join_value[64];
+        std::snprintf(join_value, sizeof(join_value), replica->async ? "null" : "%.3f", replica->join_ms);
+        std::fprintf(stderr, "REPLICA {\"event\":\"%s\",\"local_hits\":%lld,\"remote_hits\":%lld,\"computed_entries\":%lld,\"duplicate_entries\":%lld,\"missing_entries\":%lld,\"ownership_scope\":\"%s\",\"relay_bytes\":%lld,\"join_ms\":%s,\"join_timing_scope\":\"%s\",\"scheduling_mode\":\"%s\"}\n",
             event, (long long) replica->local_hits, (long long) replica->remote_hits,
                 (long long) (replica->local_hits + replica->remote_hits),
                 (long long) replica->duplicate_entries, (long long) replica->missing_entries,
-                (long long) replica->relay_bytes, replica->join_ms);
+                replica->async ? "validated_complement_maps_and_gpu_routes" : "per_entry_plan",
+                (long long) replica->relay_bytes, join_value,
+                replica->async ? "not_measured_async" : "host_schedule_and_join",
+                replica->async ? "async_events" : "sync_host");
     }
 
     void reset_hybrid_stats() {
@@ -854,6 +882,7 @@ struct Engine {
             replica->local_hits = replica->remote_hits = replica->relay_bytes = 0;
             replica->join_ms = 0;
             replica->duplicate_entries = replica->missing_entries = 0;
+            if (replica->async) { DeviceScope owner(device); CK(cudaMemsetAsync(replica->hits, 0, 3 * sizeof(unsigned long long), st)); }
         }
         if (role == Role::Outer && split_peer) split_peer->reset_hybrid_stats();
     }
@@ -1020,6 +1049,8 @@ struct Engine {
         if (replica) {
             cudaStreamSynchronize(st);
             print_replica_stats("FINAL");
+            if (replica->input_ready) cudaEventDestroy(replica->input_ready);
+            cudaFree(replica->frequencies); cudaFree(replica->hits);
             cudaFree(replica->local_miss); cudaFree(replica->local_parts);
             replica.reset();
         }
@@ -1468,6 +1499,7 @@ struct Engine {
         auto& r = *replica;
         CK(cudaStreamSynchronize(st));
         { DeviceScope remote(r.device); CK(cudaStreamSynchronize(r.stream)); }
+        collect_replica_stats(true);
         const int ne = (int) m->hp.n_expert;
         std::vector<uint8_t> blob;
         int loaded = 0;
@@ -1487,11 +1519,52 @@ struct Engine {
                 ++loaded;
             }
             CK(cudaMemcpy(L.d_slot_of, L.slot_of.data(), (size_t) ne * sizeof(int32_t), cudaMemcpyHostToDevice));
+            for (int e = 0; e < ne; ++e) if ((L.slot_of[e] >= 0) + (cold[e] >= 0) != 1) {
+                std::fprintf(stderr, "strata-inkling2: invalid replica complement map\n"); std::exit(1);
+            }
             r.cold_of[ip] = cold;
             { DeviceScope remote(r.device);
               CK(cudaMemcpy(r.maps[ip], cold.data(), (size_t) ne * sizeof(int32_t), cudaMemcpyHostToDevice)); }
         }
         std::fprintf(stderr, "REPLICA {\"event\":\"RESET\",\"hot_loaded\":%d,\"source\":\"observed_router_counts\",\"update\":\"request_reset\"}\n", loaded);
+    }
+
+    void run_replica_moe_async(PhysLayer& L, int il, const float* x_norm, int T) {
+        auto& r = *replica;
+        const auto& hp = m->hp;
+        const int N = (int) hp.n_embd, top = (int) hp.n_expert_used, ne = (int) hp.n_expert;
+        const int entries = T * top, ip = hp.loop_layer(il);
+        const size_t qbytes = (size_t) T * (N / 32) * 36, pbytes = (size_t) entries * N * sizeof(float);
+        K::quantize_q8_1_rows(x_norm, T, N, xq, st);
+        k_replica_route_stats<<<(entries+255)/256,256,0,st>>>(ids, L.d_slot_of, r.local_miss,
+            r.frequencies + (size_t) ip * ne, r.hits, entries, ne);
+        CK(cudaMemcpyAsync(r.host_ids, ids, (size_t) entries * sizeof(int32_t), cudaMemcpyDeviceToHost, st));
+        CK(cudaMemcpyAsync(r.host_xq, xq, qbytes, cudaMemcpyDeviceToHost, st));
+        CK(cudaEventRecord(r.input_ready, st));
+        // Record each generation before issuing its cross-device wait. The primary tail
+        // consumes the return slot before the next input_ready lets remote reuse it.
+        { DeviceScope remote(r.device);
+          CK(cudaStreamWaitEvent(r.stream, r.input_ready, 0));
+          CK(cudaMemcpyAsync(r.ids, r.host_ids, (size_t) entries * sizeof(int32_t), cudaMemcpyHostToDevice, r.stream));
+          CK(cudaMemcpyAsync(r.xq, r.host_xq, qbytes, cudaMemcpyHostToDevice, r.stream));
+          k_group_experts<<<1,128,0,r.stream>>>(r.ids, r.maps[ip], r.blobs[ip], L.stride, entries, ne, ne,
+              r.ptrs, r.starts, r.groups, r.dst, r.tok, top);
+          K::native_expert_grouped(L.L, r.ptrs, r.starts, r.groups, r.dst, r.tok,
+              std::min(entries, ne), entries, r.xq, r.scratch, r.parts, r.stream);
+          CK(cudaMemcpyAsync(r.host_parts, r.parts, pbytes, cudaMemcpyDeviceToHost, r.stream));
+          CK(cudaEventRecord(r.remote_done, r.stream)); }
+        if (L.n_slots) {
+            k_group_experts<<<1,128,0,st>>>(ids, L.d_slot_of, L.d_blobs, L.stride, entries, ne, L.n_slots,
+                grp_ptr, grp_start, n_groups, ent_dst, ent_tok, top);
+            K::native_expert_grouped(L.L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok,
+                std::min(entries, ne), entries, xq, escr, eparts, st);
+        }
+        CK(cudaStreamWaitEvent(st, r.remote_done, 0));
+        CK(cudaMemcpyAsync(r.local_parts, r.host_parts, pbytes, cudaMemcpyHostToDevice, st));
+        k_merge_cpu<<<(unsigned) entries,kThreads,0,st>>>(eparts, r.local_parts, r.local_miss, N);
+        k_combine_experts<<<dim3((unsigned)((N+255)/256),(unsigned)T),256,0,st>>>(eparts, ewts, moe_raw, N, top);
+        hy_gpu += entries;
+        r.relay_bytes += (int64_t) 2 * (qbytes + (size_t) entries * sizeof(int32_t) + pbytes);
     }
 
     void run_replica_moe(PhysLayer& L, int il, const float* x_norm, int T) {
@@ -1561,7 +1634,11 @@ struct Engine {
         k_route_inkling2<<<(unsigned) T, 32, 0, st>>>(router_logits, L.exp_probs_b, ids, ewts, (int) hp.n_expert, Kp, hp.expert_weights_scale);
         if (prof_detail) { CK(cudaStreamSynchronize(st)); p_d_route += ms_since(tp_moe_r0); }
 
-        if (replica) { run_replica_moe(L, il, x_norm, T); return; }
+        if (replica) {
+            if (replica->async) run_replica_moe_async(L, il, x_norm, T);
+            else run_replica_moe(L, il, x_norm, T);
+            return;
+        }
         const bool has_gpu = L.n_slots > 0;
         const bool need_cpu = L.n_slots < hp.n_expert;
         const bool is_q5 = (L.L.gu_type == 13);
@@ -2400,10 +2477,11 @@ struct Engine {
 
 };
 
-bool place_replica_experts(Model& m, Engine& E, int remote_device, size_t hot_budget, std::string& err) {
+bool place_replica_experts(Model& m, Engine& E, int remote_device, size_t hot_budget, bool async, std::string& err) {
     DeviceScope owner(E.device);
     auto r = std::make_unique<ExpertReplica>();
     r->device = remote_device;
+    r->async = async;
     const int ne = (int) m.hp.n_expert;
     const size_t entries = (size_t) E.tmax * m.hp.n_expert_used;
     const size_t qbytes = (size_t) E.tmax * (m.hp.n_embd / 32) * 36;
@@ -2418,7 +2496,8 @@ bool place_replica_experts(Model& m, Engine& E, int remote_device, size_t hot_bu
     }
     size_t free_bytes = 0, total = 0;
     CK(cudaMemGetInfo(&free_bytes, &total));
-    const size_t local_extra = pbytes + entries * sizeof(int32_t) + m.layers.size() * ne * sizeof(int32_t);
+    const size_t local_extra = pbytes + entries * sizeof(int32_t) + m.layers.size() * ne * sizeof(int32_t) +
+        (async ? (m.layers.size() * ne + 3) * sizeof(unsigned long long) : 0);
     if (free_bytes < reserve + local_extra) { err = "replica dense GPU lacks workspace reserve after full-capacity KV allocation"; return false; }
     hot_budget = std::min(hot_budget, free_bytes - reserve - local_extra);
     const int slots = (int) std::min<size_t>(ne, hot_budget / strides);
@@ -2432,6 +2511,7 @@ bool place_replica_experts(Model& m, Engine& E, int remote_device, size_t hot_bu
           err = "replica GPU cannot hold all experts plus scratch and 512 MiB reserve"; return false;
       }
       CK(cudaStreamCreateWithFlags(&r->stream, cudaStreamNonBlocking));
+      if (async) CK(cudaEventCreateWithFlags(&r->remote_done, cudaEventDisableTiming));
       r->alloc(&r->xq, qbytes); r->alloc(&r->scratch, scratch_bytes);
       r->alloc(&r->ids, entries * sizeof(int32_t));
       r->alloc(&r->starts, (ne+1) * sizeof(int32_t)); r->alloc(&r->groups, sizeof(int32_t));
@@ -2456,6 +2536,13 @@ bool place_replica_experts(Model& m, Engine& E, int remote_device, size_t hot_bu
     CK(cudaHostAlloc(&r->host_miss, entries * sizeof(int32_t), cudaHostAllocPortable));
     CK(cudaHostAlloc(&r->host_xq, qbytes, cudaHostAllocPortable));
     CK(cudaHostAlloc(&r->host_parts, pbytes, cudaHostAllocPortable));
+    if (async) {
+        CK(cudaEventCreateWithFlags(&r->input_ready, cudaEventDisableTiming));
+        CK(cudaMalloc(&r->frequencies, m.layers.size() * ne * sizeof(unsigned long long)));
+        CK(cudaMalloc(&r->hits, 3 * sizeof(unsigned long long)));
+        CK(cudaMemset(r->frequencies, 0, m.layers.size() * ne * sizeof(unsigned long long)));
+        CK(cudaMemset(r->hits, 0, 3 * sizeof(unsigned long long)));
+    }
     CK(cudaMalloc(&r->local_miss, entries * sizeof(int32_t)));
     CK(cudaMalloc(&r->local_parts, pbytes));
     for (auto& L : m.layers) {
@@ -2469,9 +2556,9 @@ bool place_replica_experts(Model& m, Engine& E, int remote_device, size_t hot_bu
     E.placed_bytes = full_bytes + r->hot_bytes;
     E.core_all_gpu = false; // no layer graphs: routing and pinned relay remain eager
     CK(cudaMemGetInfo(&E.vram_free_after_place, &total));
-    std::fprintf(stderr, "REPLICA {\"event\":\"READY\",\"dense_device\":%d,\"replica_device\":%d,\"full_experts\":%d,\"hot_capacity\":%d,\"hot_loaded\":0,\"full_bytes\":%llu,\"hot_bytes\":%llu,\"reserve_bytes\":%llu,\"kv_capacity\":%d,\"cold_start\":true}\n",
+    std::fprintf(stderr, "REPLICA {\"event\":\"READY\",\"dense_device\":%d,\"replica_device\":%d,\"full_experts\":%d,\"hot_capacity\":%d,\"hot_loaded\":0,\"full_bytes\":%llu,\"hot_bytes\":%llu,\"reserve_bytes\":%llu,\"kv_capacity\":%d,\"cold_start\":true,\"async\":%s}\n",
         E.device, remote_device, E.placed_slots, slots * (int) m.layers.size(),
-        (unsigned long long) full_bytes, (unsigned long long) r->hot_bytes, (unsigned long long) reserve, E.ctx);
+        (unsigned long long) full_bytes, (unsigned long long) r->hot_bytes, (unsigned long long) reserve, E.ctx, async ? "true" : "false");
     E.replica = std::move(r);
     return true;
 }
@@ -2932,6 +3019,7 @@ int run(int argc, char** argv) {
     int layer_split_device = -1;
     int expert_replica_device = -1, expert_dense_device = -1;
     int expert_hot_mib = 4096;
+    bool expert_replica_async = false;
     bool split_core_graph = false;
     bool split_outer_graph = false;
     bool batch_qkv_control_t1 = false;
@@ -2960,6 +3048,7 @@ int run(int argc, char** argv) {
         else if (a == "--chunk" || a == "--prefill") chunk = std::atoi(next_arg());
         else if (a == "--max-new" || a == "-n") max_new = std::atoi(next_arg());
         else if (a == "--tokens") tokens_str = next_arg();
+        else if (a == "--expert-replica-async") expert_replica_async = true;
         else if (a == "--expert-replica-device" || a == "--expert-dense-device" || a == "--expert-hot-mib") {
             const char* text = next_arg(); char* tail = nullptr;
             const long value = std::strtol(text, &tail, 10);
@@ -2996,7 +3085,7 @@ int run(int argc, char** argv) {
     }
 
     if (model_path.empty()) {
-        std::fprintf(stderr, "usage: strata-inkling2 --model <file.gguf> [--max-context N] [--kv-q8|--kv-f16] [--tokens IDS] [--max-new N] [--dump-logits PATH] [--layer-split-device N [--split-core-graph] [--split-outer-graph]] [--batch-qkv-control-t1] [--expert-dense-device N --expert-replica-device N --expert-hot-mib MiB] [--draft DRAFT.gguf --spec K] [--bench] [--serve]\n");
+        std::fprintf(stderr, "usage: strata-inkling2 --model <file.gguf> [--max-context N] [--kv-q8|--kv-f16] [--tokens IDS] [--max-new N] [--dump-logits PATH] [--layer-split-device N [--split-core-graph] [--split-outer-graph]] [--batch-qkv-control-t1] [--expert-dense-device N --expert-replica-device N --expert-hot-mib MiB [--expert-replica-async]] [--draft DRAFT.gguf --spec K] [--bench] [--serve]\n");
         return 2;
     }
     if (split_core_graph && layer_split_device < 0) {
@@ -3014,6 +3103,9 @@ int run(int argc, char** argv) {
         std::fprintf(stderr, "strata-inkling2: --verify-row0-oracle is a standalone CLI diagnostic, not a serve mode\n"); return 2;
     }
 
+    if (expert_replica_async && expert_replica_device < 0) {
+        std::fprintf(stderr, "strata-inkling2: --expert-replica-async requires expert replica placement\n"); return 2;
+    }
     if (expert_replica_device >= 0 || expert_dense_device >= 0) {
         int count = 0; CK(cudaGetDeviceCount(&count));
         if (expert_replica_device < 0 || expert_dense_device < 0 || expert_replica_device == expert_dense_device ||
@@ -3095,7 +3187,7 @@ int run(int argc, char** argv) {
         E.reset_state();
     }
     if (!(expert_replica_device >= 0
-              ? place_replica_experts(m, E, expert_replica_device, (size_t) expert_hot_mib << 20, err)
+              ? place_replica_experts(m, E, expert_replica_device, (size_t) expert_hot_mib << 20, expert_replica_async, err)
               : place_experts(m, E, expert_vram, cpu_threads, err)) ||
         (split_core && !place_experts(m, *split_core, expert_vram, cpu_threads, err))) {
         std::fprintf(stderr, "strata-inkling2: expert placement failed: %s\n", err.c_str());
