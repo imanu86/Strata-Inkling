@@ -1830,9 +1830,13 @@ def take_note() -> str:
     return note
 
 
-def engine_info(args: list[Any], log_text: str = "", note: str = "") -> dict[str, str]:
+def engine_info(args: list[Any], log_text: str = "", note: str = "", *, native_info: dict[str, Any] | None = None) -> dict[str, str]:
     """The facts of one engine start for /metrics and the apps: ``drafting`` (mtp | dflash2 | off) and ``drafting_note`` (plain words, or ""): the one drafter this
-    start loads (``--draft dflash2`` without ``--mtp``, ``--mtp`` without ``--draft``), and why it is not the one asked for. The engine's own log wins over the choice."""
+    start loads (``--draft dflash2`` without ``--mtp``, ``--mtp`` without ``--draft``), and why it is not the one asked for. The engine's own log wins over the choice.
+    Inkling's native INFO dspark=on/off is authoritative; its --draft path is not Qwen's DFlash2 selector."""
+    native = native_info or {}
+    if "inkling2" in str(native.get("engine", "")).lower() and native.get("dspark") in ("on", "off"):
+        return {"drafting": "mtp" if native["dspark"] == "on" else "off", "drafting_note": ""}
     items = [str(a) for a in args]
     asked_dflash2 = any(items[i] == "--draft" and i + 1 < len(items) and items[i + 1] == "dflash2" for i in range(len(items)))
     fell_back = fallback_note(log_text) if asked_dflash2 else ""

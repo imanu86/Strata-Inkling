@@ -937,7 +937,7 @@ class StrataEngine:
         except Exception:                               # noqa: BLE001 - a note must never stop a start
             pass
         try:                                            # which drafter runs, and in plain words why not the one that was asked for
-            self.info.update(drafting.engine_info(args, start_log_text(log, log_start), drafting.take_note()))
+            self.info.update(drafting.engine_info(args, start_log_text(log, log_start), drafting.take_note(), native_info=self.info))
         except Exception:                               # noqa: BLE001 - a note must never stop a start
             pass
         self.ended = False                              # READY: alive from here (restart() set it True, #344)

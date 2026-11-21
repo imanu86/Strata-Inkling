@@ -778,6 +778,14 @@ function projectionText(c) {
          `${single ? ` (layer ${single.replace("single", "")}'s direction)` : ""}. Per chat in Sampling. Its package ` +
          "describes the vector as a refusal-direction projection; measure the speed yourself";
 }
+function speculationText(eng) {
+  if (String(eng.engine || eng.version || "").toLowerCase().includes("inkling2") && (eng.dspark === "on" || eng.dspark === "off")) {
+    if (eng.dspark === "off") return null;
+    const count = Number(eng.draft_max);
+    return "DSpark (MTP) on" + (Number.isInteger(count) && count > 0 ? `, drafts up to ${count} tokens` : "");
+  }
+  return eng.spec && (eng.drafting == null || eng.drafting === "mtp") ? `MTP drafts up to ${Math.max(0, (eng.mtp_max || eng.spec) - 1)} tokens${eng.lookup ? ", prompt lookup on" : ""}` : null;
+}
 function renderAbout(eng, hw, st) {
   const kv = {int8: "8-bit", q4_0: "4-bit (Hadamard-rotated)", fp16: "16-bit"}[eng.kv] || eng.kv;
   facts($("facts-engine"), [
@@ -787,7 +795,7 @@ function renderAbout(eng, hw, st) {
     ["KV cache", kv ? `${kv}${eng.kv_resident ? `, streamed: ${fmt(eng.kv_resident)} positions per layer in VRAM, the rest in RAM` : ", all in VRAM"}` : null],
     ["Experts in VRAM", eng.expert_slots ? `${fmt(eng.expert_slots)} (${gb((eng.expert_cache_mib || 0) * 1048576)} GB)` : null],
     // #5080: the MTP line only when the MTP is the drafter (eng.drafting, strata_control/drafting.py engine_info; an engine too old to say had only the MTP)
-    ["Speculation", eng.spec && (eng.drafting == null || eng.drafting === "mtp") ? `MTP drafts up to ${Math.max(0, (eng.mtp_max || eng.spec) - 1)} tokens${eng.lookup ? ", prompt lookup on" : ""}` : null],
+    ["Speculation", speculationText(eng)],
     ["Images", eng.images ? "on" : "off"],
     ["Experimental speed projection", projectionText(eng.cvec)],
   ]);

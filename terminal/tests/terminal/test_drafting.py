@@ -6,6 +6,8 @@ from __future__ import annotations
 import http.server
 import importlib.util
 import json
+import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -755,6 +757,41 @@ class WhatTheEngineSaid(unittest.TestCase):
                          "Drafting: MTP (DFlash2 is for Qwen3.8-Flash-Next only)")
         self.assertEqual(drafting.engine_info(["--mtp", "/m"]), {"drafting": "mtp", "drafting_note": ""})
         self.assertEqual(drafting.engine_info(["--spec", "4"]), {"drafting": "off", "drafting_note": ""})
+
+    def test_inkling_native_info_is_authoritative(self):
+        args = ["--draft", "/inkling-dspark.gguf", "--spec", "3"]
+        native = {"engine": "0.2.17-inkling2", "dspark": "on", "draft_max": 3}
+        self.assertEqual(drafting.engine_info(args, note=drafting.NOT_SUPPORTED, native_info=native),
+                         {"drafting": "mtp", "drafting_note": ""})
+        self.assertEqual(native["draft_max"], 3)
+        self.assertEqual(drafting.engine_info([*args, "--mtp", "/qwen"], native_info={**native, "dspark": "off"}),
+                         {"drafting": "off", "drafting_note": ""})
+
+    def test_dspark_info_does_not_change_other_families(self):
+        for native in ({"engine": "0.1.63-qwen4exp", "dspark": "on", "draft_max": 3}, {"dspark": "on"}, {}):
+            self.assertEqual(drafting.engine_info(["--draft", "/a.gguf"], native_info=native),
+                             {"drafting": "off", "drafting_note": ""})
+            self.assertEqual(drafting.engine_info(self.ARGS, native_info=native),
+                             {"drafting": "dflash2", "drafting_note": ""})
+
+    def test_web_dspark_width_and_qwen_regression(self):
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node is needed to execute the web formatting function")
+        source = (ROOT / "serve/web/app.js").read_text(encoding="utf-8")
+        start = source.index("function speculationText(")
+        function = source[start:source.index("\nfunction renderAbout(", start)]
+        cases = [({"engine": "0.2.17-inkling2", "dspark": "on", "draft_max": 3}, "DSpark (MTP) on, drafts up to 3 tokens"),
+                 ({"engine": "0.2.17-inkling2", "dspark": "on"}, "DSpark (MTP) on"),
+                 ({"engine": "0.2.17-inkling2", "dspark": "off", "spec": 4, "drafting": "mtp"}, None),
+                 ({"engine": "qwen4exp", "dspark": "on", "draft_max": 3}, None),
+                 ({"engine": "qwen4exp", "spec": 4, "drafting": "mtp"}, "MTP drafts up to 3 tokens"),
+                 ({"spec": 4, "mtp_max": 5, "lookup": 1}, "MTP drafts up to 4 tokens, prompt lookup on"),
+                 ({"spec": 4, "drafting": "dflash2"}, None)]
+        script = function + "\nfor (const [eng, want] of " + json.dumps(cases) + ") { " \
+            "if (speculationText(eng) !== want) throw new Error(JSON.stringify({eng, want, got: speculationText(eng)})); }"
+        result = subprocess.run([node, "--input-type=module", "-e", script], capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_summary_line(self):
         self.assertEqual(drafting.summary_line(drafting.Decision("auto", "mtp")), "Drafting: MTP")
