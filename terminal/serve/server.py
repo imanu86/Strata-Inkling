@@ -3999,6 +3999,13 @@ class Service:
         import serve.frontend as _frontend
         _frontend.use_family(family)
         self._force_text = _frontend.inkling_force_text if family == "inkling2" else None
+        if family == "inkling2":
+            # GGUF export keeps the full metadata keys; Inkling's 200006 turn terminator is distinct from endoftext.
+            special_ids = getattr(self.tok, "special_ids", None) or {}
+            for key in ("tokenizer.ggml.eos_token_id", "tokenizer.ggml.eot_token_id"):
+                token = special_ids.get(key)
+                if isinstance(token, int) and not isinstance(token, bool) and token >= 0:
+                    self.stop_ids.add(token)
 
     _force_text = None
 
@@ -5506,6 +5513,7 @@ class Service:
                         seg, wrap, leaving = [], False, False   # this pass's tokens; the budget is reached; closed
                         nonfinite = False               # #879: the engine ended this pass on non-finite logits
                         opens = False                   # the thinking is over: write the forced call's opening
+                        exhausted = False               # only a natural iterator end may inherit native DONE stop
                         try:
                             # A value the frontend holds back (a tool call's array or object argument is sent
                             # whole, once complete) can keep the stream silent for minutes while tokens are
@@ -5588,6 +5596,8 @@ class Service:
                                     elif parser.state == "content" and parser.clean and not detok.pending():
                                         opens = True
                                         break
+                            else:
+                                exhausted = True
                         except EngineNonFinite:
                             nonfinite = True
                         except EngineDied as e:
@@ -5618,6 +5628,12 @@ class Service:
                             segment_done = getattr(self.engine, "last", None)
                             if segment_done is not None and segment_done is not segment_before:
                                 segments.append(dict(segment_done))
+                        if (self.family == "inkling2" and exhausted and finish == "length" and not cancel.is_set()
+                                and segment_done is not None and segment_done is not segment_before
+                                and segment_done.get("finish") in ("stop", "eos")):
+                            # Some native iterators consume EOS themselves. Use only THIS pass's DONE, never a
+                            # previous request's last stats or the DONE drained after a caller-side early close.
+                            finish = "stop"
                         if nonfinite and not cancel.is_set():
                             # #879: the engine emitted none of the poisoned window's tokens and reads its next prompt
                             # from token 0.  Nothing sent yet: the same request once more, unseen by the client
