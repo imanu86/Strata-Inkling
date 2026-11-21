@@ -160,6 +160,13 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/core AND EXISTS ${CMAKE_CURRENT_SOUR
   set(_strata_tests_default ON)
 endif()
 option(STRATA_BUILD_TESTS "Build the test suite" ${_strata_tests_default})
+if(STRATA_BUILD_TESTS)
+  enable_testing()
+  add_executable(inkling_sampling_test tests/inkling2/sampling_test.cpp)
+  target_include_directories(inkling_sampling_test PRIVATE include)
+  target_compile_features(inkling_sampling_test PRIVATE cxx_std_17)
+  add_test(NAME inkling_sampling_test COMMAND inkling_sampling_test)
+endif()
 # A test that needs a model file (a real expert blob from a pack, which is not in the source tree): registered as the real test
 # when the file is there, and otherwise as a stated skip that ctest lists as "Skipped" with this reason, never as a pass of nothing
 # and not as a failure on a machine that has no pack.
@@ -638,6 +645,16 @@ if(STRATA_NATIVE_EXPERTS)
   endif()
   strata_cpu_native_experts()
   strata_quant_layer()
+  if(STRATA_BUILD_TESTS)
+    add_executable(inkling_q3_parity tests/quant/inkling_q3_parity.cpp)
+    target_link_libraries(inkling_q3_parity PRIVATE strata_quant)
+    if(STRATA_ENABLE_CUDA)
+      target_compile_definitions(inkling_q3_parity PRIVATE STRATA_INKLING_Q3_CUDA=1)
+      target_link_libraries(inkling_q3_parity PRIVATE strata_kernels strata_kernels_cpu CUDA::cudart)
+    endif()
+    # GPU runs select an inference card explicitly with --device N.
+    add_test(NAME inkling_q3_cpu COMMAND inkling_q3_parity --cpu-only)
+  endif()
   if(STRATA_ENABLE_CUDA)
     strata_cuda_pf_own()   # Strata's own prompt kernels
   elseif(STRATA_ENABLE_HIP)
