@@ -7,6 +7,7 @@ Checkpoint del 21 novembre 2026. Questo documento distingue le verifiche complet
 - Repository: https://github.com/imanu86/Strata-Inkling, branch `main`.
 - Base: `kuraneko1/Strata`, commit `19e73bd6df9dc6bdf024716ed030eb369bdf16e8`.
 - Motore Strata/Kuraneko: non è stato integrato codice Basalt.
+- GitHub Actions disabilitato a livello repository su richiesta dell'owner (`actions/permissions.enabled=false`); verificati come `completed/cancelled` tutti i quattro run attivi: 44883794401, 44883794368, 44882714072 e 44882714025. I prossimi push non avviano quei workflow.
 - Repository derivato con cronologia conservata. GitHub non ha creato un secondo fork nella stessa rete: la richiesta restituiva il fork Qwen già esistente.
 - Il Daily Qwen è preservato. Il suo server sulla porta 8100 è stato fermato; il gateway preesistente non è stato modificato.
 - Capacità del contesto: **262144**, anche quando il prompt di prova è corto. KV Q8.
@@ -83,7 +84,7 @@ Riproduzione: `tools/inkling_smoke.py --gpu-uuid <2080_UUID> --core-gpu-uuid <30
 
 ## Chat disponibile
 
-Server dual verificato e lasciato in ascolto su `http://127.0.0.1:8100/`, API `/v1`. Configurazione: `D:\ds4_work\inkling2\config\inkling-dual-graph.json`. Usa il binario split immutabile, capacità 262144, KV Q8, prefill chunk64, 2080 outer/head e 3080 core. La 3060 rimane esclusa tramite UUID. Default: effort high=0.9, temperature1/top_p1/top_k0/min_p0.
+Server dual precedentemente verificato su `http://127.0.0.1:8100/`, API `/v1`. All'avvio del banco lungo del 21 novembre la porta risultava libera, nessun processo Inkling e zero VRAM sulle due GPU di inferenza. Ripristinare il server al termine delle prove con il binario validato. Configurazione precedente: `D:\ds4_work\inkling2\config\inkling-dual-graph.json`. Usa capacità 262144, KV Q8, prefill chunk64, 2080 outer/head e 3080 core. La 3060 rimane esclusa tramite UUID. Default: effort high=0.9, temperature1/top_p1/top_k0/min_p0.
 
 Verifica HTTP reale: domanda 17+25, override effort medium, limite512; risposta `42`, 78 token complessivi inclusi quelli di ragionamento, `finish_reason=stop`. Prefill962,7ms e decode1162,2ms riportati dal motore. È una verifica funzionale separata dal BAB, non un benchmark confrontabile. Artefatto: `D:\ds4_work\inkling2\runs\20261121-http-dual-verified.json`.
 
@@ -128,12 +129,88 @@ cmake --build build-windows-inkling --target strata-inkling2 inkling_q3_parity i
 
 ## Prossimi passi
 
-1. Eventuale ottimizzazione outer con CUDA Graph, seguendo la misura Nsight; verificare parità e ripetere il BAB 128/512/1000 senza profiler.
+### Aggiornamento DSpark e contesti lunghi (in corso)
+
+Trovato il draft ufficiale DSpark a tre layer, incluso nel rilascio Thinking Machines. Scaricato e verificato il GGUF Unsloth Q8 pronto: `D:\ds4_work\inkling2\mtp-research\dspark-Inkling-2-Mini-Q8_0.gguf`, 402278560 byte, revisione `ea0c79b2ecd73669e774c8519b79bfabfddbc027`, SHA256 `2ec78510da837e8fc3be54a14757a0c5fbd2d8d9e85a0d92853fafdf674f3773`. Riferimenti e confronto CPU sui 54 tensori con il BF16 ufficiale in `mtp-research\research-report.md`. Il confronto dei pesi non è una validazione end-to-end del draft.
+
+Kuraneko ha aggiunto DSpark nei commit `b946633f7` e `0222f8159`, successivi alla nostra base. Il porting è in `ee9bc61c2`: preserva split, top_k0 sull'intero vocabolario e campionamento con accettazione p/q. Il draft legge gli input delle visite virtuali 5,23,41 e la norma finale48; i layer fisici sono un'altra numerazione. Build CUDA Windows e prove qui descritte completate; HIP e gli altri backend non sono stati compilati. Il draft resta sperimentale e spento nel preset operativo.
+
+Durante la revisione è emerso un difetto preesistente nel prefill batch oltre il primo giro della cache SWA: scrivere T righe in un ring da 1024 sovrascrive alcuni KV ancora necessari alle prime query del batch. La correzione amplia la capacità a `1024+tmax-1`, lasciando la finestra di attention a 1024. Il BAB precedente a chunk1 non attraversa questo caso.
+
+Test GPU numerico indipendente `inkling_swa_ring`: passati 28 casi per GPU su 2080 e 3080. Il controllo negativo con la capacità precedente riproduce l'errore (fino a 0,06146 nel caso sintetico); la capacità corretta ha errore massimo 2,98e-8. Log in `runs\20261121-swa-ring`.
+
+Per misurare i contesti senza attendere DSpark, creato un candidato separato dai sorgenti committati `2d898a16e`, con la sola correzione della capacità SWA: `D:\ds4_work\inkling2\builds\swa-corrected-baseline-2d898a16e\build\strata-inkling2.exe`, SHA256 `16e96652fdb000e51911c22c27b303009080738628072ea1b9ff4152909d129f`. È una cartella normale, senza branch/worktree; `SOURCE.json` conserva la modifica e gli hash. Build completata, logits sul prompt corto identici bit per bit al precedente dual sia a chunk1 sia a chunk64. Non include MTP.
+
+Banco completato: `tools/inkling_context_bench.py`, 10000/20000/40000 input esatti, chunk64, 512 output, capacità262144, KV Q8, effort none e campionamento T1/P1/K0/minP0. Prompt sintetici diversi all'inizio per impedire il riuso di prefissi; un solo processo per i tre punti. Nessun ripristino SSD. Artefatti `D:\ds4_work\inkling2\runs\20261121-context-baseline-swa-fixed`.
+
+| Input | Prefill | Velocità prefill | Decode di 511 passi |
+|---:|---:|---:|---:|
+| 10000 | 27,723 s | 360,71 t/s | 57,95 t/s |
+| 20000 | 60,087 s | 332,85 t/s | 53,56 t/s |
+| 40000 | 137,190 s | 291,57 t/s | 47,70 t/s |
+
+Tutte le risposte hanno generato 512 token e terminato per limite; riuso zero. Non è un banco di qualità. Durante il decode: VRAM stabile a 10546 MiB sulla 3080 e 7174 MiB sulla 2080; RAM disponibile almeno 65,7 GiB. La 3080 registra 1965 MHz a 10K e 1935 MHz a 20K/40K; la 2080 oscilla nelle letture fra 1080 e 1875 MHz. Questo è un possibile fattore da controllare nei confronti futuri, non una causa dimostrata del calo.
+
+Build DSpark completata e test CPU sampling passato. La verifica senza draft ha rilevato una variazione dei logits introdotta dall'aggiunta delle trace ai kernel shortconv. Il codice ora registra la history con kernel separati che copiano soltanto i dati e lascia invariata l'aritmetica originale. Con draft caricato, 200058 logits iniziali sono bit-identici al riferimento, sia a chunk1 sia a chunk64 (`20261121-dspark-first-parity`). Il controllo RAM warm/cold/reset passa (`20261121-dspark-state`); non costituisce una prova SSD.
+
+Primo BAB DSpark spec3, prompt99/chunk64, capacità256K, campionamento T1/P1/K0/minP0 e output realmente generati:
+
+| Output | B1 DSpark | A senza draft | B2 DSpark |
+|---:|---:|---:|---:|
+| 128 | 41,94 t/s | 61,50 t/s | 45,17 t/s |
+| 512 | 33,16 t/s | 63,54 t/s | 33,90 t/s |
+| 1000 | 29,15 t/s | 61,24 t/s | 29,34 t/s |
+
+Sono token generati durante il decode, escluso il primo prodotto dal prefill; con MTP non equivalgono al numero di forward. Artefatti `20261121-dspark-bab-B1/A/B2`. Questo candidato è più lento e non va promosso come miglioramento. Inoltre B1/B2 divergono già agli indici5/18/18, pur con seed uguale. La revisione ha trovato un race concreto nell'iniezione KV del draft: due warp riutilizzavano lo stesso array shared per RMS, massimo K e massimo V senza proteggere tutte le letture. La correzione separa i tre array; build completata SHA256 `e859541df5b459556e246a9c58da7ab222b862ea6bf3bc611d78197e82502b4e`, preservata in `builds\dspark-racefixed-e859541d`.
+
+Ripetizione completa `20261121-dspark-racefixed-bab-B1/A/B2`, stessi input, sampling e binario su tutti i passaggi:
+
+| Output | B1 DSpark corretto | A senza draft | B2 DSpark corretto | Accettati / proposti in ciascun B |
+|---:|---:|---:|---:|---:|
+| 128 | 47,44 t/s | 62,03 t/s | 47,43 t/s | 68 / 172 |
+| 512 | 40,47 t/s | 64,92 t/s | 40,68 t/s | 228 / 843 |
+| 1000 | 30,94 t/s | 60,83 t/s | 31,12 t/s | 306 / 2073 |
+
+B1 e B2 producono ID identici a tutte le lunghezze, con gli stessi contatori di accettazione. Il difetto di ripetibilità non si presenta più in questo banco. L'MTP resta più lento, quindi rimane opzionale e spento nel preset operativo. Non è ancora dimostrata la parità end-to-end del draft Q8 con l'implementazione BF16 ufficiale.
+
+Banco greedy con1100 input,128 output e spec1/3/7 (`20261121-dspark-width-parity`, ripetuto dopo la correzione in `20261121-dspark-racefixed-width-parity`): tutte le varianti divergono dal decode normale all'indice60. Spec1/spec3/spec3 dopo STOP danno gli stessi128 ID; spec7 diverge da loro più avanti. STOP ferma a16 token, ritorna il contratto nativo `finish=cancel` e il processo resta disponibile; la prima versione del banco attendeva erroneamente `stop`, ora corretto. Il reset dopo STOP conserva gli ID. La differenza dal decode normale resta segnalata, non ignorata: il codice usa proiezioni BF16/FP32 e attention differenti fra T1 e T>1.
+
+Oracolo `20261121-dspark-row0-oracle`: ricostruito il prefisso con1100 input a chunk64 e59 token forzati a T1. Dallo stesso checkpoint di entrambi i runtime, eseguiti T1/2/4/8 senza chiamare draft, inject o commit_verify. T1 predice150759 con margine0,01889 sul secondo150078; T2/T4 mantengono lo stesso argmax, ma RMS dei logits0,05916 e differenza relativa L2=0,6493%; T8 RMS0,06967 e L2=0,7647%. Cambiando soltanto i sette token futuri di T8, la riga0 resta bit-identica. È dimostrata una differenza numerica prima del rollback e la causalità in questa prova; l'inversione del banco completo non è riprodotta dallo stesso stato. L'accumulo di differenze lungo il decode è un'ipotesi, non una causa già isolata. CLI diagnostica `--verify-row0-oracle <8 ID> --oracle-force-t1 59`, inattiva nel normale uso.
+
+### CUDA Graph dei layer esterni: guadagno verificato
+
+Commit `2a6825a1e`, flag opzionale `--split-outer-graph`, solo split a T1 senza draft e con tutti gli esperti esterni residenti. Cattura visite0..5 e42..47; head, embedding, aggiornamento posizione e trasferimenti fra GPU restano fuori. Il preset precedente non attiva il flag automaticamente.
+
+Binario testato: `D:\ds4_work\inkling2\builds\outer-graph-eb41ea7f\strata-inkling2.exe`, SHA256 `eb41ea7f38cd74a046255f579613a17b039b0ed406f725651945e76502de65ee`. Logits200058 bit-identici al riferimento dual corretto sia chunk1 sia64, quattro token greedy identici (`20261121-outer-graph-parity`). Warm/cold/reset con128 output massimi passa (`20261121-outer-graph-state`). Preparato preset `D:\ds4_work\inkling2\config\inkling-dual-outer-graph.json`, con questo binario, capacità256K, KV Q8 e MTP spento; server ancora fermo durante la diagnosi MTP. Non confondere la preparazione del preset con un'avvenuta verifica HTTP.
+
+BAB senza profiler, stesso binario con flag acceso/spento, prompt99, chunk64, output128/512/1000, stesso sampler e seed:
+
+| Output | B1 outer graph | A solo core graph | B2 outer graph | Guadagno medio |
+|---:|---:|---:|---:|---:|
+| 128 | 75,81 t/s | 61,87 t/s | 70,07 t/s | +17,9% |
+| 512 | 72,90 t/s | 64,43 t/s | 71,92 t/s | +12,4% |
+| 1000 | 68,52 t/s | 61,84 t/s | 68,42 t/s | +10,7% |
+
+Tutti gli ID emessi e i contatori hit/lookup coincidono fra A/B1/B2. Artefatti `20261121-outer-graph-bab-B1/A/B2`. Il breve128 mostra variabilità fra i due B; evitare di scegliere il solo valore migliore. Nel decode1000: VRAM3080=10546 MiB;2080=7174 MiB in A,7176 nei B; RAM disponibile almeno66,19 GiB. Clock2080 non fissato, intervalli1080..1605 MHz;3080=1950..1965 MHz. Temperature3080 crescono46..56 gradi attraverso il BAB; entrambi i B restano più rapidi. Nessuna regolazione di clock/potenza applicata.
+
+### Diagnosi MTP in parallelo
+
+Su richiesta dell'owner il lavoro MTP continua mentre si consolida il percorso senza draft. Un worker Sol possiede `inkling2_dspark.cuh` e il comparatore CPU; un altro possiede `inkling2_engine.cu`. Build e prove GPU sono coordinate in sequenza; nessun comparatore CPU pesante durante i banchi prestazionali.
+
+Dump diagnostico one-shot opt-in tramite `INKLING2_DSPARK_DUMP_PREFIX` (directory nuova, mai sovrascritta) e `INKLING2_DSPARK_DUMP_CALL` (indice zero). Disattivato senza variabile. Capture `mtp-research\capture-call0-20261121`,92 file/8,8 MB, pos99, anchor200001. La richiesta da128 token produce gli stessi ID del BAB senza dump: non usare i suoi tempi come benchmark.
+
+Comparatore `mtp-research\dspark_stage_oracle.py --no-fold --threads 8`: stadi locali ricostruiti con gli stessi input catturati e pesi GGUF. Max differenza relativa L2 locale0,01463% nel layer0.wo; resto≤0,000399%. Head nativa ricostruita con RMS circa2,7e-6 e distanza totale di variazione≤1,02e-7. Rimuovere soltanto Q8_1 dalla head cambia TV al massimo0,002493; nessun argmax diverso nelle tre proposte. RNN BF16: stato diverso dello0,24..0,30%, effetto sull'accettazione non ancora dimostrato. Call0 è quasi deterministica e riguarda framing iniziale, quindi non rappresenta la prosa lunga. Prossima cattura in fase narrativa.
+
+**Head target verificata Q5_K**,302,21 MiB nelle200058 righe utilizzate. Il draft Q8 non rende Q8 anche la head target. La precedente stima interna467 MiB era errata; non usarla. Un eventuale fold BF16 rank256 occuperebbe97,68 MiB più bias, ma non è implementato e il solo risparmio di traffico non prova un guadagno complessivo. Il riferimento target BF16 originale non è disponibile: un confronto folded sul GGUF dequantizzato è un proxy, non parità ufficiale end-to-end.
+
+Prima profilazione Nsight sampled tramite protocollo interattivo non completata: `20261121-nsys-dspark-sampled512` non contiene una generazione valida. Il processo di quella prova è stato fermato e chiuso; preservata la traccia come tentativo fallito. È in preparazione un wrapper Python per separare il protocollo del server dal forwarding del profiler. Non interpretare la traccia fallita come misura MTP.
+
+1. Profilare il costo MTP e confrontare gli stadi nella prosa; scegliere l'ottimizzazione sulla componente misurata.
 2. Approfondire il prefill batch prima di dichiarare parità su GPU miste; non cambiare quantizzazione senza una prova controllata.
 3. Ripristino SSD completo da portare prima dei banchi a contesti lunghi. Il checkpoint RAM salva SWA/convoluzione e usa KV globale ancora residente: **non è un ripristino autonomo da SSD**.
 4. Valutare i worker esperti separati dopo il consolidamento del percorso a strati; non sono implementati in questo prototipo Inkling.
 
-Binario split immutabile, verifica HTTP dual e banco 128/512/1000 completati. Prima di una nuova prova GPU usare il server esistente oppure scaricarne il modello, evitando due processi concorrenti. I test a contesto lungo occupato e multichat restano da eseguire.
+Binario split immutabile, verifica HTTP dual, banco 128/512/1000 e contesti occupati10/20/40K completati. Prima di una nuova prova GPU usare il server esistente oppure scaricarne il modello, evitando due processi concorrenti. Il multichat resta da eseguire.
 
 La ricostruzione della chat Claude precedente è in `C:\Users\imanu\Documents\Codex\2026-10-07\rip\work\TERRA_RIASSUNTO_SESSIONE_CLAUDE_STRATA_2026-11-21.md`. Il Daily a due server usava worker esperti persistenti, non due repliche HTTP. La versione a strati ripartiva prefill e decode; per Inkling occorre rispettare le 48 visite e il relativo stato KV, senza copiare alla cieca i meccanismi Qwen.
 
