@@ -1107,6 +1107,13 @@ def card_note(cfg: dict, env: dict) -> str | None:
         except (TypeError, ValueError):
             core = -1
         if 0 <= core < len(mine):
+            if "--split-full-attn-remote" in args:
+                prelude = "--split-prelude-core" in args
+                main_layers = "final six layers" if prelude else "first and final six layers"
+                fast_layers = "first six layers and repeated core" if prelude else "repeated core"
+                return (f"[strata] Inkling split: GPU {mine[0]} / CUDA0 runs the {main_layers} and output head "
+                        f"and holds the full-context attention KV. GPU {mine[core]} / CUDA{core} runs the {fast_layers} "
+                        "and uses the local KV prefix when configured.")
             return (f"[strata] Inkling split: GPU {mine[0]} / CUDA0 runs the outer layers and output head; "
                     f"GPU {mine[core]} / CUDA{core} runs the repeated core layers (prefill and decode)")
     if not mine or mine == [str(i) for i in range(len(mine))]:

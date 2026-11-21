@@ -33,6 +33,9 @@ def arguments(argv=None):
     parser.add_argument("--draft", type=Path)
     parser.add_argument("--spec", type=int, choices=range(1, 8), default=3)
     parser.add_argument("--batch-qkv-control-t1", action="store_true")
+    parser.add_argument("--full-kv-local-prefix", type=int, metavar="N",
+                        help="Run full attention on the outer GPU after N positions on the core GPU")
+    parser.add_argument("--split-prelude-core", action="store_true")
     parser.add_argument("--max-new", type=int, choices=(32, 128, 256, 512, 1000), default=32)
     parser.add_argument("--tokenizer", type=Path, default=Path("D:/ds4_work/inkling2/models/tokenizer"))
     parser.add_argument("--seed", type=int, default=20261121)
@@ -47,6 +50,12 @@ def arguments(argv=None):
             parser.error(f"--{name.replace('_', '-')} requires a full GPU UUID, never an index")
     if (args.split_core_graph or args.split_outer_graph) and args.core_gpu_uuid is None:
         parser.error("split graphs require --core-gpu-uuid")
+    if args.full_kv_local_prefix is not None:
+        if (not 0 <= args.full_kv_local_prefix <= CAPACITY or not args.core_gpu_uuid
+                or args.core_gpu_uuid == args.gpu_uuid or args.draft):
+            parser.error("remote KV requires two distinct GPUs, a prefix in 0..262144 and no draft")
+    elif args.split_prelude_core:
+        parser.error("--split-prelude-core requires --full-kv-local-prefix")
     if not 0 < args.seed <= 2 ** 64 - 1:
         parser.error("--seed must be in 1..2^64-1")
     if args.expert_vram is not None and (not math.isfinite(args.expert_vram) or args.expert_vram < 0):
@@ -163,6 +172,10 @@ def main(argv=None):
         if args.draft:
             report["files"]["draft"] = file_record(args.draft, True)
             command += ["--draft", str(args.draft.resolve()), "--spec", str(args.spec)]
+        if args.full_kv_local_prefix is not None:
+            command += ["--split-full-attn-remote", "--full-kv-local-prefix", str(args.full_kv_local_prefix)]
+        if args.split_prelude_core:
+            command.append("--split-prelude-core")
         if args.batch_qkv_control_t1:
             command.append("--batch-qkv-control-t1")
         if args.expert_vram is not None:

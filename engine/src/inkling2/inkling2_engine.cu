@@ -361,10 +361,11 @@ struct Model : GpuWeightStore {
     std::unique_ptr<strata::GgufModel> gguf;
     Hparams hp;
     int main_device = 0;
+    bool split_prelude = false;
     int split_device = -1;     // < 0: the unchanged single-device placement
 
     int layer_device(int ip) const {
-        return split_device >= 0 && hp.num_loops > 1 && ip >= hp.core_start && ip < hp.core_end
+        return split_device >= 0 && hp.num_loops > 1 && (split_prelude || ip >= hp.core_start) && ip < hp.core_end
                    ? split_device : main_device;
     }
 
@@ -774,7 +775,7 @@ struct Engine {
     std::unique_ptr<strata::prefill::Gemm> gemm;
 
     bool owns_phys(int ip) const {
-        const bool core = m->hp.num_loops > 1 && ip >= m->hp.core_start && ip < m->hp.core_end;
+        const bool core = m->hp.num_loops > 1 && (m->split_prelude || ip >= m->hp.core_start) && ip < m->hp.core_end;
         return role == Role::All || (role == Role::Core ? core : !core);
     }
     bool owns_virtual(int il) const { return owns_phys(m->hp.loop_layer(il)); }
@@ -890,7 +891,10 @@ struct Engine {
         CK(cudaStreamSynchronize(st));
         unsigned long long hits[3];
         CK(cudaMemcpy(hits, r.hits, sizeof(hits), cudaMemcpyDeviceToHost));
-        if (hits[2]) { std::fprintf(stderr, "strata-inkling2: async replica invalid router ID\n"); std::exit(1); }
+        if (hits[2]) {
+            std::fprintf(stderr, "strata-inkling2: async replica invalid router ID\n");
+            std::exit(1);
+        }
         r.local_hits = (int64_t) hits[0]; r.remote_hits = (int64_t) hits[1];
         if (scores) {
             std::vector<unsigned long long> counts((size_t) m->hp.n_phys * m->hp.n_expert);
@@ -992,9 +996,173 @@ struct Engine {
         return true;
     }
 
+    int full_kv_local_prefix = 0;
+    bool full_kv_promoted = false;
+    std::vector<int8_t *> prefix_kq, prefix_vq;
+    std::vector<__half *> prefix_ks, prefix_vs;
+    std::vector<int> prefix_cap;
+    uint8_t *prefix_stage = nullptr;
+    static constexpr size_t prefix_stage_bytes = 1024 * 1024;
+    void clear_prefix_graphs() {
+        CK(cudaStreamSynchronize(st));
+        if (core_graph) {
+            CK(cudaGraphExecDestroy(core_graph));
+            core_graph = nullptr;
+        }
+    }
+    void select_full_kv(int T) {
+        if (!remote_full || !full_kv_local_prefix || full_kv_promoted || pos + T <= full_kv_local_prefix)
+            return;
+        if (pos > full_kv_local_prefix) {
+            std::fprintf(stderr, "strata-inkling2: local KV prefix position exceeds capacity before promotion\n");
+            std::exit(1);
+        }
+        clear_prefix_graphs();
+        {
+            DeviceScope remote(remote_device);
+            CK(cudaStreamSynchronize(remote_stream));
+        }
+        const auto &hp = m->hp;
+        auto migrate = [&](void *dst, const void *src, size_t bytes) {
+            for (size_t off = 0; off < bytes; off += prefix_stage_bytes) {
+                size_t n = std::min(prefix_stage_bytes, bytes - off);
+                CK(cudaMemcpy(prefix_stage, (const uint8_t *)src + off, n, cudaMemcpyDeviceToHost));
+                {
+                    DeviceScope remote(remote_device);
+                    CK(cudaMemcpy((uint8_t *)dst + off, prefix_stage, n, cudaMemcpyHostToDevice));
+                }
+            }
+        };
+        for (int il = 0; il < hp.n_layer; ++il)
+            if (owns_virtual(il) && remote_kv(il)) {
+                migrate(kq[il], prefix_kq[il], (size_t)pos * hp.kv_dim);
+                migrate(vq[il], prefix_vq[il], (size_t)pos * hp.kv_dim);
+                migrate(ks[il], prefix_ks[il], (size_t)pos * hp.n_head_kv * sizeof(__half));
+                migrate(vs[il], prefix_vs[il], (size_t)pos * hp.n_head_kv * sizeof(__half));
+            }
+        full_kv_promoted = true;
+        std::fprintf(stderr, "strata-inkling2: promoted full KV prefix at pos=%lld T=%d local_capacity=%d\n", (long long)pos, T,
+                     full_kv_local_prefix);
+    }
+    void init_full_kv_prefix() {
+        const auto &hp = m->hp;
+        prefix_kq.resize(hp.n_layer, nullptr);
+        prefix_vq.resize(hp.n_layer, nullptr);
+        prefix_ks.resize(hp.n_layer, nullptr);
+        prefix_vs.resize(hp.n_layer, nullptr);
+        prefix_cap.assign(hp.n_layer, full_kv_local_prefix);
+        CK(cudaHostAlloc(&prefix_stage, prefix_stage_bytes, cudaHostAllocPortable));
+        for (int il = 0; il < hp.n_layer; ++il)
+            if (owns_virtual(il) && remote_kv(il)) {
+                CK(cudaMalloc(&prefix_kq[il], (size_t)full_kv_local_prefix * hp.kv_dim));
+                CK(cudaMalloc(&prefix_vq[il], (size_t)full_kv_local_prefix * hp.kv_dim));
+                CK(cudaMalloc(&prefix_ks[il], (size_t)full_kv_local_prefix * hp.n_head_kv * sizeof(__half)));
+                CK(cudaMalloc(&prefix_vs[il], (size_t)full_kv_local_prefix * hp.n_head_kv * sizeof(__half)));
+            }
+    }
+
+    bool remote_full = false;
+    int remote_device = -1;
+    cudaStream_t remote_stream = nullptr;
+    cudaEvent_t remote_ready = nullptr, remote_done = nullptr;
+    float *remote_host = nullptr, *remote_buf = nullptr, *remote_rel = nullptr, *remote_split = nullptr;
+    std::vector<float *> remote_bias;
+
+    bool remote_kv(int il) const { return remote_full && !m->hp.is_swa(il); }
+
+    void run_remote_full(int il, int T, float *srcQ, float *srcR, float *srcGate) {
+        const auto &hp = m->hp;
+        const int q_dim = (int)hp.q_dim, kv_dim = (int)hp.kv_dim;
+        const int rel_dim = (int)(hp.n_rel * hp.n_head);
+        const size_t counts[] = {
+            (size_t)T * q_dim, (size_t)T * rel_dim, (size_t)T * q_dim, (size_t)T * kv_dim, (size_t)T * kv_dim, (size_t)T * hp.n_head, 1};
+        const void *src[] = {srcQ, srcR, srcGate, K_conv, V_conv, sink, pos0_d};
+        size_t off = 0;
+        for (int i = 0; i < 7; ++i) {
+            CK(cudaMemcpyAsync(remote_host + off, src[i], counts[i] * sizeof(float), cudaMemcpyDeviceToHost, st));
+            off += counts[i];
+        }
+        CK(cudaEventRecord(remote_ready, st));
+        {
+            DeviceScope remote(remote_device);
+            CK(cudaStreamWaitEvent(remote_stream, remote_ready, 0));
+            CK(cudaMemcpyAsync(remote_buf, remote_host, off * sizeof(float), cudaMemcpyHostToDevice, remote_stream));
+            float *pQ = remote_buf;
+            float *pR = pQ + counts[0];
+            float *pGate = pR + counts[1];
+            float *remote_keys = pGate + counts[2];
+            float *remote_values = remote_keys + counts[3];
+            float *remote_sink = remote_values + counts[4];
+            int32_t *remote_position = reinterpret_cast<int32_t *>(remote_sink + counts[5]);
+            float *remote_output = remote_buf + off;
+
+            k_clip_norm_kv_store_q8<<<dim3((unsigned)hp.n_head_kv, (unsigned)T), 32, 0, remote_stream>>>(
+                remote_keys, remote_values, kq[(size_t)il], ks[(size_t)il], vq[(size_t)il], vs[(size_t)il], (int)hp.n_head_kv, hp.qk_clip,
+                hp.rms_eps, remote_position, kv_cap[(size_t)il], 0);
+
+            const int max_rel = (int)hp.n_rel_ext;
+            k_rel_table<<<dim3((unsigned)hp.n_head, (unsigned)T), kThreads, 0, remote_stream>>>(
+                pR, remote_bias[(size_t)hp.loop_layer(il)], remote_sink, remote_rel, (int)hp.n_head, (int)hp.n_rel, (int)hp.n_rel_ext,
+                max_rel, remote_position, T);
+            const float kq_scale = 1.0f / std::sqrt((float)hp.head_dim);
+
+            if (hp.n_head == 3 * hp.n_head_kv && hp.head_dim == 128) {
+                if (T == 1) {
+                    k_attn_q8_gqa3_split<<<dim3((unsigned)hp.n_head_kv, (unsigned)kAttnSplit), 128, 0, remote_stream>>>(
+                        pQ, kq[(size_t)il], ks[(size_t)il], vq[(size_t)il], vs[(size_t)il], remote_rel, remote_sink, remote_split,
+                        (int)hp.n_head, (int)hp.n_head_kv, (int)hp.n_rel_ext, kv_cap[(size_t)il], 0, (int)hp.n_swa, remote_position,
+                        kq_scale, kAttnSplit);
+                    k_attn_split_combine<<<(unsigned)hp.n_head, 128, 0, remote_stream>>>(remote_split, pGate, remote_output, (int)hp.n_head,
+                                                                                         kAttnSplit);
+                } else {
+                    k_attn_q8_gqa3_pp<<<dim3((unsigned)hp.n_head_kv, (unsigned)T), 128, 0, remote_stream>>>(
+                        pQ, kq[(size_t)il], ks[(size_t)il], vq[(size_t)il], vs[(size_t)il], remote_rel, remote_sink, pGate, remote_output,
+                        (int)hp.n_head, (int)hp.n_head_kv, (int)hp.n_rel_ext, kv_cap[(size_t)il], 0, (int)hp.n_swa, remote_position,
+                        kq_scale);
+                }
+            } else {
+                k_attn_q8<<<dim3((unsigned)hp.n_head, (unsigned)T), 128, 0, remote_stream>>>(
+                    pQ, kq[(size_t)il], ks[(size_t)il], vq[(size_t)il], vs[(size_t)il], remote_rel, remote_sink, pGate, remote_output,
+                    (int)hp.n_head, (int)hp.n_head_kv, (int)hp.n_rel_ext, kv_cap[(size_t)il], 0, (int)hp.n_swa, remote_position, kq_scale);
+            }
+
+            CK(cudaMemcpyAsync(remote_host + off, remote_output, (size_t)T * q_dim * sizeof(float), cudaMemcpyDeviceToHost, remote_stream));
+            CK(cudaEventRecord(remote_done, remote_stream));
+        }
+        CK(cudaStreamWaitEvent(st, remote_done, 0));
+        CK(cudaMemcpyAsync(att, remote_host + off, (size_t)T * q_dim * sizeof(float), cudaMemcpyHostToDevice, st));
+    }
+
+    void init_remote_full() {
+        const auto &hp = m->hp;
+        CK(cudaEventCreateWithFlags(&remote_ready, cudaEventDisableTiming));
+        const size_t count = (size_t)tmax * (3 * hp.q_dim + hp.n_rel * hp.n_head + 2 * hp.kv_dim + hp.n_head) + 1;
+        CK(cudaHostAlloc(&remote_host, count * sizeof(float), cudaHostAllocPortable));
+        remote_bias.resize((size_t)hp.n_phys, nullptr);
+        std::vector<float> bias((size_t)hp.n_rel * hp.n_rel_ext);
+        DeviceScope remote(remote_device);
+        CK(cudaStreamCreateWithFlags(&remote_stream, cudaStreamNonBlocking));
+        CK(cudaEventCreateWithFlags(&remote_done, cudaEventDisableTiming));
+        CK(cudaMalloc(&remote_buf, count * sizeof(float)));
+        CK(cudaMalloc(&remote_rel, (size_t)tmax * hp.n_head * hp.n_rel_ext * sizeof(float)));
+        CK(cudaMalloc(&remote_split, (size_t)kAttnSplit * hp.n_head * 130 * sizeof(float)));
+        for (int ip = 0; ip < hp.n_phys; ++ip)
+            if (owns_phys(ip) && !hp.is_swa(ip)) {
+                {
+                    DeviceScope local(device);
+                    CK(cudaMemcpy(bias.data(), m->layers[(size_t)ip].attn_rel_bias, bias.size() * sizeof(float), cudaMemcpyDeviceToHost));
+                }
+                CK(cudaMalloc(&remote_bias[(size_t)ip], bias.size() * sizeof(float)));
+                CK(cudaMemcpy(remote_bias[(size_t)ip], bias.data(), bias.size() * sizeof(float), cudaMemcpyHostToDevice));
+            }
+    }
+
+    // Full-attention payload remains append-only in its selected GPU bank. Checkpoints
+    // retain promotion mode across RESET restores; conv and SWA ownership stays local.
     // Prefix cache checkpoint (stores conv_hist + circular SWA KV state in host RAM; full-attn KV stays append-only on GPU)
     struct StateCheckpoint {
         std::vector<int32_t> tokens;
+        bool full_kv_remote = false;
         std::vector<uint8_t> data;
         std::vector<uint8_t> dspark_data;
     };
@@ -1011,6 +1179,7 @@ struct Engine {
         }
         StateCheckpoint cp;
         cp.tokens = tokens;
+        cp.full_kv_remote = full_kv_promoted || (split_peer && split_peer->full_kv_promoted);
         cp.data.resize(total);
         size_t off = 0;
         cudaStream_t copy_stream = st;
@@ -1046,6 +1215,13 @@ struct Engine {
     }
 
     void restore_checkpoint(const StateCheckpoint& cp) {
+        Engine &full_lane = remote_full ? *this : (split_peer ? *split_peer : *this);
+        if (cp.full_kv_remote && full_lane.full_kv_local_prefix && !full_lane.full_kv_promoted) {
+            DeviceScope owner(full_lane.device);
+            full_lane.clear_prefix_graphs();
+            full_lane.full_kv_promoted = true;
+        }
+
         const auto& hp = m->hp;
         const size_t conv_bytes = (size_t) hp.n_sconv_channels() * 3 * sizeof(float);
         size_t off = 0;
@@ -1089,8 +1265,10 @@ struct Engine {
             cudaStreamSynchronize(st);
             print_replica_stats("FINAL");
             if (replica->input_ready) cudaEventDestroy(replica->input_ready);
-            cudaFree(replica->frequencies); cudaFree(replica->hits);
-            cudaFree(replica->local_miss); cudaFree(replica->local_parts);
+            cudaFree(replica->frequencies);
+            cudaFree(replica->hits);
+            cudaFree(replica->local_miss);
+            cudaFree(replica->local_parts);
             replica.reset();
         }
         if (core_graph) cudaGraphExecDestroy(core_graph);
@@ -1098,12 +1276,48 @@ struct Engine {
         if (verify_core_graph) cudaGraphExecDestroy(verify_core_graph);
         for (auto graph : outer_graph) if (graph) cudaGraphExecDestroy(graph);
         for (auto g : layer_pre_graph) if (g) cudaGraphExecDestroy(g);
-        for (auto* p : kc) cudaFree(p);
-        for (auto* p : vc) cudaFree(p);
-        for (auto* p : kq) cudaFree(p);
-        for (auto* p : vq) cudaFree(p);
-        for (auto* p : ks) cudaFree(p);
-        for (auto* p : vs) cudaFree(p);
+        if (remote_full) {
+            CK(cudaStreamSynchronize(st));
+            DeviceScope remote(remote_device);
+            CK(cudaStreamSynchronize(remote_stream));
+        }
+        for (auto *p : prefix_kq)
+            cudaFree(p);
+        for (auto *p : prefix_vq)
+            cudaFree(p);
+        for (auto *p : prefix_ks)
+            cudaFree(p);
+        for (auto *p : prefix_vs)
+            cudaFree(p);
+        cudaFreeHost(prefix_stage);
+        for (size_t il = 0; il < kq.size(); ++il) {
+            DeviceScope kv_owner(remote_kv((int)il) ? remote_device : device);
+            cudaFree(kc[il]);
+            cudaFree(vc[il]);
+            cudaFree(kq[il]);
+            cudaFree(vq[il]);
+            cudaFree(ks[il]);
+            cudaFree(vs[il]);
+        }
+        if (remote_full) {
+            cudaStreamSynchronize(st);
+            {
+                DeviceScope remote(remote_device);
+                cudaStreamSynchronize(remote_stream);
+                for (auto *p : remote_bias)
+                    cudaFree(p);
+                cudaFree(remote_buf);
+                cudaFree(remote_rel);
+                cudaFree(remote_split);
+                if (remote_done)
+                    cudaEventDestroy(remote_done);
+                if (remote_stream)
+                    cudaStreamDestroy(remote_stream);
+            }
+            if (remote_ready)
+                cudaEventDestroy(remote_ready);
+            cudaFreeHost(remote_host);
+        }
         for (auto* p : conv_hist) cudaFree(p);
         cudaFree(swa_bak); cudaFree(d_conv_trace);
         for (auto* p : d_tgt_feat) cudaFree(p);
@@ -1125,10 +1339,16 @@ struct Engine {
         cudaFree(xq); cudaFree(xq_k); cudaFree(xq_v); cudaFree(escr);
         cudaFree(ids); cudaFree(grp_start); cudaFree(n_groups); cudaFree(ent_dst); cudaFree(ent_tok); cudaFree(grp_ptr);
         cudaFree(sampling_mass);
-        cudaFree(tok_d); cudaFree(pos0_d); cudaFree(pick_d);
-        cudaFree(d_miss); cudaFree(ecpu);
+        cudaFree(tok_d);
+        cudaFree(pos0_d);
+        cudaFree(pick_d);
+        cudaFree(d_miss);
+        cudaFree(ecpu);
         cudaFreeHost(h_tok_buf);
-        cudaFreeHost(h_ids); cudaFreeHost(h_h); cudaFreeHost(cpu_out); cudaFreeHost(h_miss);
+        cudaFreeHost(h_ids);
+        cudaFreeHost(h_h);
+        cudaFreeHost(cpu_out);
+        cudaFreeHost(h_miss);
         cudaFreeHost(split_handoff);
         std::free(acts);
         if (ev_route) cudaEventDestroy(ev_route);
@@ -1185,14 +1405,17 @@ struct Engine {
             if (!owns_virtual(il)) continue;
             trace_slot[(size_t) il] = (int) (local_conv_floats / layer_conv_floats);
             local_conv_floats += layer_conv_floats;
-            if (kv_q8) {
-                CK(cudaMalloc(&kq[(size_t) il], (size_t) cap * hp.kv_dim * sizeof(int8_t)));
-                CK(cudaMalloc(&vq[(size_t) il], (size_t) cap * hp.kv_dim * sizeof(int8_t)));
-                CK(cudaMalloc(&ks[(size_t) il], (size_t) cap * hp.n_head_kv * sizeof(__half)));
-                CK(cudaMalloc(&vs[(size_t) il], (size_t) cap * hp.n_head_kv * sizeof(__half)));
-            } else {
-                CK(cudaMalloc(&kc[(size_t) il], (size_t) cap * hp.kv_dim * sizeof(__half)));
-                CK(cudaMalloc(&vc[(size_t) il], (size_t) cap * hp.kv_dim * sizeof(__half)));
+            {
+                DeviceScope kv_owner(remote_kv(il) ? remote_device : device);
+                if (kv_q8) {
+                    CK(cudaMalloc(&kq[(size_t)il], (size_t)cap * hp.kv_dim * sizeof(int8_t)));
+                    CK(cudaMalloc(&vq[(size_t)il], (size_t)cap * hp.kv_dim * sizeof(int8_t)));
+                    CK(cudaMalloc(&ks[(size_t)il], (size_t)cap * hp.n_head_kv * sizeof(__half)));
+                    CK(cudaMalloc(&vs[(size_t)il], (size_t)cap * hp.n_head_kv * sizeof(__half)));
+                } else {
+                    CK(cudaMalloc(&kc[(size_t)il], (size_t)cap * hp.kv_dim * sizeof(__half)));
+                    CK(cudaMalloc(&vc[(size_t)il], (size_t)cap * hp.kv_dim * sizeof(__half)));
+                }
             }
             CK(cudaMalloc(&conv_hist[(size_t) il], (size_t) hp.n_sconv_channels() * 3 * sizeof(float)));
         }
@@ -1271,6 +1494,10 @@ struct Engine {
             CK(cudaEventCreateWithFlags(&ev_pp_used[b], cudaEventDisableTiming));
         }
         if (const char* v = std::getenv("STRATA_PP_STREAM_T")) pp_stream_t = std::max(1, std::atoi(v));
+        if (remote_full)
+            init_remote_full();
+        if (full_kv_local_prefix)
+            init_full_kv_prefix();
         reset_state();
         return true;
     }
@@ -1290,6 +1517,12 @@ struct Engine {
     }
 
     void reset_state() {
+        if (full_kv_promoted) {
+            DeviceScope owner(device);
+            clear_prefix_graphs();
+            full_kv_promoted = false;
+        }
+
         DeviceScope owner(device);
         if (replica) refresh_replica_hot();
         pos = 0;
@@ -1560,7 +1793,8 @@ struct Engine {
             }
             CK(cudaMemcpy(L.d_slot_of, L.slot_of.data(), (size_t) ne * sizeof(int32_t), cudaMemcpyHostToDevice));
             for (int e = 0; e < ne; ++e) if ((L.slot_of[e] >= 0) + (cold[e] >= 0) != 1) {
-                std::fprintf(stderr, "strata-inkling2: invalid replica complement map\n"); std::exit(1);
+                    std::fprintf(stderr, "strata-inkling2: invalid replica complement map\n");
+                    std::exit(1);
             }
             r.cold_of[ip] = cold;
             { DeviceScope remote(r.device);
@@ -1622,11 +1856,17 @@ struct Engine {
         const int ip = hp.loop_layer(il);
         for (int e = 0; e < entries; ++e) {
             const int x = r.host_ids[e];
-            if (x < 0 || x >= ne) { std::fprintf(stderr, "strata-inkling2: invalid replica router ID\n"); std::exit(1); }
+            if (x < 0 || x >= ne) {
+                std::fprintf(stderr, "strata-inkling2: invalid replica router ID\n");
+                std::exit(1);
+            }
             const int owners = (L.slot_of[x] >= 0) + (r.cold_of[ip][x] >= 0);
             r.duplicate_entries += owners > 1;
             r.missing_entries += owners == 0;
-            if (owners != 1) { std::fprintf(stderr, "strata-inkling2: replica ownership partition failed\n"); std::exit(1); }
+            if (owners != 1) {
+                std::fprintf(stderr, "strata-inkling2: replica ownership partition failed\n");
+                std::exit(1);
+            }
             L.score[x] += 1.0;
             r.host_miss[e] = L.slot_of[x] < 0;
             misses += r.host_miss[e];
@@ -1960,6 +2200,7 @@ struct Engine {
     void run_layers(ForwardState& state, int first_layer, int end_layer) {
         DeviceScope owner(device);
         const int T = state.T;
+        select_full_kv(T);
         const auto& hp = m->hp;
         const int N = (int) hp.n_embd;
         const int64_t kv_dim = hp.kv_dim, q_dim = hp.q_dim;
@@ -2133,43 +2374,58 @@ struct Engine {
             k_clip_and_tau<<<dim3((unsigned) hp.n_head, (unsigned) T), 32, 0, st>>>(
                 pR, L.attn_rel_clip, hp.rel_clip, (int) hp.n_rel, (int) hp.n_head, apply_tau, pos0_d, (int) hp.log_scale_floor, hp.log_scale_alpha);
 
-            if (kv_q8) {
-                k_clip_norm_kv_store_q8<<<dim3((unsigned) hp.n_head_kv, (unsigned) T), 32, 0, st>>>(
-                    K_conv, V_conv, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il],
-                    (int) hp.n_head_kv, hp.qk_clip, hp.rms_eps, pos0_d, kv_cap[(size_t) il], is_swa ? 1 : 0);
+            if (remote_full && !is_swa && (!full_kv_local_prefix || full_kv_promoted)) {
+                run_remote_full(il, T, pQ, pR, pGate);
             } else {
-                k_clip_and_tau<<<dim3((unsigned) hp.n_head_kv, (unsigned) T), 32, 0, st>>>(
-                    K_conv, nullptr, hp.qk_clip, (int) hp.head_dim, (int) hp.n_head_kv, 0, pos0_d, (int) hp.log_scale_floor, hp.log_scale_alpha);
-                k_v_rms_norm<<<dim3((unsigned) hp.n_head_kv, (unsigned) T), 32, 0, st>>>(V_conv, (int) hp.head_dim, (int) hp.n_head_kv, hp.rms_eps);
-                k_kv_store<<<dim3((unsigned) ((kv_dim + 255) / 256), (unsigned) T), 256, 0, st>>>(
-                    K_conv, V_conv, kc[(size_t) il], vc[(size_t) il], (int) kv_dim, pos0_d, kv_cap[(size_t) il], is_swa ? 1 : 0);
-            }
+                const bool local_full = remote_full && !is_swa && full_kv_local_prefix && !full_kv_promoted;
+                auto &active_kq = local_full ? prefix_kq : this->kq;
+                auto &active_vq = local_full ? prefix_vq : this->vq;
+                auto &active_ks = local_full ? prefix_ks : this->ks;
+                auto &active_vs = local_full ? prefix_vs : this->vs;
+                auto &active_cap = local_full ? prefix_cap : this->kv_cap;
+                if (kv_q8) {
+                    k_clip_norm_kv_store_q8<<<dim3((unsigned)hp.n_head_kv, (unsigned)T), 32, 0, st>>>(
+                        K_conv, V_conv, active_kq[(size_t)il], active_ks[(size_t)il], active_vq[(size_t)il], active_vs[(size_t)il],
+                        (int)hp.n_head_kv, hp.qk_clip, hp.rms_eps, pos0_d, active_cap[(size_t)il], is_swa ? 1 : 0);
+                } else {
+                    k_clip_and_tau<<<dim3((unsigned)hp.n_head_kv, (unsigned)T), 32, 0, st>>>(K_conv, nullptr, hp.qk_clip, (int)hp.head_dim,
+                                                                                             (int)hp.n_head_kv, 0, pos0_d,
+                                                                                             (int)hp.log_scale_floor, hp.log_scale_alpha);
+                    k_v_rms_norm<<<dim3((unsigned)hp.n_head_kv, (unsigned)T), 32, 0, st>>>(V_conv, (int)hp.head_dim, (int)hp.n_head_kv,
+                                                                                           hp.rms_eps);
+                    k_kv_store<<<dim3((unsigned)((kv_dim + 255) / 256), (unsigned)T), 256, 0, st>>>(
+                        K_conv, V_conv, kc[(size_t)il], vc[(size_t)il], (int)kv_dim, pos0_d, active_cap[(size_t)il], is_swa ? 1 : 0);
+                }
 
-            const int max_rel = is_swa ? std::min<int>((int) hp.n_swa, (int) hp.n_rel_ext) : (int) hp.n_rel_ext;
-            k_rel_table<<<dim3((unsigned) hp.n_head, (unsigned) T), kThreads, 0, st>>>(
-                pR, L.attn_rel_bias, sink, rel_tab, (int) hp.n_head, (int) hp.n_rel, (int) hp.n_rel_ext, max_rel, pos0_d, T);
-            const float kq_scale = 1.0f / std::sqrt((float) hp.head_dim);
-            if (kv_q8) {
-                if (hp.n_head == 3 * hp.n_head_kv && hp.head_dim == 128) {
-                    if (T == 1) {
-                        k_attn_q8_gqa3_split<<<dim3((unsigned) hp.n_head_kv, (unsigned) kAttnSplit), 128, 0, st>>>(
-                            pQ, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], rel_tab, sink, attn_split,
-                            (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, kv_cap[(size_t) il], is_swa ? 1 : 0, (int) hp.n_swa, pos0_d, kq_scale, kAttnSplit);
-                        k_attn_split_combine<<<(unsigned) hp.n_head, 128, 0, st>>>(attn_split, pGate, att, (int) hp.n_head, kAttnSplit);
+                const int max_rel = is_swa ? std::min<int>((int)hp.n_swa, (int)hp.n_rel_ext) : (int)hp.n_rel_ext;
+                k_rel_table<<<dim3((unsigned)hp.n_head, (unsigned)T), kThreads, 0, st>>>(
+                    pR, L.attn_rel_bias, sink, rel_tab, (int)hp.n_head, (int)hp.n_rel, (int)hp.n_rel_ext, max_rel, pos0_d, T);
+                const float kq_scale = 1.0f / std::sqrt((float)hp.head_dim);
+                if (kv_q8) {
+                    if (hp.n_head == 3 * hp.n_head_kv && hp.head_dim == 128) {
+                        if (T == 1) {
+                            k_attn_q8_gqa3_split<<<dim3((unsigned)hp.n_head_kv, (unsigned)kAttnSplit), 128, 0, st>>>(
+                                pQ, active_kq[(size_t)il], active_ks[(size_t)il], active_vq[(size_t)il], active_vs[(size_t)il], rel_tab,
+                                sink, attn_split, (int)hp.n_head, (int)hp.n_head_kv, (int)hp.n_rel_ext, active_cap[(size_t)il],
+                                is_swa ? 1 : 0, (int)hp.n_swa, pos0_d, kq_scale, kAttnSplit);
+                            k_attn_split_combine<<<(unsigned)hp.n_head, 128, 0, st>>>(attn_split, pGate, att, (int)hp.n_head, kAttnSplit);
+                        } else {
+                            k_attn_q8_gqa3_pp<<<dim3((unsigned)hp.n_head_kv, (unsigned)T), 128, 0, st>>>(
+                                pQ, active_kq[(size_t)il], active_ks[(size_t)il], active_vq[(size_t)il], active_vs[(size_t)il], rel_tab,
+                                sink, pGate, att, (int)hp.n_head, (int)hp.n_head_kv, (int)hp.n_rel_ext, active_cap[(size_t)il],
+                                is_swa ? 1 : 0, (int)hp.n_swa, pos0_d, kq_scale);
+                        }
                     } else {
-                        k_attn_q8_gqa3_pp<<<dim3((unsigned) hp.n_head_kv, (unsigned) T), 128, 0, st>>>(
-                            pQ, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], rel_tab, sink, pGate, att,
-                            (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, kv_cap[(size_t) il], is_swa ? 1 : 0, (int) hp.n_swa, pos0_d, kq_scale);
+                        k_attn_q8<<<dim3((unsigned)hp.n_head, (unsigned)T), 128, 0, st>>>(
+                            pQ, active_kq[(size_t)il], active_ks[(size_t)il], active_vq[(size_t)il], active_vs[(size_t)il], rel_tab, sink,
+                            pGate, att, (int)hp.n_head, (int)hp.n_head_kv, (int)hp.n_rel_ext, active_cap[(size_t)il], is_swa ? 1 : 0,
+                            (int)hp.n_swa, pos0_d, kq_scale);
                     }
                 } else {
-                    k_attn_q8<<<dim3((unsigned) hp.n_head, (unsigned) T), 128, 0, st>>>(
-                        pQ, kq[(size_t) il], ks[(size_t) il], vq[(size_t) il], vs[(size_t) il], rel_tab, sink, pGate, att,
-                        (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, kv_cap[(size_t) il], is_swa ? 1 : 0, (int) hp.n_swa, pos0_d, kq_scale);
+                    k_attn<<<dim3((unsigned)hp.n_head, (unsigned)T), 128, 0, st>>>(
+                        pQ, kc[(size_t)il], vc[(size_t)il], rel_tab, sink, att, (int)hp.n_head, (int)hp.n_head_kv, (int)hp.n_rel_ext,
+                        active_cap[(size_t)il], is_swa ? 1 : 0, (int)hp.n_swa, pos0_d, kq_scale);
                 }
-            } else {
-                k_attn<<<dim3((unsigned) hp.n_head, (unsigned) T), 128, 0, st>>>(
-                    pQ, kc[(size_t) il], vc[(size_t) il], rel_tab, sink, att,
-                    (int) hp.n_head, (int) hp.n_head_kv, (int) hp.n_rel_ext, kv_cap[(size_t) il], is_swa ? 1 : 0, (int) hp.n_swa, pos0_d, kq_scale);
             }
             if (prof_detail) { CK(cudaStreamSynchronize(st)); p_d_attn += ms_since(tp_d2); }
 
@@ -2275,6 +2531,8 @@ struct Engine {
                     hy_gpu = saved_hits; hy_cpu = saved_misses; hy_cpu_ms = saved_cpu_ms;
                     if (status == cudaSuccess && candidate) {
                         graph = candidate;
+                        std::fprintf(stderr, "strata-inkling2: captured outer graph device=%d virtual=%d..%d\n", device, first_layer,
+                                     end_layer - 1);
                     } else {
                         if (candidate) cudaGraphExecDestroy(candidate);
                         outer_graph_failed[outer_range] = true;
@@ -2307,7 +2565,8 @@ struct Engine {
             }
             const bool core_graph_allowed = role == Role::All || (role == Role::Core && split_core_graph);
             const bool graph_shape = T == 1 || (T == verify_max_t && state.capture_dspark && save_conv_trace);
-            if (core_graph_allowed && graph_shape && core_all_gpu && !prof_detail && il == hp.core_start && n_core > 0) {
+            if (core_graph_allowed && graph_shape && core_all_gpu && !prof_detail && il == (m->split_prelude ? 0 : hp.core_start) &&
+                n_core > 0) {
                 cudaGraphExec_t& cg = T != 1 ? verify_core_graph : (state.capture_dspark ? capture_core_graph : core_graph);
                 if (!cg) {
                     cudaGraph_t g = nullptr;
@@ -2325,6 +2584,9 @@ struct Engine {
                     graph_check(cudaStreamEndCapture(st, &g), "end capture");
                     graph_check(cudaGraphInstantiate(&cg, g, nullptr, nullptr, 0), "instantiate");
                     CK(cudaGraphDestroy(g));
+                    if (role == Role::Core)
+                        std::fprintf(stderr, "strata-inkling2: captured fast graph device=%d virtual=%d..%d full_KV=%s\n", device, il,
+                                     core_end_virt - 1, remote_full && (!full_kv_local_prefix || full_kv_promoted) ? "remote" : "local");
                 } else {
                     norm_blocks = {norm_blk_buf[0], norm_blk_buf[5], norm_blk_buf[6]};
                     next_blk_buf = 7;
@@ -2432,14 +2694,19 @@ struct Engine {
         for (float* p : source.norm_blocks) {
             int id = -1;
             for (int i = 0; i < 9; ++i) if (p == norm_blk_buf[i]) id = i;
-            if (id < 0) { std::fprintf(stderr, "strata-inkling2: split residual has no logical ID\n"); std::exit(1); }
+            if (id < 0) {
+                std::fprintf(stderr, "strata-inkling2: split residual has no logical ID\n");
+                std::exit(1);
+            }
             block_ids.push_back(id);
         }
         if (!host || T <= 0 || T > tmax || T > destination.tmax || block_ids.size() > 3 || source.next_blk_buf > 8) {
-            std::fprintf(stderr, "strata-inkling2: invalid split residual metadata\n"); std::exit(1);
+            std::fprintf(stderr, "strata-inkling2: invalid split residual metadata\n");
+            std::exit(1);
         }
-        const std::vector<int> expected_ids = role == Role::Outer ? std::vector<int>{0} : std::vector<int>{0, 5, 6};
-        const int expected_next = role == Role::Outer ? 1 : 7;
+        const std::vector<int> expected_ids =
+            role == Role::Outer ? (m->split_prelude ? std::vector<int>{} : std::vector<int>{0}) : std::vector<int>{0, 5, 6};
+        const int expected_next = role == Role::Outer ? (m->split_prelude ? 0 : 1) : 7;
         if (block_ids != expected_ids || source.next_blk_buf != expected_next) {
             std::fprintf(stderr, "strata-inkling2: split boundary residual IDs do not match the 6/36/6 layer schedule\n");
             std::exit(1);
@@ -2489,7 +2756,8 @@ struct Engine {
                     std::vector<int32_t>* out_picks = nullptr) {
         if (T <= 0 || T > tmax || pos < 0 || pos + T > ctx || ((all_row_logits || out_picks) && T > verify_max_t) ||
             (verify_k_save > 0 && (!dspark || verify_k_save != T - 1 || T > verify_max_t))) {
-            std::fprintf(stderr, "strata-inkling2: invalid forward/verify extent\n"); std::exit(1);
+            std::fprintf(stderr, "strata-inkling2: invalid forward/verify extent\n");
+            std::exit(1);
         }
         if (verify_k_save > 0) {
             backup_verify(verify_k_save);
@@ -2507,10 +2775,11 @@ struct Engine {
         if (role == Role::Outer && split_peer) {
             const int begin = (int) m->hp.core_start;
             const int end = (int) (m->hp.core_start + m->hp.num_loops * (m->hp.core_end - m->hp.core_start));
-            run_layers(state, 0, begin);
+            if (!m->split_prelude)
+                run_layers(state, 0, begin);
             ForwardState core_state;
             handoff(state, *split_peer, core_state);
-            split_peer->run_layers(core_state, begin, end);
+            split_peer->run_layers(core_state, m->split_prelude ? 0 : begin, end);
             split_peer->handoff(core_state, *this, state);
             run_layers(state, end, (int) m->hp.n_layer);
         } else {
@@ -2645,8 +2914,14 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
                 budget -= req_stage * 2;
             } else {
                 (void) cudaGetLastError();
-                if (E.pp_stage[0]) { cudaFree(E.pp_stage[0]); E.pp_stage[0] = nullptr; }
-                if (E.pp_stage[1]) { cudaFree(E.pp_stage[1]); E.pp_stage[1] = nullptr; }
+                if (E.pp_stage[0]) {
+                    cudaFree(E.pp_stage[0]);
+                    E.pp_stage[0] = nullptr;
+                }
+                if (E.pp_stage[1]) {
+                    cudaFree(E.pp_stage[1]);
+                    E.pp_stage[1] = nullptr;
+                }
             }
         }
     }
@@ -2815,6 +3090,13 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, std::strin
 
     E.core_all_gpu = !tier1.empty() && slots[(size_t) tier1[0]] == ne;
     for (int ip : tier1) if (slots[(size_t) ip] != ne) E.core_all_gpu = false;
+    if (m.split_prelude && E.role == Engine::Role::Core) {
+        for (int ip = 0; ip < hp.core_end; ++ip)
+            if (slots[(size_t)ip] != ne) {
+                err = "prelude/core split requires all fast-region experts resident";
+                return false;
+            }
+    }
 
     size_t fr_after = 0, tot_after = 0;
     CK(cudaMemGetInfo(&fr_after, &tot_after));
@@ -3062,6 +3344,9 @@ int run(int argc, char** argv) {
     int chunk = 256;
     int max_new = 32;
     int cpu_threads = 0;
+    bool split_prelude = false;
+    int full_kv_local_prefix = 0;
+    bool split_full_attn_remote = false;
     bool gpu_full_vocab = false;
     int layer_split_device = -1;
     int expert_replica_device = -1, expert_dense_device = -1;
@@ -3119,8 +3404,14 @@ int run(int argc, char** argv) {
                 return 2;
             }
             layer_split_device = (int) value;
-        }
-        else if (a == "--gpu-full-vocab") gpu_full_vocab = true;
+        } else if (a == "--split-prelude-core")
+            split_prelude = true;
+        else if (a == "--full-kv-local-prefix" && i + 1 < argc)
+            full_kv_local_prefix = std::atoi(argv[++i]);
+        else if (a == "--split-full-attn-remote")
+            split_full_attn_remote = true;
+        else if (a == "--gpu-full-vocab")
+            gpu_full_vocab = true;
         else if (a == "--split-core-graph") split_core_graph = true;
         else if (a == "--split-outer-graph") split_outer_graph = true;
         else if (a == "--batch-qkv-control-t1") batch_qkv_control_t1 = true;
@@ -3133,7 +3424,24 @@ int run(int argc, char** argv) {
     }
 
     if (model_path.empty()) {
-        std::fprintf(stderr, "usage: strata-inkling2 --model <file.gguf> [--max-context N] [--kv-q8|--kv-f16] [--tokens IDS] [--max-new N] [--dump-logits PATH] [--layer-split-device N [--split-core-graph] [--split-outer-graph]] [--batch-qkv-control-t1] [--gpu-full-vocab] [--expert-dense-device N --expert-replica-device N --expert-hot-mib MiB [--expert-replica-async]] [--draft DRAFT.gguf --spec K] [--bench] [--serve]\n");
+        std::fprintf(
+            stderr,
+            "usage: strata-inkling2 --model <file.gguf> [--max-context N] [--kv-q8|--kv-f16] [--tokens IDS] [--max-new N] [--dump-logits "
+            "PATH] [--layer-split-device N [--split-core-graph] [--split-outer-graph] [--split-full-attn-remote [--full-kv-local-prefix N] "
+            "[--split-prelude-core]]] [--gpu-full-vocab] [--batch-qkv-control-t1] [--expert-dense-device N --expert-replica-device N "
+            "--expert-hot-mib MiB [--expert-replica-async]] [--draft DRAFT.gguf --spec K] [--bench] [--serve]\n");
+        return 2;
+    }
+    if (split_prelude && !split_full_attn_remote) {
+        std::fprintf(stderr, "strata-inkling2: prelude core requires remote full attention\n");
+        return 2;
+    }
+    if (full_kv_local_prefix < 0 || full_kv_local_prefix > max_ctx || (full_kv_local_prefix && !split_full_attn_remote)) {
+        std::fprintf(stderr, "strata-inkling2: local full KV prefix requires remote attention and capacity 1..max-context\n");
+        return 2;
+    }
+    if (split_full_attn_remote && (layer_split_device < 0 || !kv_q8 || !draft_path.empty() || expert_replica_device >= 0)) {
+        std::fprintf(stderr, "strata-inkling2: remote full attention requires layer split, Q8, no DSpark or replica\n");
         return 2;
     }
     if (split_core_graph && layer_split_device < 0) {
@@ -3168,6 +3476,7 @@ int run(int argc, char** argv) {
     Model m;
     CK(cudaGetDevice(&m.main_device));
     m.split_device = layer_split_device;
+    m.split_prelude = split_prelude;
     if (layer_split_device >= 0) {
         int device_count = 0;
         CK(cudaGetDeviceCount(&device_count));
@@ -3217,19 +3526,32 @@ int run(int argc, char** argv) {
         split_core = std::make_unique<Engine>();
         split_core->device = layer_split_device;
         split_core->role = Engine::Role::Core;
+        split_core->remote_full = split_full_attn_remote;
+        split_core->full_kv_local_prefix = full_kv_local_prefix;
+        split_core->remote_device = m.main_device;
         split_core->split_core_graph = split_core_graph;
         split_core->batch_qkv_control_t1 = batch_qkv_control_t1;
         if (!split_core->init(m, max_ctx, runtime_t, kv_q8, err, verify_t, false)) {
             std::fprintf(stderr, "strata-inkling2: split core init failed: %s\n", err.c_str()); return 1;
         }
+        std::fprintf(stderr,
+                     "strata-inkling2: actual placement main=%d virtual=%s+head fast=%d virtual=%s full_KV_for_fast_layers=%s local_prefix=%d\n",
+                     E.device, split_prelude ? "42..47" : "0..5,42..47", split_core->device, split_prelude ? "0..41" : "6..41",
+                     split_full_attn_remote ? "main" : "fast", full_kv_local_prefix);
         E.split_peer = split_core.get();
         split_core->split_peer = &E;
         {
             DeviceScope owner(E.device);
             CK(cudaHostAlloc(&E.split_handoff, (size_t) 4 * E.tmax * m.hp.n_embd * sizeof(float), cudaHostAllocPortable));
         }
-        std::fprintf(stderr, "strata-inkling2: layer split main_device=%d virtual=0..5,42..47+head core_device=%d virtual=6..41 (physical=6..17 x3), context=262144 KV=Q8, host handoff=18/36 KiB per token, core_graph=%s\n",
-                     E.device, split_core->device, split_core_graph ? "enabled" : "disabled (eager)");
+        const long long handoff_row_bytes = (long long) m.hp.n_embd * (long long) sizeof(float);
+        std::fprintf(stderr,
+                     "strata-inkling2: layer split main_device=%d core_device=%d context=262144 KV=Q8 "
+                     "host_handoff_payload_bytes/token to_fast=%lld to_main=%lld core_graph=%s\n",
+                     E.device, split_core->device,
+                     (split_prelude ? 1 : 2) * handoff_row_bytes,
+                     4 * handoff_row_bytes,
+                     split_core_graph ? "enabled" : "disabled (eager)");
     }
     if (dm) {
         dspark = std::make_unique<DsparkEngine>();
@@ -3326,10 +3648,12 @@ int run(int argc, char** argv) {
                 q_lines.pop_front();
             }
             if (line == "QUIT" || line == "EXIT") break;
-            if (line == "RESET" && E.replica) {
+            if (line == "RESET" && (E.replica || split_full_attn_remote)) {
                 E.reset_state();
                 E.reset_hybrid_stats();
-                live_tokens.clear(); snaps.clear(); hist.clear();
+                live_tokens.clear();
+                snaps.clear();
+                hist.clear();
                 std::printf("RESET_OK\n"); std::fflush(stdout);
                 continue;
             }

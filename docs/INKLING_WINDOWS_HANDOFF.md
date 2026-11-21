@@ -453,3 +453,44 @@ Banco del 21 novembre su Q3_K_XL. Il confronto cambia un solo flag nello stesso 
 Tutti gli ID coincidono fra i tre passaggi a ciascuna lunghezza. Altri due seed, 20261122 e 20261123, coincidono per tutti i 128 token confrontati. I numeri descrivono questa singola chat, con una sola misura A. Report e log locali nella cartella `D:/ds4_work/inkling2/astra-placement-bench`, riepilogo `sampler-bab-summary.json`.
 
 Preset locale pronto in `D:/ds4_work/inkling2/config/inkling-dual-qkv-gpu-sampler.json`. Build CUDA 12.6 SM75/SM86 del solo sampler in `builds/full-vocab-0eb965c1/strata-inkling2.exe`, SHA256 `0eb965c15c47570c62fe29d90bf9710e318d6a649f723c8e920f521a393187af`.
+
+
+### KV sulla 2080 Ti e prefisso locale sulla 3080 Ti
+
+La full attention può ora girare sulla 2080 Ti accanto alla sua KV Q8. Il flag `--split-full-attn-remote` si aggiunge al normale layer split. `--full-kv-local-prefix N` conserva sulla 3080 le prime N posizioni delle visite full assegnate ai suoi blocchi. Quando un chunk supera N, l'engine copia le sole posizioni già scritte attraverso RAM pinned e ricattura il graph. Da quel momento invia le attivazioni alla 2080 per ciascuna visita full interessata. Le SWA conservano il proprio ring locale. `--split-prelude-core` sposta anche i blocchi fisici 0–5 sulla 3080, che così esegue le visite virtuali 0–41. La 2080 esegue le visite 42–47 e la head. Capacità 262.144, chunk64, 3060 dedicata al desktop.
+
+**Correttezza.** Lo spostamento della sola full attention sulla 2080, con la ripartizione originaria dei blocchi, ha prodotto 200.058 logits identici al riferimento a chunk1 e chunk64 e gli stessi 128 token generati. Ha lasciato circa 3,9 GiB liberi sulla 3080. Aggiungendo lo spostamento dei sei blocchi iniziali, i logits a chunk1 coincidono. A chunk64 l'argmax coincide, la differenza L2 relativa è 1,69% e 92 dei 128 ID campionati differiscono dal vecchio layout. Nelle prove del passaggio di soglia, mantenendo fisso il nuovo placement, N=0/64/128 hanno prodotto gli stessi 128 ID, due volte ciascuno dopo RESET. N=64 attraversa la soglia in prefill, N=128 in decode. Artefatti in `astra-placement-bench/prefix-boundary-v2`.
+
+**Placement provati.** I valori seguenti sono pilot da 99 token di input e 128 di output. Alcuni pilot si sono sovrapposti alle compilazioni CPU. Il confronto controllato del sampler è nella tabella precedente.
+
+| Modello e disposizione | Sampler | Decode t/s |
+|---|---|---:|
+| Q3, sei visite full del core spostate sulla 2080, prefisso locale 0 | CPU | 68,62 |
+| Q3, 20 blocchi fisici sulla 3080 alternati ai quattro blocchi full sulla 2080 | CPU | 52,49 |
+| Q3, 18 blocchi contigui sulla 3080, 6 sulla 2080, prefisso 8192 | GPU | 81,25 |
+| IQ3_XXS, stessi 18 + 6 e prefisso 8192 | GPU | 85,61 |
+| IQ3_XXS, 23 blocchi sulla 3080, ultimo blocco e head sulla 2080, prefisso 8192 | GPU | 79,24 |
+
+IQ3_XXS verificato su D, SHA256 `bd7ef0865adf119b5183e45e741c629bafa649769b33b5ebf689bb4bcc4690d6`, 11.663.309.504 byte. Rispetto al Q3, nel core fisico 6–17 cambiano le 12 matrici gate/up. Le 12 down restano NVFP4. L'IQ3_XXS con tutti i 24 blocchi sulla 3080, prefisso 8192 e head sulla 2080 si arresta al controllo di residenza al pilot con chunk64. Nel caricamento diagnostico separato con chunk1 servono 10.298.982.400 byte per gli esperti, contro un budget allocatore di 9.831.448.576 byte dopo le riserve e lo staging previsti per il percorso ibrido. Quel divario include la politica dell'allocatore. Con il blocco 23 sulla 2080, i 3.072 esperti entrano e i logits chunk1 coincidono con il riferimento IQ3 su singola 2080 per tutte le 200.058 voci. Sul pilot chunk64 restano 486 MiB liberi sulla 3080 dopo il placement. Il prototipo a 23 blocchi è recuperabile in `C:/Users/imanu/Documents/Codex/inkling-iq3-allblocks-lab`. Il preset per la chat resta il Q3 con GPU sampler.
+
+Con 10.000 ID occupati e 128 generati, stesso prompt freddo e Q3, la configurazione originale misura 68,65 t/s con sampler CPU e 75,13 t/s con sampler GPU. Tutti gli ID coincidono. Il prefill dura 27,571 / 27,584 s e la richiesta nativa completa 29,422 / 29,281 s. Con il placement 18 + 6 e il sampler GPU, lo stesso confronto a contesto fisso misura 70,69 t/s con soglia 8192 (KV già migrata) e 72,31 t/s con soglia 16384 (KV ancora locale). Gli ID sono identici fra queste due soglie. I rispettivi prefill durano 29,357 / 29,502 s. È una singola coppia di osservazioni. Report in `astra-placement-bench/context10k-*`.
+
+Sul preset Q3 scelto per la chat, mantenendo 128 output, prompt freddo e zero riuso:
+
+| Input realmente occupato | Prefill | Prefill t/s | Decode t/s | Richiesta nativa |
+|---:|---:|---:|---:|---:|
+| 10.000 | 27,58 s | 362,5 | 75,13 | 29,28 s |
+| 20.000 | 60,31 s | 331,6 | 69,49 | 62,16 s |
+| 40.000 | 137,33 s | 291,3 | 60,84 | 139,45 s |
+
+I tre prompt provengono da `runs/20261121-context-baseline-swa-fixed/inputs.json`. Riepilogo e telemetria in `astra-placement-bench/context-summary.json`. Nessun restore SSD. Nel BAB corto, picco 10.546 MiB sulla 3080 Ti (PCIe 4.0 x4) e 7.176 MiB sulla 2080 Ti (PCIe 3.0 x16). La 3060 serve Windows.
+
+Verifica su due turni della chat con migrazione KV. Con soglia 37 e prompt A da 36 token, la generazione attraversa la soglia. Il turno B riusa i 36 token di A e genera gli stessi ID della richiesta B a freddo. A dopo reset coincide con A iniziale. Report in `astra-placement-bench/prefix-warm-state/report.json`. Per ripeterla, `tools/inkling_state_parity.py` accetta `--full-kv-local-prefix 37 --split-prelude-core` oltre ai normali flag del layer split.
+
+Preset alternativo riproducibile in `D:/ds4_work/inkling2/config/inkling-dual-kv2080-prefix8192.json`. Binario immutabile SHA256 `61891828ad9b898963605ff1f21a333694c81d8af919e2af9359da739345a109`. Per il preset più veloce usare la configurazione `inkling-dual-qkv-gpu-sampler.json` indicata sopra. Dalla directory `terminal` del checkout:
+
+```powershell
+python -m serve.server --engine strata --config D:/ds4_work/inkling2/config/inkling-dual-qkv-gpu-sampler.json --host 127.0.0.1 --port 8100
+```
+
+Verifica HTTP finale del preset chat su porta 8100. Il primo turno ha risposto «Roma» in 1,422 s completi, con 31 token di input e 78 generati inclusi i token di ragionamento. Il secondo ha risposto «Parigi» in 1,391 s, con 54 token di input di cui 31 riusati e 105 generati. Entrambi hanno terminato con stop. I limiti di output erano 128 e 512. Uno script preliminare aveva alterato gli accenti del prompt Windows: la prova finale usa il testo UTF-8 verificato. Report `astra-placement-bench/http-full-vocab-final/report.json`. Il server di prova è stato chiuso. Verifica finale: 0 MiB sulla 3080 Ti e sulla 2080 Ti, 1.641 MiB sulla 3060.
