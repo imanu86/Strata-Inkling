@@ -732,6 +732,7 @@ struct Engine {
     float *in_q = nullptr, *in_k = nullptr, *in_v = nullptr, *in_ffn = nullptr;
     float *msg0 = nullptr, *msg1 = nullptr, *msg2 = nullptr, *msg3 = nullptr;
     float *ctrl2N = nullptr, *ctrl64 = nullptr, *ctrl_g = nullptr, *ctrl_f = nullptr;
+    float *qkv_ctrl2N = nullptr, *qkv_ctrl64 = nullptr; // opt-in T=1, three independent controllers
     float *norm_cur = nullptr;       // [tmax * N]
     float *prelude_cur_buf = nullptr;
     float *norm_blk_buf[9] = {};     // cached RMSNorm of pushed block residuals (0..7 + 8=bank_last)
@@ -858,6 +859,7 @@ struct Engine {
     std::vector<cudaGraphExec_t> layer_pre_graph;
     bool core_all_gpu = false;
     bool split_core_graph = false;     // opt-in for the Core runtime; All keeps its existing graph policy
+    bool batch_qkv_control_t1 = false; // fixed before init/capture; all virtual owners receive it
     bool split_outer_graph = false;
     bool outer_graph_profile_block = false;
     bool graph_oom = false;
@@ -986,6 +988,7 @@ struct Engine {
         cudaFree(in_q); cudaFree(in_k); cudaFree(in_v); cudaFree(in_ffn);
         cudaFree(msg0); cudaFree(msg1); cudaFree(msg2); cudaFree(msg3);
         cudaFree(ctrl2N); cudaFree(ctrl64); cudaFree(ctrl_g); cudaFree(ctrl_f);
+        cudaFree(qkv_ctrl2N); cudaFree(qkv_ctrl64);
         cudaFree(Q); cudaFree(K); cudaFree(V); cudaFree(R); cudaFree(qgr_t1);
         cudaFree(K_conv); cudaFree(V_conv); cudaFree(dyn_k); cudaFree(dyn_v);
         cudaFree(sink); cudaFree(rel_tab); cudaFree(att); cudaFree(att_gate); cudaFree(wo);
@@ -1086,6 +1089,10 @@ struct Engine {
         d_f32(&ctrl64, (size_t) tmax * hp.loop_gate_rank);
         d_f32(&ctrl_g, (size_t) tmax * N);
         d_f32(&ctrl_f, (size_t) tmax * N);
+        if (batch_qkv_control_t1) {
+            d_f32(&qkv_ctrl2N, (size_t) 3 * 2 * N);
+            d_f32(&qkv_ctrl64, (size_t) 3 * 64);
+        }
 
         d_f32(&Q, (size_t) tmax * hp.q_dim);
         d_f32(&K, (size_t) tmax * hp.kv_dim);
@@ -1306,6 +1313,33 @@ struct Engine {
         project(ctrl64, L.loop_forget[mod], ctrl_f, T, N, hp.loop_gate_rank);
         const int64_t tot = (int64_t) T * N;
         k_control_combine<<<(unsigned) ((tot + 255) / 256), 256, 0, st>>>(c, msg, ctrl_g, ctrl_f, out, tot);
+    }
+
+    void run_controls_qkv(const float* q, const float* k, const float* v, const PhysLayer& L, int T) {
+        bool f32 = batch_qkv_control_t1 && T == 1 && m->hp.loop_gate_rank == 64 && (m->hp.n_embd % 4) == 0;
+        if (f32) {
+            for (int i = 0; i < 3; ++i)
+                f32 = f32 && L.loop_down[i].type == 0 && L.loop_gain[i].type == 0 && L.loop_forget[i].type == 0;
+        }
+        if (f32) {
+            const int N = (int) m->hp.n_embd;
+            QkvControlT1 p{};
+            p.cur[0] = q; p.cur[1] = k; p.cur[2] = v;
+            p.msg[0] = msg0; p.msg[1] = msg1; p.msg[2] = msg2;
+            p.out[0] = in_q; p.out[1] = in_k; p.out[2] = in_v;
+            for (int i = 0; i < 3; ++i) {
+                p.down[i] = (const float*) L.loop_down[i].d;
+                p.gain[i] = (const float*) L.loop_gain[i].d;
+                p.forget[i] = (const float*) L.loop_forget[i].d;
+            }
+            k_control_prep_qkv_t1<<<dim3(2, 3), kThreads, 0, st>>>(p, qkv_ctrl2N, N, m->hp.rms_eps);
+            k_control_down_qkv_t1<<<dim3(64, 3), 128, 0, st>>>(p, qkv_ctrl2N, qkv_ctrl64, N);
+            k_control_up_combine_qkv_t1<<<dim3((unsigned) ((N + 31) / 32), 3), 256, 0, st>>>(p, qkv_ctrl64, N);
+            return;
+        }
+        run_control(q, msg0, L, 0, in_q, T);
+        run_control(k, msg1, L, 1, in_k, T);
+        run_control(v, msg2, L, 2, in_v, T);
     }
 
     void pp_kick_next() {
@@ -1726,9 +1760,7 @@ struct Engine {
                 float* outs[3] = {in_q, in_k, in_v};
                 run_mix_normed(norm_blocks, cur, false, L.attn_res_query, outs, is_swa ? 1 : 3, T, is_swa ? 1 : 0);
                 if (has_msg) {
-                    run_control(in_q, msg0, L, 0, in_q, T);
-                    run_control(in_k, msg1, L, 1, in_k, T);
-                    run_control(in_v, msg2, L, 2, in_v, T);
+                    run_controls_qkv(in_q, in_k, in_v, L, T);
                 }
                 if (is_swa && has_msg) {
                     k_rms_norm_3<<<dim3(3, (unsigned) T), kThreads, 0, st>>>(in_q, in_k, in_v, L.attn_norm, N, hp.rms_eps);
@@ -1743,9 +1775,7 @@ struct Engine {
                 }
             } else {
                 if (has_msg) {
-                    run_control(cur, msg0, L, 0, in_q, T);
-                    run_control(cur, msg1, L, 1, in_k, T);
-                    run_control(cur, msg2, L, 2, in_v, T);
+                    run_controls_qkv(cur, cur, cur, L, T);
                     if (is_swa) {
                         k_rms_norm_3<<<dim3(3, (unsigned) T), kThreads, 0, st>>>(in_q, in_k, in_v, L.attn_norm, N, hp.rms_eps);
                     } else {
@@ -2677,6 +2707,7 @@ int run(int argc, char** argv) {
     int layer_split_device = -1;
     bool split_core_graph = false;
     bool split_outer_graph = false;
+    bool batch_qkv_control_t1 = false;
     double expert_vram = -1.0;
     bool serve = false;
     bool bench = false;
@@ -2717,6 +2748,7 @@ int run(int argc, char** argv) {
         }
         else if (a == "--split-core-graph") split_core_graph = true;
         else if (a == "--split-outer-graph") split_outer_graph = true;
+        else if (a == "--batch-qkv-control-t1") batch_qkv_control_t1 = true;
         else if (a == "--kv-f16") kv_q8 = false;
         else if (a == "--kv-q8") kv_q8 = true;
         else if (a == "--serve") serve = true;
@@ -2726,7 +2758,7 @@ int run(int argc, char** argv) {
     }
 
     if (model_path.empty()) {
-        std::fprintf(stderr, "usage: strata-inkling2 --model <file.gguf> [--max-context N] [--kv-q8|--kv-f16] [--tokens IDS] [--max-new N] [--dump-logits PATH] [--layer-split-device N [--split-core-graph] [--split-outer-graph]] [--draft DRAFT.gguf --spec K] [--bench] [--serve]\n");
+        std::fprintf(stderr, "usage: strata-inkling2 --model <file.gguf> [--max-context N] [--kv-q8|--kv-f16] [--tokens IDS] [--max-new N] [--dump-logits PATH] [--layer-split-device N [--split-core-graph] [--split-outer-graph]] [--batch-qkv-control-t1] [--draft DRAFT.gguf --spec K] [--bench] [--serve]\n");
         return 2;
     }
     if (split_core_graph && layer_split_device < 0) {
@@ -2776,6 +2808,7 @@ int run(int argc, char** argv) {
     E.device = m.main_device;
     E.role = layer_split_device >= 0 ? Engine::Role::Outer : Engine::Role::All;
     E.split_outer_graph = split_outer_graph;
+    E.batch_qkv_control_t1 = batch_qkv_control_t1;
     E.outer_graph_profile_block = profile || profile_detail;
     if (!E.init(m, max_ctx, runtime_t, kv_q8, err, verify_t, dm && dm->has_quant_dense, dm ? dm->hp.n_ff : 0)) {
         std::fprintf(stderr, "strata-inkling2: engine init failed: %s\n", err.c_str());
@@ -2792,6 +2825,7 @@ int run(int argc, char** argv) {
         split_core->device = layer_split_device;
         split_core->role = Engine::Role::Core;
         split_core->split_core_graph = split_core_graph;
+        split_core->batch_qkv_control_t1 = batch_qkv_control_t1;
         if (!split_core->init(m, max_ctx, runtime_t, kv_q8, err, verify_t, false)) {
             std::fprintf(stderr, "strata-inkling2: split core init failed: %s\n", err.c_str()); return 1;
         }

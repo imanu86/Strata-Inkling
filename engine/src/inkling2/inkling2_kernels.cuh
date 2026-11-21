@@ -459,6 +459,109 @@ __global__ void k_gemv_f32_cta(const float* __restrict__ W, const float* __restr
     if (threadIdx.x == 0) y[o] = acc;
 }
 
+// Opt-in Q/K/V batching: same arithmetic and logical CTA shapes as the T=1 kernels above.
+// Conceptual batching comparison: NInfer Inkling2 controllers; no external implementation copied.
+struct QkvControlT1 {
+    const float* cur[3];
+    const float* msg[3];
+    const float* down[3];
+    const float* gain[3];
+    const float* forget[3];
+    float* out[3];
+};
+
+__global__ void k_control_prep_qkv_t1(QkvControlT1 p, float* scratch, int N, float eps) {
+    const int controller = blockIdx.y;
+    const float* cur = p.cur[controller];
+    const float* msg = p.msg[controller];
+    float* out2N = scratch + (size_t) controller * 2 * N;
+
+    __shared__ float sh[32];
+    const int k = blockIdx.x, t = 0;
+    const float* src = (k == 0 ? cur : msg) + (size_t) t * N;
+    float* dst = out2N + (size_t) t * (2 * N) + (k * N);
+    float s = 0.0f;
+    if ((N & 3) == 0) {
+        const int n4 = N >> 2;
+        const float4* s4 = (const float4*) src;
+        float4* d4 = (float4*) dst;
+        for (int i = threadIdx.x; i < n4; i += blockDim.x) {
+            const float4 v = s4[i];
+            s += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+        }
+        s = block_sum(s, sh);
+        const float r = rsqrtf(s / (float) N + eps);
+        for (int i = threadIdx.x; i < n4; i += blockDim.x) {
+            const float4 v = s4[i];
+            d4[i] = make_float4(v.x * r, v.y * r, v.z * r, v.w * r);
+        }
+        return;
+    }
+    for (int i = threadIdx.x; i < N; i += blockDim.x) {
+        const float v = src[i];
+        s += v * v;
+    }
+    s = block_sum(s, sh);
+    const float r = rsqrtf(s / (float) N + eps);
+    for (int i = threadIdx.x; i < N; i += blockDim.x) dst[i] = src[i] * r;
+}
+
+__global__ void k_control_down_qkv_t1(QkvControlT1 p, const float* prep, float* down, int N) {
+    const int controller = blockIdx.y;
+    const float* W = p.down[controller];
+    const float* x = prep + (size_t) controller * 2 * N;
+    float* y = down + (size_t) controller * 64;
+    const int n_in = 2 * N, n_out = 64;
+
+    __shared__ float sh[32];
+    const int o = blockIdx.x;
+    if (o >= n_out) return;
+    const float4* wr = (const float4*) (W + (size_t) o * n_in);
+    const float4* xr = (const float4*) x;
+    float acc = 0.0f;
+    const int n4 = n_in / 4;
+    for (int i = threadIdx.x; i < n4; i += blockDim.x) {
+        const float4 a = wr[i], b = xr[i];
+        acc += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+    }
+    acc = block_sum(acc, sh);
+    if (threadIdx.x == 0) y[o] = acc;
+}
+
+__global__ void k_control_up_combine_qkv_t1(QkvControlT1 p, const float* down, int N) {
+    const int controller = blockIdx.y;
+    const float* cur = p.cur[controller];
+    const float* msg = p.msg[controller];
+    const float* w_gain = p.gain[controller];
+    const float* w_forget = p.forget[controller];
+    const float* ctrl64 = down + (size_t) controller * 64;
+    float* out = p.out[controller];
+    const int R = 64;
+
+    __shared__ float sx[64];
+    if (threadIdx.x < R) sx[threadIdx.x] = ctrl64[threadIdx.x];
+    __syncthreads();
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int base_o = (blockIdx.x * 8 + warp) * 4;
+    const int half = lane >> 4;
+    const int i = lane & 15;
+    const float4 x = reinterpret_cast<const float4*>(sx)[i];
+    const float* wg = half ? w_forget : w_gain;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const int o = base_o + k;
+        if (o >= N) return;
+        const float4 w = reinterpret_cast<const float4*>(wg + (size_t) o * R)[i];
+        float acc = w.x * x.x + w.y * x.y + w.z * x.z + w.w * x.w;
+#pragma unroll
+        for (int m = 8; m > 0; m >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, m);
+        const float f_val = __shfl_sync(0xffffffffu, acc, 16);
+        if (lane == 0) {
+            out[o] = (1.0f - fast_tanh(f_val)) * cur[o] + fast_tanh(acc) * msg[o];
+        }
+    }
+}
+
 /// Causal 4-tap shortconv (+ optional dynamic per-head taps for full-attn K/V).
 /// hist has [hist_stride, 3] floats? Wait: hist is [n_channels_total][3] for coalesced / per-channel state:
 /// specifically hist[channel_offset + c][0..2] holds the 3 oldest->newest prior inputs.

@@ -32,6 +32,7 @@ def arguments(argv=None):
     parser.add_argument("--model", type=Path, default=Path("D:/ds4_work/inkling2/models/Inkling-2-Mini-UD-Q3_K_XL.gguf"))
     parser.add_argument("--draft", type=Path)
     parser.add_argument("--spec", type=int, choices=range(1, 8), default=3)
+    parser.add_argument("--batch-qkv-control-t1", action="store_true")
     parser.add_argument("--max-new", type=int, choices=(32, 128, 256, 512, 1000), default=32)
     parser.add_argument("--tokenizer", type=Path, default=Path("D:/ds4_work/inkling2/models/tokenizer"))
     parser.add_argument("--seed", type=int, default=20261121)
@@ -162,6 +163,8 @@ def main(argv=None):
         if args.draft:
             report["files"]["draft"] = file_record(args.draft, True)
             command += ["--draft", str(args.draft.resolve()), "--spec", str(args.spec)]
+        if args.batch_qkv_control_t1:
+            command.append("--batch-qkv-control-t1")
         if args.expert_vram is not None:
             command += ["--expert-vram", str(args.expert_vram)]
         if args.cpu_threads is not None:
