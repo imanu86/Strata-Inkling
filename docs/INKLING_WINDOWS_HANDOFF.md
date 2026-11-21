@@ -277,3 +277,104 @@ Alle10:42 locali del21 novembre avviato il server su `http://127.0.0.1:8100`, AP
 Verifica HTTP effettiva `20261121-http-outer-graph-verified.json`: richiesta con limite256, risposta finale `Roma`,69 token complessivi, `finish_reason=stop`,36 token input,1,745 s HTTP. È uno smoke funzionale con arresto naturale, non un benchmark da69 token. Il server espone capacità262144; non significa che siano stati misurati262144 token occupati. I contesti10/20/40K sopra sono misure precedenti all'ottimizzazione outer graph.
 
 Resta da isolare la causa dell'aderenza limitata del draft al target in questo carico; il replay completo esclude un grande recupero dalla sola rimozione della quantizzazione draft nel campione controllato. La precisione del target, le sue feature e la parità greedy T1/batch restano aperte. Non presentare l'MTP come accelerazione già ottenuta. Gli esperimenti BF16 perdenti sono rimossi dal codice corrente; nessuna PR o comunicazione esterna inviata.
+
+### Ricognizione estesa dei motori e dei fix, 21 novembre
+
+Ricontrollati live Kuraneko `602dbbc59179be8133d5468da77225df4fe176cd` e Niko `3142b66b96e9c0e775e30f620b11b191a1427c2a`. La ricerca comprende anche NInfer-all, Xolotl, llama.cpp mainline e Unsloth, i veri PR Mini di SGLang/vLLM, HF ufficiale e Unsloth. Nessun merge generale, cambio motore o nuovo branch. Le prestazioni degli altri autori non sono misure sulla nostra macchina.
+
+| Fonte primaria fissata | Riscontro e applicabilità |
+|---|---|
+| [NInfer-all](https://github.com/iamwavecut/ninfer-all/blob/395ce8b85627bcb2d53a1a81623088eab755443c/docs/inkling2.md) | L'autore misura AR88,9→111,4 t/s su3090 raggruppando controller, dividendo depth mix e fondendo routing. Sampled essay DSpark0,99..1,05×; greedy essay1,14× e Python1,41×. IQ4_XS/F16KV/singola3090: non confrontare direttamente quei112 t/s con i nostri70. Inkling non supporta lì KV quantizzata. La nostra implementazione ha già grouping MoE, norm cached e alcuni kernel fusi: occorre confrontare i singoli percorsi. |
+| [NInfer controller](https://github.com/iamwavecut/ninfer-all/blob/395ce8b85627bcb2d53a1a81623088eab755443c/src/models/inkling2/executor.cpp#L1804) | Gap locale verificato: Q/K/V T1 eseguono in sequenza tre volte prep/down/up+combine con scratch condiviso. Sono raggruppabili senza cambiare somme o pesi. Il controller MLP dipende dall'attenzione e resta separato. |
+| [Xolotl attention multicolonna](https://github.com/Indras-Mirror/Xolotl/commit/9d222fa3c42f04b57329d07537055c7102e58257) e [MMVQ interleaved](https://github.com/Indras-Mirror/Xolotl/commit/17a85465d94d321274002a3a5493e84c37cdf982) | Riuso KV/pesi fra query T1..8. Candidati per verify; per Inkling servono relative bias, sink, SWA e layout Q8 corretti. Non portati né misurati. Il suo DSpark sampled non è un sostituto pronto del nostro rejection sampling. |
+| [llama.cpp32704](https://github.com/ggml-org/llama.cpp/pull/32704), `4030448224768f5c83b98e70aef81111b1037039` | Fix aperto per scale NVFP4 perse nei passaggi ripetuti. Audit Strata: ogni blob porta le scale per esperto; tutte le visite riusano il medesimo PhysLayer e tail, copiati integralmente anche fra tier. Non trovato l'analogo del bug; è una verifica statica, non PPL misurata. |
+| [llama.cpp32724](https://github.com/ggml-org/llama.cpp/pull/32724), `85fd12a7b4ab60c35039c3362487d2fe1bc6dedc` | Proposta chiusa senza merge: KV/conv delle visite sul device dei pesi condivisi. Il nostro split fa già questa colocazione; i risultati su due T4 non implicano un guadagno aggiuntivo qui. |
+| [Unsloth390](https://github.com/unslothai/llama.cpp/pull/390), `8aa2f23f6bbe0b2d23eb3ff676f318f96111d591`; [394](https://github.com/unslothai/llama.cpp/pull/394), `ffa1b96a80b1a4d30be7ee9a663005eb4c8e9915` | Fix ancora aperti: tap per visita, fuse F32, limitare ricorrenza alle proposte richieste e un prodotto head per passo. Il nostro mapping e numero di passi risultano già corretti.394 misura77,3 t/s contro60,3 AR su3090Ti, ma con temperatura0/draft2, non il nostro samplerT1.390 dichiara stessa acceptance con draftBF16/Q8. |
+| [SGLang Mini51926](https://github.com/sgl-project/sglang/pull/51926), `b736e624fec767d239a49b581578fe2da45154dc`; [vLLM Mini69028](https://github.com/vllm-project/vllm/pull/69028), `fc1443152c0eb655f5c2762f56b540bebe93b196` | I veri sorgenti Mini erano ancora PR aperti, non bastava il precedente riferimento main flat. Audit tap5/23/41/48, anchor, mask, previous-ID e softcap confermato. Differenza reale nei controller: RMS e down sono arrotondatiBF16 nel riferimento; Strata conservaFP32 e usa fast_tanh/FMA differenti. Impatto sull'accettazione ancora non misurato. |
+
+Riletti i due pesi norm target ufficiali tramite piccoli range HTTP: `embed_norm→token_embd_norm` e `norm→output_norm` sono bit-identici dopo upcast. Anche norm final draft e norm f_rnn sono mappate correttamente. Nessuna head Mini alternativa trovata nelle fonti controllate; i file Unsloth targetQ3 e draftQ8 mantengono gli hash già usati. Mancano confronti pubblici controllati di acceptance Mini Q3/Q4; non confondere KLD dei logits con fedeltà delle hidden feature.
+
+La documentazione [vLLM](https://vllm-project.github.io/2026/11/20/inkling2-mini.html) descrive inoltre `thinkingmachines/TML-d24-varloop-research`, checkpoint distinto addestrato a variare i passaggi. Uno o due passaggi riducono il lavoro, cambiando il compromesso qualità/velocità; DSpark richiede i tre passaggi standard. Non è corretto tagliare i loop del nostro checkpoint fisso. È una strada architetturale separata, non implementata né scaricata. Il [produttore](https://thinkingmachines.ai/news/inkling-2-mini/) riporta5,4B parametri attivi e48 visite da24 layer memorizzati: la dimensione su disco non misura il lavoro per token.
+
+Esaminati anche TokenSpeed, inkling-turbo e inkling2-exl3-spark: le fonti trovate riguardano rispettivamente soprattutto hardware datacenter/Inkling precedente, attention con limiti specifici di piattaforma, e Inkling2Small su dueDGXSpark. Nessuna accelerazione Mini SM75/86 pronta dimostrata da quelle pagine. La ricerca non costituisce un censimento esaustivo di ogni fork.
+
+### Prove derivate dalla ricognizione
+
+Il [percorso BF16 Tensor Core di Niko](https://github.com/Niko1221/Strata/commit/4dbc4c8b82b24ae5dbbba256fde4ff1e3d4a61ec) era già compilato e opt-in per SM75 con `STRATA_BF16_TC=1`. A lascia la variabile assente, preservando il default SM86; B1/B2 la impostano1, sempre nuovi processi. Binario immutabile `dspark-history-f857764b`, stessa configurazione italiana spec3 del banco precedente.
+
+Il controllo chunk1/T1 conserva tutti i200058 logits. Il prefill64 cambia i logits rispetto al riferimento dual corretto: L2 relativa0,52565%, quattro token greedy iniziali invariati. Nell'oracolo1100+59 T1 forzati cambia anche l'argmax; la coda futura resta causalmente indipendente. Nessun nonfinito. Non è un'ottimizzazione bitwise.
+
+| Output | B1 BF16_TC | A default | B2 BF16_TC | Accettati B / A |
+|---:|---:|---:|---:|---:|
+|128|47,34|47,48|47,56 t/s|69 /68|
+|512|35,35|40,52|35,39 t/s|185 /228|
+|1000|28,43|31,09|28,49 t/s|249 /306|
+
+Artefatti `20261121-bf16tc-parity`, `20261121-bf16tc-row0-oracle-B1/A`, `20261121-bf16tc-bab-B1/A/B2`. Le traiettorie e l'accettazione cambiano, quindi il delta non isola il solo costo GEMM. Il risultato operativo peggiora: flag non promosso. Nessuna modifica di sorgente necessaria per questo tentativo.
+
+Completato e pubblicato su main il candidato `--batch-qkv-control-t1`, commit `6ff2e48e8`: tre kernel raggruppano Q/K/V al posto di nove, mantenendo i corpi aritmetici Strata. Non copia codice NInfer; ne usa l'idea come riferimento.24 visite con messaggio producono144 nodi graph in meno per forwardT1, non144 lanci CPU evitati. Flag impostato prima di init/capture, scratch separato preallocato, default/MLP/T>1 invariati. Revisione statica indipendente passa, inclusi alias SWA e device ownership.
+
+Build immutabile `builds\qkv-control-0dc78e64`, SHA256 `0dc78e6451c3047665319b136217320005badddfe32e642f65d5b88fa94f736f`. Build CUDA e CTest `inkling_sampling_test` passati; sette test Python del banco passati. Test standalone `engine/tests/test_inkling2_qkv_control_t1.cu`:108 casi su ciascuna GPU, prep/down/output identici bitwise eager e tre replay graph, eps1e-6, scratch avvelenati con NaN e controllo nonfiniti. Tutti i200058 logits sono identici al riferimento **dual** corretto, sia chunk1 sia64, con flag spento e acceso. Non usare il confronto storico single-GPU riportato dal vecchio helper come esito di questa parità. Artefatti `20261121-qkv-control-unit`, `-parity-A/B`, `-state`.
+
+Stato RAM warm/cold/reset passato, riuso36 token contro0 nel cold e reset; non è ripristino SSD. BAB con99 token input, T1/P1/K0, seed20261121, core+outer graph, senza draft, produce tutti gli ID identici in A/B1/B2 e tutte le lunghezze richieste:
+
+| Output | B1 QKV raggruppati | A default | B2 QKV raggruppati | Delta media B / A |
+|---:|---:|---:|---:|---:|
+|128|74,18 t/s|75,62 t/s|76,02 t/s|−0,68%|
+|512|74,69 t/s|72,60 t/s|74,32 t/s|+2,62%|
+|1000|71,42 t/s|69,33 t/s|71,94 t/s|+3,39%|
+
+Artefatti `20261121-qkv-control-bab-B1/A/B2`, riepilogo verificabile `20261121-qkv-control-summary.json`. Velocità calcolate come `(generated−1)/decode_seconds`, separatamente dai tempi completi nativi; nessuna misura HTTP in questa tabella. Guadagno piccolo e coerente nei due B lunghi, nessun vantaggio chiaro a128; non generalizzarlo a tutti i prompt o a256K occupati. Picco VRAM3080=10546 MiB,2080=7176 MiB,3060=1579 MiB; RAM disponibile almeno65,95 GiB. Clock non bloccati, nessuna build o prova concorrente. La capacità resta262144, il contesto effettivo di questo banco è99.
+
+BAB QKV con DSpark spec3 completato sul medesimo prompt:128=47,82/46,82/46,26;512=40,38/40,71/40,41;1000=30,88/31,13/30,84 t/s, ordine B1/A/B2. Tutti gli ID coincidono; acceptance invariata68/172,228/843,306/2073. Nessun vantaggio nel verify MTP; il raggruppamento T1 rimane un miglioramento del preset senza draft. Artefatti `20261121-qkv-mtp-bab-B1/A/B2` e `20261121-qkv-mtp-summary.json`.
+
+Completata anche la verifica derivata dai veri sorgenti Mini: due arrotondamenti BF16 del controller (`casts`) e, separatamente, cast più proiezioni up separate, `tanhf` e fusione FP32 senza FMA (`official-merge`). Quest'ultima non isola soltanto FMA. Non è una conversione dell'intero target in BF16 e conserva l'ordine di riduzione Strata. Default invariato e batching QKV scavalcato nei due opt-in.
+
+Snapshot `builds\controller-precision-6ff2e48e8-20261121`, exe SHA256 `55bd1c3d5c034bddcb426c691990ac07157b64f21f735569f28956b07f514d27`. Build CUDA e CPU sampler passati; review indipendente senza blocker. Test GPU su SM75/86 passa cast RNE anche ai limiti e10 casi forma/alias con tre replay graph. Tutti i200058 logits del default rimangono identici al riferimento dual a chunk1/64. Oracolo1100+59T1: nessun nonfinito, coda futura indipendente; L2 relativa T4/T1 passa da0,6493% native a1,1696% casts e0,7826% official-merge. Non risolve quindi la differenza fra forme del verify.
+
+| Modalità B | Output | B1 / A native / B2, t/s | Accettati / proposti B | Accettati / proposti A |
+|---|---:|---:|---:|---:|
+|casts|128|46,00 /44,05 /45,08|66 /177|68 /172|
+|casts|512|32,81 /40,52 /32,76|160 /1047|228 /843|
+|casts|1000|28,47 /30,78 /28,50|250 /2241|306 /2073|
+|official-merge|128|49,14 /48,11 /47,17|71 /163|68 /172|
+|official-merge|512|35,33 /40,55 /35,24|190 /960|228 /843|
+|official-merge|1000|28,97 /30,84 /28,99|266 /2196|306 /2073|
+
+Stesso banco italiano, spec3, seed20261121, capacità262144, output128/512/1000. Tutte le lunghezze raggiunte; B1/B2 identici, B diversi da A. I cast aggiungono kernel: i tempi non isolano il solo effetto numerico. Anche l'accettazione però peggiora nei due test lunghi, sulle traiettorie prodotte. Nessuna promozione; patch e test conservati nello snapshot, sorgente operativo ripristinato a `6ff2e48e8` dopo verifica di recuperabilità e hash. Artefatti `20261121-controller-precision-unit`, `-native-parity`, `-row0-native/casts/official-merge`, `20261121-controller-casts-bab-B1/A/B2`, `20261121-controller-official-merge-bab-B1/A/B2`, riepilogo `20261121-controller-precision-summary.json`. Non dedurre da questa prova che la fedeltà dell'intero target BF16 sia irrilevante.
+
+Audit dell'adattività NInfer: una policy può scegliere K0/1/2/3 dalla storia senza cambiare rejection sampling p/q. Tuttavia il transformer draft continua a elaborare block8 anche con K1; si risparmiano head/Markov e verify, non tutto il draft. Oggi il graph verify copre solo la larghezza massima: diminuire K a caldo può ricadere su eager. Il fallback con DSpark attivo conserva inoltre cattura/iniezione feature e costa più dell'AR puro. Un confidence floor non deve filtrare i token già estratti conservando la q originale: introdurrebbe bias. Servono cache graph per larghezza e misura del costo completo prima di implementare la policy. Nessuna adattività introdotta in questa fase.
+
+### Baseline llama.cpp richiesta dall'owner
+
+Prima di questa fase non era stato eseguito un confronto reale con llama.cpp sulla macchina. Il runtime compatibile individuato è la [release ufficiale Unsloth b12588-mix-c0c3de8](https://github.com/unslothai/llama.cpp/releases/tag/b12588-mix-c0c3de8), sorgente `883286076efe5b85fddb31d9cc7035a6b698ba9b`, pacchetto Windows CUDA12 older con SM75/86. Archivio SHA256 `7adbcfbb6b4980632885767b914468e2c1a560b485ce4be2dfbf432458508138`; exe `llama-baseline/prebuilt-b12588-cuda12-older/llama-server.exe`, SHA256 `bcbc39f0a6f31f5de251be7e21d5e45bdeb5e80aeac33568e086c8a80b35793a`. Provenienza, sorgente, licenza e comandi conservati in `D:/ds4_work/inkling2/llama-baseline/PROVENANCE.json` e `PREPARED.txt`. Nessuna build locale o modifica del GGUF.
+
+Il nuovo head upstream della PR32704, `608e3703fd15ecb989d96747b28fa98320c5cc4f`, richiede metadati `inkling2_loop` diversi dal nostro GGUF legacy `inkling2`,48 visite/24 blocchi tensor. Non è stato usato per un benchmark caricando male i pesi. Il runtime Unsloth scelto incorpora i cambiamenti389/390 e carica le scale prima di condividere i layer; gli stati KV/conv delle visite seguono il proprietario fisico.
+
+Il vero `tensor split` è esplicitamente rifiutato per Inkling da questa revisione. `row` compare nella CLI, ma il backend CUDA non implementa il buffer split: prova reale `20261121-llama-row-unsupported`, avvio fallito con `device CUDA0 does not support split buffers`. Non riportare un numero di prestazioni per row e non equipararlo a tensor parallelism. Anche l'help che colloca KV/intermediates su `--main-gpu` in row è obsoleto in questo sorgente.
+
+Harness esterno `D:/ds4_work/inkling2/llama-baseline-bench.py`, con versioni precedenti salvate e hash. Usa `/completion`, gli stessi99 ID interi del banco Strata, sampler T1/P1/K0/minP0, seed20261121, penalità neutre, nessun draft, output128/512/1000, un solo slot e `cache_prompt=false`. Verifica99 input, riuso0, capacità effettiva262144 e ID output nel vocabolario non padded200058. Il `predicted_per_second` nativo llama usa già `(predicted_n−1)/predicted_ms`; il numeratore coincide con Strata, senza garantire identici confini del timer. Tempi HTTP conservati separatamente. KV entrambe a8 bit ma rappresentazione diversa: llama Q8_0 scala per32 valori, Strata Q8 perhead128.
+
+Primo confronto `20261121-llama-layer-bab-B1/A/B2`: llama layer65/35, ordine2080/3080, main0, chunk64, fit off e flash attention on. B1/B2 hanno output identici e raggiungono tutte le lunghezze. Velocità llama B1=17,36/15,22/14,71 e B2=15,37/15,14/14,63 t/s; Strata A=75,51/75,13/72,39. B1 è un pilot con telemetria ogni0,5s; A/B2 ogni2s. Non presentare questo primo giro come controllo perfettamente uniforme della telemetria.
+
+Quel65/35 distribuisce le25 unità fisiche, incluso l'output: fisici0..16 sulla2080,17..23+head sulla3080. Ben33 delle36 visite del core rimangono sulla2080. Non è il placement Strata, e le prestazioni non sono un limite teorico delle schede. Il codice CUDA supporta NVFP4/Q3_K anche su SM75/86; non è emerso un fallback CPU obbligato per quei pesi. Input embedding CPU previsto, head sulla3080. I clock osservati sono variabili; nessun lock o modifica della potenza.
+
+Provata una seconda configurazione stock con `GGML_CUDA_DEVICES=3`: device virtuali2080/3080/2080, `--device CUDA0,CUDA1,CUDA2 --tensor-split 6,12,7`. Riproduce fisici0..5 e18..23+head sulla2080,6..17 sulla3080, con stato colocato. Non coinvolge la3060. A chunk64 fallisce la riserva dei buffer di calcolo sulla3080:3814 MiB con pipeline,3257,53 MiB nel retry senza pipeline. A chunk32 fallisce ancora:1908,65/1629,23 MiB. Artefatti `20261121-llama-virtual-layer-bab-B1` e `20261121-llama-virtual32-bab-B1`: sono avvii falliti, nessun dato prestazionale.
+
+Il sorgente materializza bias relativi F32 di dimensione `n_kv × T ×24`; alla riserva262144 un buffer vale1536 MiB aT64,768 aT32,384 aT16. La catena get_rows/cont può richiederne due: spiega plausibilmente gran parte dello scratch osservato, senza essere una misura diretta dell'allocatore. Con KV Q8 il fastpath speciale banded è escluso e viene usata l'attenzione ordinaria. A chunk16 il caricamento riesce dopo disattivazione automatica della pipeline, mantenendo256K/Q8. Il BAB `20261121-llama-virtual16-bab-B1/A/B2` è completato: usa16 in entrambi i motori, telemetria2s e identici altri parametri sopra.
+
+| Output effettivo | B1 llama, decode | A Strata, decode | B2 llama, decode | Tempi completi B1 / A / B2 |
+|---:|---:|---:|---:|---:|
+|128|14,06 t/s|78,11 t/s|14,72 t/s|10,250 /2,531 /9,844 s|
+|512|14,48 t/s|76,37 t/s|14,72 t/s|36,234 /7,219 /35,625 s|
+|1000|14,65 t/s|72,60 t/s|14,66 t/s|69,375 /14,312 /69,500 s|
+
+Tutte le risposte raggiungono il limite; B1/B2 hanno ID identici. I tempi completi includono HTTP per llama e protocollo nativo per Strata: non sono una misura isolata del server HTTP. Riepilogo `20261121-llama-versus-strata-summary.json`. Il chunk16 serve a rendere possibile il confronto llama; non viene promosso come migliore prefill Strata rispetto al64 operativo.
+
+Llama arriva a12080 MiB sulla3080 e9668 MiB sulla2080, con margine VRAM minimo sulla3080. Strata nello stesso banco raggiunge10526/7150 MiB.3060=1579 MiB per Windows, esclusa da entrambi. RAM disponibile minima67,45 GiB nei B,65,91 GiB in A. I clock sono variabili e differiscono fra carichi; i range completi sono nel riepilogo e nelle curve. Nessun blocco clock, build o altra generazione concorrente. La pipeline llama viene disabilitata automaticamente in entrambi i B; questi numeri descrivono le configurazioni effettivamente caricabili, non un limite teorico di llama o delle GPU. Non misurati200 t/s né vantaggi MTP in questa baseline.
+
+### Stato finale di questa verifica
+
+Sorgente su main: kernel QKV verificato `6ff2e48e8`; esperimenti controller precision rimossi e recuperabili dai rispettivi snapshot. Il banco Strata accetta ora anche chunk16/32, mantenendo64 come default; sette test Python passati. Nessuna PR o messaggio esterno inviato.
+
+Server riavviato come processo separato nascosto, tramite `Start-Process`, su `http://127.0.0.1:8100`, preset nuovo `D:/ds4_work/inkling2/config/inkling-dual-qkv-graph.json`. Usa il binario immutabile QKV `0dc78e64`, chunk64, capacità262144, Q8, core+outer graph, MTP spento. Il precedente preset outer graph è conservato. Health conferma `loaded=true`; richiesta HTTP con limite256 si arresta naturalmente con `Roma`,36 token input e69 output,1,900 s completi: smoke funzionale, non benchmark breve. PID e log in `runs/20261121-http-qkv-graph-operational/launch.json`, esito in `verified.json`. Il server foreground precedentemente osservato alle10:42 non era più presente al controllo iniziale di questa fase; causa non accertata. Daily Qwen e gateway8787 invariati.

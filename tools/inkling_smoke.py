@@ -280,7 +280,7 @@ def arguments(argv=None):
     parser.add_argument("--max-new", type=int, choices=(32, 64, 128, 256, 512, 1000), default=128)
     parser.add_argument("--lengths", type=int, nargs="+", choices=(128, 256, 512, 1000),
                         help="Output lengths to run in sequence without reloading the model")
-    parser.add_argument("--chunk", type=int, choices=(1, 64), default=64,
+    parser.add_argument("--chunk", type=int, choices=(1, 16, 32, 64), default=64,
                         help="1 isolates decode parity from architecture-dependent batched prefill")
     parser.add_argument("--seed", type=int, default=20261121)
     parser.add_argument("--greedy", action="store_true", help="Explicit temperature=0 parity run; still recorded as greedy")
