@@ -1543,6 +1543,12 @@ struct Engine {
         CK(cudaEventRecord(r.input_ready, st));
         // Record each generation before issuing its cross-device wait. The primary tail
         // consumes the return slot before the next input_ready lets remote reuse it.
+        if (L.n_slots) {
+            k_group_experts<<<1,128,0,st>>>(ids, L.d_slot_of, L.d_blobs, L.stride, entries, ne, L.n_slots,
+                grp_ptr, grp_start, n_groups, ent_dst, ent_tok, top);
+            K::native_expert_grouped(L.L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok,
+                std::min(entries, ne), entries, xq, escr, eparts, st);
+        }
         { DeviceScope remote(r.device);
           CK(cudaStreamWaitEvent(r.stream, r.input_ready, 0));
           CK(cudaMemcpyAsync(r.ids, r.host_ids, (size_t) entries * sizeof(int32_t), cudaMemcpyHostToDevice, r.stream));
@@ -1553,12 +1559,6 @@ struct Engine {
               std::min(entries, ne), entries, r.xq, r.scratch, r.parts, r.stream);
           CK(cudaMemcpyAsync(r.host_parts, r.parts, pbytes, cudaMemcpyDeviceToHost, r.stream));
           CK(cudaEventRecord(r.remote_done, r.stream)); }
-        if (L.n_slots) {
-            k_group_experts<<<1,128,0,st>>>(ids, L.d_slot_of, L.d_blobs, L.stride, entries, ne, L.n_slots,
-                grp_ptr, grp_start, n_groups, ent_dst, ent_tok, top);
-            K::native_expert_grouped(L.L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok,
-                std::min(entries, ne), entries, xq, escr, eparts, st);
-        }
         CK(cudaStreamWaitEvent(st, r.remote_done, 0));
         CK(cudaMemcpyAsync(r.local_parts, r.host_parts, pbytes, cudaMemcpyHostToDevice, st));
         k_merge_cpu<<<(unsigned) entries,kThreads,0,st>>>(eparts, r.local_parts, r.local_miss, N);
