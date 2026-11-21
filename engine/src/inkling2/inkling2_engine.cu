@@ -30,6 +30,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <filesystem>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -852,10 +853,23 @@ struct Engine {
     cudaGraphExec_t core_graph = nullptr;
     cudaGraphExec_t capture_core_graph = nullptr;  // T=1 with DSpark feature taps
     cudaGraphExec_t verify_core_graph = nullptr;   // fixed verify_max_t, feature taps and conv trace
+    cudaGraphExec_t outer_graph[2] = {};          // no-draft T=1 prefix / suffix, head excluded
+    bool outer_graph_failed[2] = {};
     std::vector<cudaGraphExec_t> layer_pre_graph;
     bool core_all_gpu = false;
     bool split_core_graph = false;     // opt-in for the Core runtime; All keeps its existing graph policy
+    bool split_outer_graph = false;
+    bool outer_graph_profile_block = false;
     bool graph_oom = false;
+
+    bool outer_graph_eligible() const {
+        if (role != Role::Outer || !split_peer || dspark || outer_graph_profile_block || prof || prof_detail) return false;
+        for (int ip = 0; ip < m->hp.n_phys; ++ip) if (owns_phys(ip)) {
+            const auto& layer = m->layers[(size_t) ip];
+            if (layer.device != device || layer.n_slots != m->hp.n_expert) return false;
+        }
+        return true;
+    }
 
     // Prefix cache checkpoint (stores conv_hist + circular SWA KV state in host RAM; full-attn KV stays append-only on GPU)
     struct StateCheckpoint {
@@ -953,6 +967,7 @@ struct Engine {
         if (core_graph) cudaGraphExecDestroy(core_graph);
         if (capture_core_graph) cudaGraphExecDestroy(capture_core_graph);
         if (verify_core_graph) cudaGraphExecDestroy(verify_core_graph);
+        for (auto graph : outer_graph) if (graph) cudaGraphExecDestroy(graph);
         for (auto g : layer_pre_graph) if (g) cudaGraphExecDestroy(g);
         for (auto* p : kc) cudaFree(p);
         for (auto* p : vc) cudaFree(p);
@@ -1926,6 +1941,69 @@ struct Engine {
             if (pp_streaming) pp_begin(core_end_virt, core_all_gpu ? 1 : 0);
             state.pp_prepared = true;
         }
+        // Both ranges use the unchanged layer kernels. Copies, position/token updates,
+        // the cross-device handoff and the output head remain outside these graphs.
+        const int outer_range = first_layer == 0 && end_layer == hp.core_start ? 0 :
+                                first_layer == core_end_virt && end_layer == hp.n_layer ? 1 : -1;
+        if (split_outer_graph && T == 1 && outer_range >= 0 && !state.capture_dspark &&
+            !save_conv_trace && outer_graph_eligible()) {
+            const std::vector<float*> expected_in = outer_range == 0 ? std::vector<float*>{} :
+                                                    std::vector<float*>{norm_blk_buf[0], norm_blk_buf[5], norm_blk_buf[6]};
+            const std::vector<float*> expected_out = outer_range == 0 ? std::vector<float*>{norm_blk_buf[0]} :
+                std::vector<float*>{norm_blk_buf[0], norm_blk_buf[5], norm_blk_buf[6], norm_blk_buf[7]};
+            const int next_in = outer_range == 0 ? 0 : 7, next_out = outer_range == 0 ? 1 : 8;
+            if (norm_blocks == expected_in && next_blk_buf == next_in) {
+                auto& graph = outer_graph[outer_range];
+                if (!graph && !outer_graph_failed[outer_range]) {
+                    const ForwardState saved_state = state;
+                    const int64_t saved_hits = hy_gpu, saved_misses = hy_cpu;
+                    const double saved_cpu_ms = hy_cpu_ms;
+                    cudaGraph_t captured = nullptr;
+                    cudaGraphExec_t candidate = nullptr;
+                    cudaError_t status = cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal);
+                    if (status == cudaSuccess) {
+                        for (int il = first_layer; il < end_layer; ++il) {
+                            run_layer_pre(il);
+                            run_layer_post(il);
+                        }
+                        status = cudaStreamEndCapture(st, &captured);
+                    }
+                    if (status == cudaSuccess && (!captured || norm_blocks != expected_out || next_blk_buf != next_out))
+                        status = cudaErrorInvalidValue;
+                    if (status == cudaSuccess && captured)
+                        status = cudaGraphInstantiate(&candidate, captured, nullptr, nullptr, 0);
+                    if (captured) cudaGraphDestroy(captured);
+                    // Capture only records device work, but its host calls advance these
+                    // fields. Undo them before either the first launch or eager fallback.
+                    state = saved_state;
+                    hy_gpu = saved_hits; hy_cpu = saved_misses; hy_cpu_ms = saved_cpu_ms;
+                    if (status == cudaSuccess && candidate) {
+                        graph = candidate;
+                    } else {
+                        if (candidate) cudaGraphExecDestroy(candidate);
+                        outer_graph_failed[outer_range] = true;
+                        (void) cudaGetLastError();
+                        std::fprintf(stderr, "strata-inkling2: outer %s graph capture/instantiate failed on device %d: %s; using eager range\n",
+                                     outer_range == 0 ? "prefix" : "suffix", device, cudaGetErrorString(status));
+                    }
+                }
+                if (graph) {
+                    // A launch error is surfaced: after execution may have started, replaying
+                    // eager could apply the recurrent updates twice and is not a safe fallback.
+                    const cudaError_t status = cudaGraphLaunch(graph, st);
+                    if (status != cudaSuccess)
+                        std::fprintf(stderr, "strata-inkling2: outer %s graph launch failed on device %d: %s\n",
+                                     outer_range == 0 ? "prefix" : "suffix", device, cudaGetErrorString(status));
+                    CK(status);
+                    norm_blocks = expected_out;
+                    next_blk_buf = next_out;
+                    // Six all-resident layers x top-8 = 48 lookups, counted once on
+                    // the first successful launch as well as on every replay.
+                    hy_gpu += (int64_t) (end_layer - first_layer) * hp.n_expert_used;
+                    return;
+                }
+            }
+        }
         for (int il = first_layer; il < end_layer; ++il) {
             if (!owns_virtual(il)) {
                 std::fprintf(stderr, "strata-inkling2: virtual layer %d belongs to the other split runtime\n", il);
@@ -2597,6 +2675,7 @@ int run(int argc, char** argv) {
     int cpu_threads = 0;
     int layer_split_device = -1;
     bool split_core_graph = false;
+    bool split_outer_graph = false;
     double expert_vram = -1.0;
     bool serve = false;
     bool bench = false;
@@ -2636,6 +2715,7 @@ int run(int argc, char** argv) {
             layer_split_device = (int) value;
         }
         else if (a == "--split-core-graph") split_core_graph = true;
+        else if (a == "--split-outer-graph") split_outer_graph = true;
         else if (a == "--kv-f16") kv_q8 = false;
         else if (a == "--kv-q8") kv_q8 = true;
         else if (a == "--serve") serve = true;
@@ -2645,12 +2725,15 @@ int run(int argc, char** argv) {
     }
 
     if (model_path.empty()) {
-        std::fprintf(stderr, "usage: strata-inkling2 --model <file.gguf> [--max-context N] [--kv-q8|--kv-f16] [--tokens IDS] [--max-new N] [--dump-logits PATH] [--layer-split-device N [--split-core-graph]] [--draft DRAFT.gguf --spec K] [--bench] [--serve]\n");
+        std::fprintf(stderr, "usage: strata-inkling2 --model <file.gguf> [--max-context N] [--kv-q8|--kv-f16] [--tokens IDS] [--max-new N] [--dump-logits PATH] [--layer-split-device N [--split-core-graph] [--split-outer-graph]] [--draft DRAFT.gguf --spec K] [--bench] [--serve]\n");
         return 2;
     }
     if (split_core_graph && layer_split_device < 0) {
         std::fprintf(stderr, "strata-inkling2: --split-core-graph requires --layer-split-device N\n");
         return 2;
+    }
+    if (split_outer_graph && layer_split_device < 0) {
+        std::fprintf(stderr, "strata-inkling2: --split-outer-graph requires --layer-split-device N\n"); return 2;
     }
 
     if (oracle_tail.empty() && oracle_force_t1 != 0) {
@@ -2691,6 +2774,8 @@ int run(int argc, char** argv) {
     Engine E;
     E.device = m.main_device;
     E.role = layer_split_device >= 0 ? Engine::Role::Outer : Engine::Role::All;
+    E.split_outer_graph = split_outer_graph;
+    E.outer_graph_profile_block = profile || profile_detail;
     if (!E.init(m, max_ctx, runtime_t, kv_q8, err, verify_t, dm && dm->has_quant_dense, dm ? dm->hp.n_ff : 0)) {
         std::fprintf(stderr, "strata-inkling2: engine init failed: %s\n", err.c_str());
         return 1;
@@ -2731,6 +2816,9 @@ int run(int argc, char** argv) {
         return 1;
     }
     if (split_core) {
+        if (split_outer_graph)
+            std::fprintf(stderr, "strata-inkling2: split outer graph requested=1 eligible=%d (T=1, no draft/capture/trace/profile, all outer experts resident; head excluded)\n",
+                         (int) E.outer_graph_eligible());
         std::fprintf(stderr, "strata-inkling2: split core graph requested=%d eligible=%d (T=1, fully resident core, profile-detail off)\n",
                      (int) split_core_graph, (int) (split_core_graph && split_core->core_all_gpu && !profile_detail));
         size_t total = 0;

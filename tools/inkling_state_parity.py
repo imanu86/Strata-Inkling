@@ -26,6 +26,7 @@ def arguments(argv=None):
     parser.add_argument("--gpu-uuid", required=True)
     parser.add_argument("--core-gpu-uuid", help="Optional explicit split core UUID; may equal the primary UUID")
     parser.add_argument("--split-core-graph", action="store_true")
+    parser.add_argument("--split-outer-graph", action="store_true")
     parser.add_argument("--artifact-dir", type=Path, required=True)
     parser.add_argument("--exe", type=Path, default=ROOT / "build-windows-inkling/strata-inkling2.exe")
     parser.add_argument("--model", type=Path, default=Path("D:/ds4_work/inkling2/models/Inkling-2-Mini-UD-Q3_K_XL.gguf"))
@@ -43,8 +44,8 @@ def arguments(argv=None):
         value = getattr(args, name)
         if value is not None and not GPU_UUID.fullmatch(value):
             parser.error(f"--{name.replace('_', '-')} requires a full GPU UUID, never an index")
-    if args.split_core_graph and args.core_gpu_uuid is None:
-        parser.error("--split-core-graph requires --core-gpu-uuid")
+    if (args.split_core_graph or args.split_outer_graph) and args.core_gpu_uuid is None:
+        parser.error("split graphs require --core-gpu-uuid")
     if not 0 < args.seed <= 2 ** 64 - 1:
         parser.error("--seed must be in 1..2^64-1")
     if args.expert_vram is not None and (not math.isfinite(args.expert_vram) or args.expert_vram < 0):
@@ -145,6 +146,7 @@ def main(argv=None):
               "speculation": {"enabled": args.draft is not None, "draft_max": args.spec if args.draft else 0},
               "sampling": {"temperature": 0, "top_p": 1, "top_k": 0, "min_p": 0, "seed": args.seed},
               "gpu_uuid": args.gpu_uuid, "core_gpu_uuid": args.core_gpu_uuid, "split_core_graph": args.split_core_graph,
+              "split_outer_graph": args.split_outer_graph,
               "processes": [], "scope": "Native RAM checkpoint/restore and shorter-prompt reset; not an SSD cache test."}
     try:
         report["files"] = {"exe": file_record(args.exe, True), "model": file_record(args.model),

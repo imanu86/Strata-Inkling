@@ -267,6 +267,7 @@ def arguments(argv=None):
     parser.add_argument("--gpu-uuid", required=True, help="Full GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx UUID; never an index")
     parser.add_argument("--core-gpu-uuid", help="Enable layer split; the same UUID selects same-device parity")
     parser.add_argument("--split-core-graph", action="store_true", help="Use the opt-in split core decode graph")
+    parser.add_argument("--split-outer-graph", action="store_true", help="Use the opt-in outer decode graphs")
     parser.add_argument("--artifact-dir", type=Path, required=True, help="Directory with no existing smoke artifact files")
     parser.add_argument("--exe", type=Path, default=ROOT / "build-windows-inkling/strata-inkling2.exe")
     parser.add_argument("--model", type=Path, default=Path("D:/ds4_work/inkling2/models/Inkling-2-Mini-UD-Q3_K_XL.gguf"))
@@ -293,8 +294,8 @@ def arguments(argv=None):
         parser.error("--gpu-uuid must be a full GPU UUID, not a CUDA/nvidia-smi index")
     if args.core_gpu_uuid is not None and not GPU_UUID.fullmatch(args.core_gpu_uuid):
         parser.error("--core-gpu-uuid must be a full GPU UUID, not an index")
-    if args.split_core_graph and args.core_gpu_uuid is None:
-        parser.error("--split-core-graph requires --core-gpu-uuid")
+    if (args.split_core_graph or args.split_outer_graph) and args.core_gpu_uuid is None:
+        parser.error("split graphs require --core-gpu-uuid")
     if args.seed <= 0 or args.seed > 2 ** 64 - 1:
         parser.error("--seed must be an integer in 1..2^64-1")
     if args.expert_vram is not None and (not math.isfinite(args.expert_vram) or args.expert_vram < 0):
@@ -313,6 +314,8 @@ def device_selection(args):
         split_args = ["--layer-split-device", str(visible.index(args.core_gpu_uuid))]
         if args.split_core_graph:
             split_args.append("--split-core-graph")
+        if getattr(args, "split_outer_graph", False):
+            split_args.append("--split-outer-graph")
     return ",".join(visible), split_args
 
 
