@@ -723,7 +723,46 @@ bool load_model(const std::string& path, Model& m, std::string& err) {
     return true;
 }
 
+// Full-vocabulary temperature-one sampling. Softcapped logits are bounded
+// by an explicitly checked positive cap <=80; expf remains finite.
+// Accumulate in FP64 and draw one uniform from the existing host RNG.
+__global__ void full_vocab_tile_mass(const float *logits, double *mass, int vocab) {
+    __shared__ double partial[256];
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    partial[threadIdx.x] = i < vocab ? (double)expf(logits[i]) : 0.0;
+    __syncthreads();
+    for (int step = 128; step; step >>= 1) {
+        if (threadIdx.x < step)
+            partial[threadIdx.x] += partial[threadIdx.x + step];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0)
+        mass[blockIdx.x] = partial[0];
+}
+
+__global__ void full_vocab_pick(const float *logits, const double *mass, int32_t *pick, int vocab, int tiles, double u) {
+    // One thread selects a tile. Only its 256 probabilities are revisited.
+    double total = 0.0;
+    for (int t = 0; t < tiles; ++t)
+        total += mass[t];
+    double cut = u * total, before = 0.0;
+    int t = 0;
+    for (; t + 1 < tiles && before + mass[t] < cut; ++t)
+        before += mass[t];
+    int begin = t * 256, end = min(begin + 256, vocab);
+    for (int i = begin; i < end; ++i) {
+        before += (double)expf(logits[i]);
+        if (before >= cut) {
+            *pick = i;
+            return;
+        }
+    }
+    *pick = end - 1;
+}
+
 struct Engine {
+    double *sampling_mass = nullptr;
+    double sample_u = -1.0;
     Model* m = nullptr;
     enum class Role { All, Outer, Core };
     Role role = Role::All;
@@ -1085,6 +1124,7 @@ struct Engine {
         cudaFree(logits); cudaFree(act_bf16);
         cudaFree(xq); cudaFree(xq_k); cudaFree(xq_v); cudaFree(escr);
         cudaFree(ids); cudaFree(grp_start); cudaFree(n_groups); cudaFree(ent_dst); cudaFree(ent_tok); cudaFree(grp_ptr);
+        cudaFree(sampling_mass);
         cudaFree(tok_d); cudaFree(pos0_d); cudaFree(pick_d);
         cudaFree(d_miss); cudaFree(ecpu);
         cudaFreeHost(h_tok_buf);
@@ -2361,7 +2401,13 @@ struct Engine {
         project(head_h, m->output_weight, logits, rows, hp.vocab_unpadded, N);
         const int64_t total_logits = (int64_t) rows * hp.vocab_unpadded;
         k_softcap<<<(unsigned) ((total_logits + 255) / 256), 256, 0, st>>>(logits, total_logits, hp.softcap);
-        k_argmax<<<(unsigned) rows, 256, 0, st>>>(logits, pick_d, (int) hp.vocab_unpadded);
+        if (sample_u >= 0.0 && rows == 1) {
+            const int tiles = ((int)hp.vocab_unpadded + 255) / 256;
+            full_vocab_tile_mass<<<tiles, 256, 0, st>>>(logits, sampling_mass, hp.vocab_unpadded);
+            full_vocab_pick<<<1, 1, 0, st>>>(logits, sampling_mass, pick_d, hp.vocab_unpadded, tiles, sample_u);
+        } else {
+            k_argmax<<<(unsigned)rows, 256, 0, st>>>(logits, pick_d, (int)hp.vocab_unpadded);
+        }
         std::vector<int32_t> picks((size_t) rows);
         if (copy_logits && out_logits) {
             out_logits->resize((size_t) total_logits);
@@ -3016,6 +3062,7 @@ int run(int argc, char** argv) {
     int chunk = 256;
     int max_new = 32;
     int cpu_threads = 0;
+    bool gpu_full_vocab = false;
     int layer_split_device = -1;
     int expert_replica_device = -1, expert_dense_device = -1;
     int expert_hot_mib = 4096;
@@ -3073,6 +3120,7 @@ int run(int argc, char** argv) {
             }
             layer_split_device = (int) value;
         }
+        else if (a == "--gpu-full-vocab") gpu_full_vocab = true;
         else if (a == "--split-core-graph") split_core_graph = true;
         else if (a == "--split-outer-graph") split_outer_graph = true;
         else if (a == "--batch-qkv-control-t1") batch_qkv_control_t1 = true;
@@ -3085,7 +3133,7 @@ int run(int argc, char** argv) {
     }
 
     if (model_path.empty()) {
-        std::fprintf(stderr, "usage: strata-inkling2 --model <file.gguf> [--max-context N] [--kv-q8|--kv-f16] [--tokens IDS] [--max-new N] [--dump-logits PATH] [--layer-split-device N [--split-core-graph] [--split-outer-graph]] [--batch-qkv-control-t1] [--expert-dense-device N --expert-replica-device N --expert-hot-mib MiB [--expert-replica-async]] [--draft DRAFT.gguf --spec K] [--bench] [--serve]\n");
+        std::fprintf(stderr, "usage: strata-inkling2 --model <file.gguf> [--max-context N] [--kv-q8|--kv-f16] [--tokens IDS] [--max-new N] [--dump-logits PATH] [--layer-split-device N [--split-core-graph] [--split-outer-graph]] [--batch-qkv-control-t1] [--gpu-full-vocab] [--expert-dense-device N --expert-replica-device N --expert-hot-mib MiB [--expert-replica-async]] [--draft DRAFT.gguf --spec K] [--bench] [--serve]\n");
         return 2;
     }
     if (split_core_graph && layer_split_device < 0) {
@@ -3154,6 +3202,10 @@ int run(int argc, char** argv) {
     if (!E.init(m, max_ctx, runtime_t, kv_q8, err, verify_t, dm && dm->has_quant_dense, dm ? dm->hp.n_ff : 0)) {
         std::fprintf(stderr, "strata-inkling2: engine init failed: %s\n", err.c_str());
         return 1;
+    }
+    if (gpu_full_vocab) {
+        DeviceScope scope(E.device);
+        CK(cudaMalloc(&E.sampling_mass, ((m.hp.vocab_unpadded + 255) / 256) * sizeof(double)));
     }
     std::unique_ptr<Engine> split_core;
     if (layer_split_device >= 0) {
@@ -3425,9 +3477,16 @@ int run(int argc, char** argv) {
                         }
                         if (step + 1 < limit) {
                             const int32_t fed = next_tok;
-                            next_tok = E.forward(&fed, 1, sample_on, &lg);
+                            const bool device_sample = gpu_full_vocab && m.hp.softcap > 0.0f && m.hp.softcap <= 80.0f && smp.temp == 1.0f &&
+                                                       smp.top_k == 0 && smp.top_p == 1.0f && smp.min_p == 0.0f && smp.rep_pen == 1.0f &&
+                                                       smp.pres_pen == 0.0f && smp.freq_pen == 0.0f;
+                            if (device_sample)
+                                E.sample_u = std::uniform_real_distribution<double>(0.0, 1.0)(rng);
+                            next_tok = E.forward(&fed, 1, sample_on && !device_sample, &lg);
+                            E.sample_u = -1.0;
                             live_tokens.push_back(fed);
-                            if (sample_on) next_tok = sample_logits(lg, hist, smp, rng);
+                            if (sample_on && !device_sample)
+                                next_tok = sample_logits(lg, hist, smp, rng);
                             if (E.any_hybrid() && (step % 8 == 7)) E.rebalance(E.core_all_gpu ? 4 : 6);
                         }
                     }

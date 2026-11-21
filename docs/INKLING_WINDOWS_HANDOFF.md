@@ -436,3 +436,20 @@ L'owner ha proposto UD-IQ3_XXS e KV o MTP sulla2080. UD-IQ3_XXS pesa11,66GB su d
 Audit del vero Daily `kv_stream`: il target Qwen conserva laKV completa in RAM pinned e usa cache VRAM CLOCK delle pagine selezionate dall'indexer QSA; il drafter usa un ring della propria finestra. Config Daily:262144/int8/kv-resident32768, log3,09GiB pinned e circa396MiB di payload cacheQSA. Non è uno streamingSSD. Inkling ha full attention senza quell'indexer: un cache-ring host non evita di leggere tutta laKV delle8 visite full. Non trasferire il beneficio Qwen a Inkling senza una diversa implementazione e misura.
 
 La candidata architettura KV remota mantiene sulla2080 laKV delle8 full attention e ne esegue lì il calcolo; proiezioni, controller, MoE e40SWA rimangono sulla3080. Stima da forme esistenti:373.504byte di attivazioni andata/ritorno per token, circa729,5KiB contando entrambi i passaggi del relay pinned. Traffico indipendente dalla lunghezza del contesto, ma8 dipendenze round-trip. Serve nuovo codice per ownership KV, stato/checkpoint e graph per segmenti o multidevice. Non implementata né misurata; non è sufficiente spostare un puntatore o abilitare i graph della replica eager.
+
+
+### 21 novembre, campionamento GPU a vocabolario completo
+
+Nel protocollo nativo AR il flag `--gpu-full-vocab` estrae il token sulla GPU della head dopo il primo token della risposta. Con il preset T1/P1/K0/minP0 e penalità neutre evita la copia di 200.058 logits e il calcolo delle probabilità sulla CPU a ogni passo. Il seed e il generatore casuale sono quelli del server. Il primo token usa ancora il sampler CPU. Gli altri parametri di campionamento e DSpark seguono i percorsi esistenti. La somma parallela ha un ordine diverso dalla CPU, quindi la parità va riferita alle prove eseguite.
+
+Banco del 21 novembre su Q3_K_XL. Il confronto cambia un solo flag nello stesso binario, con 2080 Ti outer/head, 3080 Ti core, capacità 262.144, KV Q8, chunk64, MTP spento e seed 20261121. Ogni richiesta misurata legge da zero i 99 ID canonici dopo un warmup distinto. Decode calcolato come (output − 1) / secondi di decode. Tempi completi dal protocollo nativo.
+
+| Output | GPU B1, t/s | CPU A, t/s | GPU B2, t/s | Variazione media dei B su A | Secondi completi B1 / A / B2 |
+|---:|---:|---:|---:|---:|---:|
+| 128 | 83,51 | 77,77 | 84,30 | +7,9% | 1,828 / 1,969 / 1,828 |
+| 512 | 82,63 | 74,75 | 82,99 | +10,8% | 6,468 / 7,141 / 6,438 |
+| 1.000 | 79,06 | 71,53 | 78,59 | +10,2% | 12,938 / 14,281 / 13,000 |
+
+Tutti gli ID coincidono fra i tre passaggi a ciascuna lunghezza. Altri due seed, 20261122 e 20261123, coincidono per tutti i 128 token confrontati. I numeri descrivono questa singola chat, con una sola misura A. Report e log locali nella cartella `D:/ds4_work/inkling2/astra-placement-bench`, riepilogo `sampler-bab-summary.json`.
+
+Preset locale pronto in `D:/ds4_work/inkling2/config/inkling-dual-qkv-gpu-sampler.json`. Build CUDA 12.6 SM75/SM86 del solo sampler in `builds/full-vocab-0eb965c1/strata-inkling2.exe`, SHA256 `0eb965c15c47570c62fe29d90bf9710e318d6a649f723c8e920f521a393187af`.
