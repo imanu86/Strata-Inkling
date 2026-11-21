@@ -181,7 +181,7 @@ Oracolo `20261121-dspark-row0-oracle`: ricostruito il prefisso con1100 input a c
 
 Commit `2a6825a1e`, flag opzionale `--split-outer-graph`, solo split a T1 senza draft e con tutti gli esperti esterni residenti. Cattura visite0..5 e42..47; head, embedding, aggiornamento posizione e trasferimenti fra GPU restano fuori. Il preset precedente non attiva il flag automaticamente.
 
-Binario testato: `D:\ds4_work\inkling2\builds\outer-graph-eb41ea7f\strata-inkling2.exe`, SHA256 `eb41ea7f38cd74a046255f579613a17b039b0ed406f725651945e76502de65ee`. Logits200058 bit-identici al riferimento dual corretto sia chunk1 sia64, quattro token greedy identici (`20261121-outer-graph-parity`). Warm/cold/reset con128 output massimi passa (`20261121-outer-graph-state`). Preparato preset `D:\ds4_work\inkling2\config\inkling-dual-outer-graph.json`, con questo binario, capacità256K, KV Q8 e MTP spento; server ancora fermo durante la diagnosi MTP. Non confondere la preparazione del preset con un'avvenuta verifica HTTP.
+Binario testato: `D:\ds4_work\inkling2\builds\outer-graph-eb41ea7f\strata-inkling2.exe`, SHA256 `eb41ea7f38cd74a046255f579613a17b039b0ed406f725651945e76502de65ee`. Logits200058 bit-identici al riferimento dual corretto sia chunk1 sia64, quattro token greedy identici (`20261121-outer-graph-parity`). Warm/cold/reset con128 output massimi passa (`20261121-outer-graph-state`). Preset `D:\ds4_work\inkling2\config\inkling-dual-outer-graph.json`, con questo binario, capacità256K, KV Q8 e MTP spento. Dopo la diagnosi MTP il server è stato riavviato e verificato via HTTP; dettagli dello stato operativo in fondo.
 
 BAB senza profiler, stesso binario con flag acceso/spento, prompt99, chunk64, output128/512/1000, stesso sampler e seed:
 
@@ -215,3 +215,65 @@ Binario split immutabile, verifica HTTP dual, banco 128/512/1000 e contesti occu
 La ricostruzione della chat Claude precedente è in `C:\Users\imanu\Documents\Codex\2026-10-07\rip\work\TERRA_RIASSUNTO_SESSIONE_CLAUDE_STRATA_2026-11-21.md`. Il Daily a due server usava worker esperti persistenti, non due repliche HTTP. La versione a strati ripartiva prefill e decode; per Inkling occorre rispettare le 48 visite e il relativo stato KV, senza copiare alla cieca i meccanismi Qwen.
 
 Non sono state aperte PR né inviati messaggi esterni per questo lavoro.
+
+### Profilazione MTP completata e verifiche successive
+
+La cattura valida è `runs\20261121-nsys-dspark-python512`: Nsight avvia Python, che gestisce il protocollo del processo nativo figlio. `command.json` conserva il comando; `capture.nsys-rep`, `capture.sqlite`, `analysis.py/json/md` conservano traccia e analisi riproducibile. La richiesta512 produce gli stessi ID della baseline DSpark, con228 proposte accettate su843. Non usare i tempi sotto profiler come banco prestazionale: la traccia serve a ripartire il costo. La precedente cattura interattiva resta fallita.
+
+- Finestra decode12294,34 ms; verify target8887,3 ms, **72,29%**. GPU attiva in unione9280,85 ms; idle3013,5 ms.
+- Head delle843 proposte573,6 ms, **4,67%**. Il fold della head è quindi una priorità bassa, anche se risparmia banda.
+- DFlare438,8 ms; intervalli host dopo readback draft1262,0 ms e dopo verify805,4 ms. Senza stack CPU/NVTX non attribuire questi intervalli a una singola funzione.
+- Nei kernel verify: BF16 magma sulla2080 vale1193,16 ms/4512 chiamate; GU+DOWN NVFP4 sulla3080 valgono1515,19 ms. I MoE sono già raggruppati e processano più righe: non descrivere un nuovo kernel come introduzione del batching.
+- 282 round, con prefissi accettati `{0:145,1:74,2:35,3:28}`. Accettazione condizionata alla proposta raggiunta:48,58%,45,99%,44,44% rispettivamente. Non è corretto attribuire il problema soltanto al terzo token.1125 righe verificate per510 avanzamenti reali.
+
+Capture narrativa `mtp-research\capture-call400-pq-20261121`: pos742, tre proposte e logits P completi prima del commit. Le prime due proposte sono accettate; overlap P/Q99,58%,89,79%,4,08%. Alla terza, P assegna99,705% alla virgoletta tipografica `“`, Q soltanto3,928%; Q preferisce la virgoletta ASCII. È uno scarto ampio in quel punto, non un quasi pareggio numerico. La ricostruzione CPU locale con gli stessi input e pesi quantizzati riproduce gli stadi e la head; cambiare soltanto Q8_1 della head o rounding RNN ha effetto piccolo nei due campioni osservati. Questo non esclude differenze accumulate nell'intero draft.
+
+Completato l'oracolo con pesi draft BF16 ufficiali e matematica FP32. Commit diagnostico `e1b4fe46d`; build immutabile `builds\dspark-history-f857764b`, SHA256 `f857764baf46321b1385584fd4307a1bfe9de122bcac3dabf6fc8c7152b43405`. Build CUDA e CTest sampler passati. `INKLING2_DSPARK_DUMP_HISTORY=1`, insieme a prefix/call, conserva i quattro tap dei soli token committati; gap, limite4096 e restore senza history invalidano il replay. Il percorso normale non alloca né copia questa history.
+
+Capture `mtp-research\capture-call400-history-20261121`, raccolta in `runs\20261121-dspark-dump-call400-history`: tutti i1000 ID coincidono con il BAB corretto;306 accettati su2073 proposti. History completa742 righe, generazione1, errore0, quattro file da6838272 byte. I tempi della cattura diagnostica non sono benchmark.
+
+`mtp-research\dspark_full_cpu_oracle.py` ricostruisce tutte le KV e l'intera testa DFlare+RNN senza quantizzazione draft/KV. Anchor, feature target, ID precedenti e head target Q5_K restano fissati. Replay riuscito in7,03 s su8 thread CPU, CUDA non inizializzata. Le sette mask sono esattamente quelle ufficiali; ricalibrazione head nativa RMS1,13..1,33e-6 e TV≤4,84e-7.
+
+| Proposta | Overlap P/Q nativa | Overlap con pesi BF16 e calcolo FP32 |
+|---:|---:|---:|
+|0|99,575944%|99,576083%|
+|1|89,786025%|89,779205%|
+|2|4,080842%|4,357531%|
+
+Gli argmax delle tre Q non cambiano. La terza proposta recupera solo0,277 punti percentuali: eliminare la quantizzazione draft/KV non risolve questo rifiuto. La differenza accumulata degli output DFlare arriva a0,942% L2, dell'hidden normalizzato a1,690%. È una controprova controllata locale, **non** parità con un runtime BF16 ufficiale e non un tasso di accettazione dell'intera corsa. La precisione del target e delle sue feature resta fuori dal confronto. Rapporti e logits controfattuali sono nella capture, con nomi `full-fp32-bf16-weights-oracle.json` e `.q.f32`.
+
+Due tentativi completati, entrambi sperimentali e non promossi:
+
+| Output | BF16 GEMV per riga B1 / A / B2 | Spec1 B1 / spec3 A / spec1 B2 |
+|---:|---:|---:|
+|128|53,68 /46,02 /50,49 t/s|47,11 /47,42 /49,52 t/s|
+|512|38,97 /40,59 /38,50 t/s|39,24 /40,54 /39,45 t/s|
+|1000|29,42 /30,94 /29,06 t/s|33,77 /31,07 /33,79 t/s|
+
+Artefatti `20261121-sm75-row-gemv-bab-B1/A/B2` e `20261121-dspark-spec1-bab-B1/A/B2`. GEMV per riga cambia l'aritmetica del verify (input FP32 invece di arrotondato BF16) e il percorso generato: accettati71/212/271 contro68/228/306, quindi il delta temporale non isola soltanto il costo del kernel. Spec1 aiuta il solo punto1000 e resta sotto il percorso senza draft. B1/B2 sono ripetibili in entrambi i banchi, ma non producono gli stessi ID di A.
+
+Completato anche `20261121-sm75-multi-gemv-bab-B1/A/B2`, unico lancio GEMV con più righe:128=50,70/45,93/54,75;512=38,84/40,67/38,97;1000=29,70/31,03/29,79 t/s. B1/B2 e la variante per riga producono esattamente gli stessi ID. L'oracolo T2/4/8 dà le stesse metriche numeriche della variante per riga, senza migliorare la corrispondenza con T1. Anche questa variante perde sui test lunghi. Entrambi i flag BF16 e i relativi dispatch sono stati rimossi dal codice corrente; restano binari, patch e metadati nelle cartelle `builds\sm75-row-gemv-54716e4e` e `builds\sm75-multi-gemv-1026b00f`, senza perdere la riproducibilità.
+
+Analisi statica dei graph verify: il core alla larghezza massima è già catturato; routing MoE e scratch potrebbero supportare altri graph, ma l'intero budget verify non-kernel è circa815 ms su12294 ms. Eliminarlo idealmente tutto varrebbe circa+7,1% complessivo, prima dei costi inevitabili: non risolverebbe il divario osservato. Segnalazione di bookkeeping da approfondire: nel replay core gli incrementi host di `hy_gpu` della cattura non risultano compensati. Non usare quel contatore per dedurre un numero assoluto di operazioni GPU; non è una differenza dei logits.
+
+Upstream controllato fino a `602dbbc59179be8133d5468da77225df4fe176cd`, senza merge. Il nuovo WMMA FlashAttention e MoE BM64 richiedono T>=16, quindi non accelerano direttamente il verify T2/4/8. Il solo cambiamento `rel_table` otto righe/CTA raggiunge quel percorso; beneficio non ancora misurato. Per un futuro port prefill occorre preservare la correzione SWA, la scelta per-device e verificare i nuovi arrotondamenti FP16. Non importare automaticamente nuovi chunk o kernel sul presupposto che migliorino il decode.
+
+### Controllo separato in inglese e stato operativo
+
+Tradotta in inglese la stessa richiesta narrativa, senza sostituire il banco italiano. Prompt80 token, chunk64, capacità262144, output128/512/1000, T1/P1/K0/minP0, seed20261121. Stesso binario immutabile `dspark-history-f857764b` in B1/A/B2. B attiva DSpark spec3; A usa il percorso senza draft con core e outer graph. Il flag outer graph è richiesto in tutti i passaggi, ma il motore lo esclude esplicitamente con DSpark: si confrontano i preset utilizzabili, non un kernel isolato.
+
+| Output | B1 DSpark | A senza draft | B2 DSpark | Accettati / proposti nei B |
+|---:|---:|---:|---:|---:|
+|128|47,27 t/s|72,39 t/s|47,74 t/s|69 /169|
+|512|42,38 t/s|70,66 t/s|42,30 t/s|239 /810|
+|1000|38,88 t/s|67,90 t/s|38,88 t/s|448 /1649|
+
+Artefatti `20261121-dspark-english-bab-B1/A/B2`. Tutte le risposte raggiungono la lunghezza richiesta; B1/B2 hanno ID identici. L'inglese migliora il punto1000 rispetto all'italiano, ma DSpark resta nettamente più lento del percorso senza draft sullo stesso prompt. Non estendere questa conclusione a tutti i domini o a tutte le quantizzazioni.
+
+Telemetria dell'intera esecuzione, inclusi caricamento e generazione: nei B picco VRAM3080=10576 MiB e2080=8114 MiB; in A10546/7176 MiB.3060=1579 MiB per Windows. RAM disponibile almeno65,67 GiB; clock non bloccati (2080 fino a1905 MHz nei B,1380 in A). Nessuna compilazione, oracolo CPU pesante o altra generazione concorrente durante il BAB. Le curve complete sono nei rispettivi `telemetry.jsonl`.
+
+Alle10:42 locali del21 novembre avviato il server su `http://127.0.0.1:8100`, API `/v1`, dal preset `inkling-dual-outer-graph.json`. Core e outer graph entrambi eligible,3072/3072 esperti residenti,2080 outer/head e3080 core,3060 esclusa. MTP resta spento nel preset più veloce verificato; il supporto sperimentale e i relativi artefatti sono conservati. Daily Qwen e gateway8787 invariati.
+
+Verifica HTTP effettiva `20261121-http-outer-graph-verified.json`: richiesta con limite256, risposta finale `Roma`,69 token complessivi, `finish_reason=stop`,36 token input,1,745 s HTTP. È uno smoke funzionale con arresto naturale, non un benchmark da69 token. Il server espone capacità262144; non significa che siano stati misurati262144 token occupati. I contesti10/20/40K sopra sono misure precedenti all'ottimizzazione outer graph.
+
+Resta da isolare la causa dell'aderenza limitata del draft al target in questo carico; il replay completo esclude un grande recupero dalla sola rimozione della quantizzazione draft nel campione controllato. La precisione del target, le sue feature e la parità greedy T1/batch restano aperte. Non presentare l'MTP come accelerazione già ottenuta. Gli esperimenti BF16 perdenti sono rimossi dal codice corrente; nessuna PR o comunicazione esterna inviata.
