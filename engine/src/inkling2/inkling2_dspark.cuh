@@ -904,7 +904,7 @@ struct DsparkEngine {
     /// When `out_logits != nullptr` (`n_draft` rows of `vocab_unpadded`), uses `sample_fn(row_vec)` for each draft step.
     template <typename EngineT, typename SampleFn>
     void draft(EngineT& E, int32_t anchor, int n_draft, std::vector<int32_t>& out_tokens,
-               std::vector<std::vector<float>>* out_logits, SampleFn&& sample_fn) {
+               std::vector<std::vector<float>>* out_logits, SampleFn&& sample_fn, bool device_logits = false) {
         DeviceScope owner(device);
         const auto t0 = Clock::now();
         const auto& hp = dm->hp;
@@ -1033,10 +1033,12 @@ struct DsparkEngine {
                     E.logits, hp.vocab_unpadded, hp.softcap);
                 if (dump) snap(tag + ".logits", E.logits, 1, (int) hp.vocab_unpadded);
                 auto& row_lg = (*out_logits)[(size_t) i];
-                row_lg.resize((size_t) hp.vocab_unpadded);
-                CK(cudaMemcpyAsync(row_lg.data(), E.logits, (size_t) hp.vocab_unpadded * sizeof(float),
-                                   cudaMemcpyDeviceToHost, E.st));
-                CK(cudaStreamSynchronize(E.st));
+                if (!device_logits) {
+                    row_lg.resize((size_t) hp.vocab_unpadded);
+                    CK(cudaMemcpyAsync(row_lg.data(), E.logits, (size_t) hp.vocab_unpadded * sizeof(float),
+                                       cudaMemcpyDeviceToHost, E.st));
+                    CK(cudaStreamSynchronize(E.st));
+                }
                 prev_id = sample_fn(i, row_lg);
             } else {
                 if (dump) snap(tag + ".logits_raw", E.logits, 1, (int) hp.vocab_unpadded);

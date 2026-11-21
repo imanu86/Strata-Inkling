@@ -369,6 +369,75 @@ __global__ void k_mix_normed_4(NormMixPtrs ptrs, int D, const float* __restrict_
     }
 }
 
+// Two-pass depth mixing for short AR/verifier rows. Partial sums preserve the
+// original 256-thread block's per-thread float4 accumulation and XOR reduction.
+// Scratch layout: [row][query][state][8 original warps].
+__global__ void k_depth_mix_partials(NormMixPtrs ptrs, int D, const float* query,
+                                     const float* query_second, float* partials, int n_q, int N) {
+    static_assert(kThreads == 256);
+    const int warp = blockIdx.x, d = blockIdx.y;
+    const int q = blockIdx.z % n_q, row = blockIdx.z / n_q;
+    const int lane = threadIdx.x;
+    const float* qv = query_second ? (q < 2 ? query + (size_t) q * N : query_second + (size_t) (q - 2) * N)
+                                   : query + (size_t) q * N;
+    const float4* q4 = reinterpret_cast<const float4*>(qv);
+    const float4* s4 = reinterpret_cast<const float4*>(ptrs.p[d] + (size_t) row * N);
+    float dot = 0.0f;
+    for (int i = warp * 32 + lane; i < N / 4; i += kThreads) {
+        const float4 a = s4[i], b = q4[i];
+        dot += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+    }
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        dot += __shfl_xor_sync(0xffffffffu, dot, offset);
+    if (lane == 0)
+        partials[(((size_t) row * n_q + q) * D + d) * 8 + warp] = dot;
+}
+
+// One warp writes 128 consecutive channels; every writer reconstructs the same
+// lane-zero block sum, softmax order and per-state weighted float4 products.
+__global__ void k_depth_mix_rows(NormMixPtrs ptrs, int D, const float* partials,
+                                 MixOuts4 out, int n_q, int N, float inv_sqrt_n, int swa_broadcast) {
+    const int tile = blockIdx.x, q = blockIdx.y, row = blockIdx.z;
+    const int lane = threadIdx.x, i = tile * 32 + lane;
+    float weights[8];
+    for (int d = 0; d < D; ++d) {
+        float dot = lane < 8 ? partials[(((size_t) row * n_q + q) * D + d) * 8 + lane] : 0.0f;
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            dot += __shfl_xor_sync(0xffffffffu, dot, offset);
+        weights[d] = __shfl_sync(0xffffffffu, dot, 0) * inv_sqrt_n;
+    }
+    float maximum = -1e30f;
+    for (int d = 0; d < D; ++d)
+        if (weights[d] > maximum) maximum = weights[d];
+    float sum = 0.0f;
+    for (int d = 0; d < D; ++d) {
+        weights[d] = __expf(weights[d] - maximum);
+        sum += weights[d];
+    }
+    const float inverse = __fdividef(1.0f, sum);
+    for (int d = 0; d < D; ++d) weights[d] *= inverse;
+    if (i >= N / 4) return;
+    float ax = 0.0f, ay = 0.0f, az = 0.0f, aw = 0.0f;
+    for (int d = 0; d < D; ++d) {
+        const float4 value = reinterpret_cast<const float4*>(ptrs.p[d] + (size_t) row * N)[i];
+        const float weight = weights[d];
+        ax += weight * value.x;
+        ay += weight * value.y;
+        az += weight * value.z;
+        aw += weight * value.w;
+    }
+    const float4 value = make_float4(ax, ay, az, aw);
+    if (swa_broadcast) {
+        reinterpret_cast<float4*>(out.p[0] + (size_t) row * N)[i] = value;
+        reinterpret_cast<float4*>(out.p[1] + (size_t) row * N)[i] = value;
+        reinterpret_cast<float4*>(out.p[2] + (size_t) row * N)[i] = value;
+    } else {
+        reinterpret_cast<float4*>(out.p[q] + (size_t) row * N)[i] = value;
+    }
+}
+
 /// control prep: out2N[t][0..N-1] = rms_norm(cur[t]), out2N[t][N..2N-1] = rms_norm(msg[t]). grid(2, T), block 256.
 __global__ void k_control_prep(const float* __restrict__ cur, const float* __restrict__ msg,
                                float* __restrict__ out2N, int N, float eps) {
