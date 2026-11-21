@@ -1099,6 +1099,16 @@ def card_note(cfg: dict, env: dict) -> str | None:
     if cfg.get("backend") == "hip" or not gpu_list(cfg):
         return None
     mine = [x.strip() for x in str((env or {}).get("CUDA_VISIBLE_DEVICES", "")).split(",") if x.strip() != ""]
+    if cfg.get("arch") == "inkling2" and mine:
+        args = cfg.get("args") or []
+        split = [args[i + 1] for i, arg in enumerate(args[:-1]) if arg == "--layer-split-device"]
+        try:
+            core = int(split[-1]) if split else -1
+        except (TypeError, ValueError):
+            core = -1
+        if 0 <= core < len(mine):
+            return (f"[strata] Inkling split: GPU {mine[0]} / CUDA0 runs the outer layers and output head; "
+                    f"GPU {mine[core]} / CUDA{core} runs the repeated core layers (prefill and decode)")
     if not mine or mine == [str(i) for i in range(len(mine))]:
         return None
     names = [f"CUDA{i}" for i in range(len(mine))]
