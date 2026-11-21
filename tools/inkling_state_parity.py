@@ -29,6 +29,9 @@ def arguments(argv=None):
     parser.add_argument("--artifact-dir", type=Path, required=True)
     parser.add_argument("--exe", type=Path, default=ROOT / "build-windows-inkling/strata-inkling2.exe")
     parser.add_argument("--model", type=Path, default=Path("D:/ds4_work/inkling2/models/Inkling-2-Mini-UD-Q3_K_XL.gguf"))
+    parser.add_argument("--draft", type=Path)
+    parser.add_argument("--spec", type=int, choices=range(1, 8), default=3)
+    parser.add_argument("--max-new", type=int, choices=(32, 128, 256, 512, 1000), default=32)
     parser.add_argument("--tokenizer", type=Path, default=Path("D:/ds4_work/inkling2/models/tokenizer"))
     parser.add_argument("--seed", type=int, default=20261121)
     parser.add_argument("--load-timeout", type=bounded_seconds(180), default=180)
@@ -111,7 +114,10 @@ def run_process(command, env, directory, cases, inputs, tokenizer, args, record)
         for case, prompt in cases:
             run = {"case": case, "prompt": prompt}
             record["runs"].append(run)
-            session.generate(inputs[prompt]["input_token_ids"], 32, args.seed, args.generate_timeout, greedy=True, record=run)
+            session.generate(inputs[prompt]["input_token_ids"], args.max_new, args.seed, args.generate_timeout, greedy=True, record=run)
+            if args.draft:
+                run["done"]["decode_generated_tokens"] = run["done"].pop("decode_forward_steps", None)
+                run["done"]["decode_generated_tok_s"] = run["done"].pop("decode_forward_tok_s", None)
             run.update(output_channels(tokenizer, run["output_token_ids"]))
     finally:
         try:
@@ -135,7 +141,8 @@ def main(argv=None):
         raise SystemExit("artifact directory is not empty; choose a new directory")
     folder.mkdir(parents=True, exist_ok=True)
     report = {"schema": 1, "status": "preparing", "started": stamp(), "machine": platform.uname()._asdict(),
-              "capacity": CAPACITY, "chunk": 1, "kv": "q8", "effort": "none", "max_new": 32,
+              "capacity": CAPACITY, "chunk": 1, "kv": "q8", "effort": "none", "max_new": args.max_new,
+              "speculation": {"enabled": args.draft is not None, "draft_max": args.spec if args.draft else 0},
               "sampling": {"temperature": 0, "top_p": 1, "top_k": 0, "min_p": 0, "seed": args.seed},
               "gpu_uuid": args.gpu_uuid, "core_gpu_uuid": args.core_gpu_uuid, "split_core_graph": args.split_core_graph,
               "processes": [], "scope": "Native RAM checkpoint/restore and shorter-prompt reset; not an SSD cache test."}
@@ -150,6 +157,9 @@ def main(argv=None):
         report["timeouts_s"] = {"load": args.load_timeout, "generate": args.generate_timeout}
         command = [str(args.exe.resolve()), "--model", str(args.model.resolve()), "--serve", "--max-context", str(CAPACITY),
                    "--chunk", "1", "--kv-q8"]
+        if args.draft:
+            report["files"]["draft"] = file_record(args.draft, True)
+            command += ["--draft", str(args.draft.resolve()), "--spec", str(args.spec)]
         if args.expert_vram is not None:
             command += ["--expert-vram", str(args.expert_vram)]
         if args.cpu_threads is not None:

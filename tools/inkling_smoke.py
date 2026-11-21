@@ -270,6 +270,8 @@ def arguments(argv=None):
     parser.add_argument("--artifact-dir", type=Path, required=True, help="Directory with no existing smoke artifact files")
     parser.add_argument("--exe", type=Path, default=ROOT / "build-windows-inkling/strata-inkling2.exe")
     parser.add_argument("--model", type=Path, default=Path("D:/ds4_work/inkling2/models/Inkling-2-Mini-UD-Q3_K_XL.gguf"))
+    parser.add_argument("--draft", type=Path, help="Optional official DSpark GGUF; absent means no speculation")
+    parser.add_argument("--spec", type=int, choices=range(1, 8), default=3)
     parser.add_argument("--tokenizer", type=Path, default=Path("D:/ds4_work/inkling2/models/tokenizer"))
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
     parser.add_argument("--effort", choices=("none", "minimal", "low", "medium", "high", "xhigh", "max"), default="none")
@@ -325,7 +327,7 @@ def main(argv=None):
               "gpu_uuid": args.gpu_uuid, "core_gpu_uuid": args.core_gpu_uuid,
               "capacity": CAPACITY, "chunk": args.chunk, "kv": "q8", "runs": [],
               "measurement_notes": ["Timing fields come directly from native DONE, not request/HTTP wall time.",
-                                    "First token is sampled after prefill; decode performs generated-1 forwards.",
+                                    "First token comes from prefill; the decode rate counts generated-1 emitted tokens. With speculation this is not the forward count.",
                                     "Repeat is same-process RAM/resident-weight/KV reuse, not an SSD-cache benchmark.",
                                     "Native ram/file tier counters are placeholders; their zero values do not measure SSD reads."]}
     session = None
@@ -337,6 +339,9 @@ def main(argv=None):
         report["files"] = {"exe": file_record(args.exe, True), "model": file_record(args.model),
                            "tokenizer": file_record(args.tokenizer / "tokenizer.json", True),
                            "chat_template": file_record(args.tokenizer / "chat_template.jinja", True)}
+        report["speculation"] = {"enabled": args.draft is not None, "draft_max": args.spec if args.draft else 0}
+        if args.draft:
+            report["files"]["draft"] = file_record(args.draft, True)
         manifest = args.tokenizer / "source-manifest.json"
         if manifest.exists():
             report["tokenizer_source"] = json.loads(manifest.read_text(encoding="utf-8-sig"))
@@ -351,6 +356,8 @@ def main(argv=None):
         (folder / "input.json").write_text(json.dumps(report["input"], ensure_ascii=False, indent=2), encoding="utf-8")
         command = [str(args.exe.resolve()), "--model", str(args.model.resolve()), "--serve", "--max-context", str(CAPACITY),
                    "--chunk", str(args.chunk), "--kv-q8"]
+        if args.draft:
+            command += ["--draft", str(args.draft.resolve()), "--spec", str(args.spec)]
         if args.expert_vram is not None:
             command += ["--expert-vram", str(args.expert_vram)]
         if args.cpu_threads is not None:
@@ -392,6 +399,9 @@ def main(argv=None):
             record = {"index": index + 1, "requested_max_new": length}
             report["runs"].append(record)
             session.generate(ids, length, args.seed, args.generate_timeout, args.greedy, record)
+            if args.draft:
+                record["done"]["decode_generated_tokens"] = record["done"].pop("decode_forward_steps", None)
+                record["done"]["decode_generated_tok_s"] = record["done"].pop("decode_forward_tok_s", None)
             record.update(output_channels(tokenizer, record["output_token_ids"]))
         report["status"] = "ok"
     except (Exception, KeyboardInterrupt) as error:
