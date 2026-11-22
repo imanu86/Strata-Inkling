@@ -1,0 +1,23 @@
+--- a/bench/results/2026-09-30-community-rtx-5090/benchmark.py
++++ b/bench/results/2026-09-30-community-rtx-5090/benchmark.py
+@@ -33,8 +33,10 @@
+     tokens = [None] * len(vocab)
+     for token, number in vocab.items():
+         tokens[number] = token
++    tokenizer_config = json.loads((directory / "tokenizer.json").read_text(encoding="utf-8"))
+     tokenizer = Tokenizer(tokens, (directory / "merges.txt").read_text(encoding="utf-8").splitlines(),
+-                          json.loads((directory / "token_type.json").read_text(encoding="utf-8")))
++                          json.loads((directory / "token_type.json").read_text(encoding="utf-8")),
++                          tokenizer_config["pre"], tokenizer_config["special_ids"])
+     template = ChatTemplate(directory / "chat_template.jinja")
+     initial = get(args.url + "/v1/status")
+     (args.out / "initial-status.json").write_text(json.dumps(initial, indent=2) + "\n")
+@@ -47,6 +49,8 @@
+ 
+     def count(req):
+         messages, tools, kwargs = openai_to_messages(req)
++        if kwargs.get("enable_thinking") is False and "reasoning_effort" not in kwargs:
++            kwargs["reasoning_effort"] = "none"
+         return len(tokenizer.encode(template.render(messages, tools, **kwargs), parse_special=True))
+ 
+     def perform(label, req, expected=None):
