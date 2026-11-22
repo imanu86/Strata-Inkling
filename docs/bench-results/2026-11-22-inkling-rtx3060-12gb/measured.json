@@ -1,0 +1,144 @@
+{
+  "expert_budget": "auto",
+  "resident": 2176,
+  "total": 3072,
+  "expert_gib": 8.4,
+  "rows": [
+    {
+      "label": "tokens-20000-run-1",
+      "input": 20000,
+      "output": 256,
+      "reused": 0,
+      "prefill": 48.348135195503666,
+      "decode": 43.69241902395232,
+      "ttft": 413.77210390008986,
+      "http": 419.5757605000399,
+      "request_sha256": "094e342945ddc897bb6a3cdd6f72abb5987ecdfa269e8ea5dc87a1f1a34a5335",
+      "content": 0,
+      "reasoning_content": 924
+    },
+    {
+      "label": "tokens-40000-run-1",
+      "input": 40000,
+      "output": 256,
+      "reused": 0,
+      "prefill": 46.927821479246354,
+      "decode": 40.547132874221525,
+      "ttft": 852.5094834999181,
+      "http": 858.7729981999146,
+      "request_sha256": "0ec31880608dc121d67f372a067463d5023778f9f776c2bcff883114dd36201f",
+      "content": 0,
+      "reasoning_content": 904
+    }
+  ],
+  "short_code": {
+    "prefill": 51.77067115345817,
+    "decode": 48.13267772615214,
+    "http_or_native_s": 9.281000000075437,
+    "gen": 321
+  },
+  "checks": {
+    "passed": 305,
+    "total": 305,
+    "first_error": null
+  },
+  "probes": [
+    {
+      "budget": "7.0",
+      "code": {
+        "prefill": 35.67156975890216,
+        "decode": 43.03250029584844,
+        "http_or_native_s": 11.25,
+        "gen": 321
+      },
+      "checks": {
+        "passed": 305,
+        "total": 305,
+        "first_error": null
+      },
+      "screen": {
+        "prefill": 34.76114274541061,
+        "decode": 43.189933684747494,
+        "http_or_native_s": 32.39000000001397,
+        "gen": 128
+      }
+    },
+    {
+      "budget": "7.5",
+      "code": {
+        "prefill": 39.59392931901353,
+        "decode": 44.62162949824372,
+        "http_or_native_s": 10.608999999938533,
+        "gen": 321
+      },
+      "checks": {
+        "passed": 305,
+        "total": 305,
+        "first_error": null
+      },
+      "screen": {
+        "prefill": 38.53586300199641,
+        "decode": 44.208818789096085,
+        "http_or_native_s": 29.43799999996554,
+        "gen": 128
+      }
+    },
+    {
+      "budget": "8.0",
+      "code": {
+        "prefill": 44.44139454481882,
+        "decode": 46.26691091740055,
+        "http_or_native_s": 9.984000000054948,
+        "gen": 321
+      },
+      "checks": {
+        "passed": 305,
+        "total": 305,
+        "first_error": null
+      },
+      "screen": {
+        "prefill": 43.23763768801933,
+        "decode": 45.70679987619575,
+        "http_or_native_s": 26.469000000040978,
+        "gen": 128
+      }
+    },
+    {
+      "budget": "auto",
+      "code": {
+        "prefill": 51.77067115345817,
+        "decode": 48.13267772615214,
+        "http_or_native_s": 9.281000000075437,
+        "gen": 321
+      },
+      "checks": {
+        "passed": 305,
+        "total": 305,
+        "first_error": null
+      },
+      "screen": {
+        "prefill": 50.625026264204294,
+        "decode": 46.42118268014708,
+        "http_or_native_s": 22.96799999999348,
+        "gen": 128
+      }
+    }
+  ],
+  "vram_total_mib_samples": {
+    "NVIDIA GeForce RTX 3080 Ti": {
+      "n": 63,
+      "min": 0,
+      "max": 0
+    },
+    "NVIDIA GeForce RTX 3060": {
+      "n": 63,
+      "min": 11885,
+      "max": 11899
+    },
+    "NVIDIA GeForce RTX 2080 Ti": {
+      "n": 63,
+      "min": 0,
+      "max": 0
+    }
+  }
+}

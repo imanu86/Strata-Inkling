@@ -899,3 +899,7 @@ Dopo le quattro patch già elencate per coding, prefill e DSpark, applicare `ver
 Nel banco comunità del Daily, tre repliche con input da 20.000 e 40.000 token effettivi e 256 generati, il Daily Qwen 3.8 Flash Next a tre GPU registra rispettivamente 1.408 e 1.596 t/s di prefill, 114,6 e 111,1 t/s di decode. Inkling split registra 385 e 330 t/s di prefill, 84,1 e 79,0 t/s di decode. Con la cache FP16 per le proiezioni dense Inkling sale a 405 e 343 t/s di prefill. La mediana HTTP scende da 55,00 a 52,52 s e da 124,52 a 120,06 s. Tutte e sei le risposte riproducono il testo del controllo. Nei 256 token concessi Inkling emette solo ragionamento, mentre Qwen scrive nel canale di risposta.
 
 Il rapporto include il tempo al primo testo SSE, le prove con identico corpo HTTP tra i due modelli, la verifica numerica dei kernel e gli hash delle richieste per replica. [Misure, protocollo e patch riproducibili](bench-results/2026-11-22-inkling-community-20k-40k/)
+
+## 22 novembre 2026 — RTX 3060 sola con il desktop attivo
+
+Inkling UD-Q3_K_XL genera 321 token di Python a 48,13 t/s su input breve, con 305/305 controlli superati. Con i medesimi messaggi HTTP della prima replica del banco comunità, a 20.000 e 40.000 token effettivi la 3060 misura 48,35 e 46,93 t/s di prefill e 43,69 e 40,55 t/s di decode. Una richiesta completa per lunghezza, zero riuso. Il primo token SSE arriva dopo 413,77 s e 852,51 s. La 3060 tiene 2.176 esperti su 3.072 con il budget automatico. [Rapporto e dati](bench-results/2026-11-22-inkling-rtx3060-12gb/)
