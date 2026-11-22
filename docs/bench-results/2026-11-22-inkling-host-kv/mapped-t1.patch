@@ -1,0 +1,195 @@
+diff --git a/engine/src/inkling2/inkling2_engine.cu b/engine/src/inkling2/inkling2_engine.cu
+--- a/engine/src/inkling2/inkling2_engine.cu
++++ b/engine/src/inkling2/inkling2_engine.cu
+@@ -1087,10 +1087,44 @@
+     bool remote_full = false;
+     bool remote_all = false, remote_peer = false;
+     float* worker_packet = nullptr;
++    bool worker_mapped_requested = false;
++    float *worker_mapped_host = nullptr, *worker_mapped_main = nullptr, *worker_mapped_remote = nullptr;
++    size_t worker_mapped_output = 0;
++    uint64_t worker_mapped_visits = 0;
++    void init_worker_mapping() {
++        if (!worker_mapped_requested) return;
++        const auto &hp = m->hp;
++        const size_t words = 2*hp.q_dim + hp.n_rel*hp.n_head + 2*hp.kv_dim + hp.n_head + 1;
++        worker_mapped_output = (words + 31) & ~size_t(31);
++        const size_t bytes = (worker_mapped_output + hp.q_dim)*sizeof(float);
++        int a=0,b=0;
++        CK(cudaDeviceGetAttribute(&a,cudaDevAttrCanMapHostMemory,device));
++        CK(cudaDeviceGetAttribute(&b,cudaDevAttrCanMapHostMemory,remote_device));
++        cudaError_t status = cudaErrorNotSupported;
++        if (a && b) {
++            status=cudaHostAlloc(&worker_mapped_host,bytes,cudaHostAllocPortable|cudaHostAllocMapped);
++            if(status==cudaSuccess)
++                status=cudaHostGetDevicePointer(&worker_mapped_main,worker_mapped_host,0);
++            if(status==cudaSuccess) {
++                DeviceScope worker(remote_device);
++                status=cudaHostGetDevicePointer(&worker_mapped_remote,worker_mapped_host,0);
++            }
++        }
++        if(status!=cudaSuccess) {
++            std::fprintf(stderr,"ATTN_WORKER mapped_t1=fallback reason=%s transport=%s\n",
++                         cudaGetErrorString(status),remote_peer?"p2p":"pinned-host");
++            (void)cudaGetLastError();
++            if(worker_mapped_host) CK(cudaFreeHost(worker_mapped_host));
++            worker_mapped_host=worker_mapped_main=worker_mapped_remote=nullptr;
++            return;
++        }
++        std::fprintf(stderr,"ATTN_WORKER mapped_t1=active pinned_bytes=%llu output_offset_bytes=%llu\n",
++                     (unsigned long long)bytes,(unsigned long long)(worker_mapped_output*sizeof(float)));
++    }
+     uint64_t worker_visits = 0, worker_out_bytes = 0, worker_in_bytes = 0;
+     void worker_stats(const char* phase) const {
+-        if (remote_all) std::fprintf(stderr,"ATTN_WORKER %s visits=%llu payload_main_to_worker=%llu payload_worker_to_main=%llu\n",
+-            phase,(unsigned long long)worker_visits,(unsigned long long)worker_out_bytes,(unsigned long long)worker_in_bytes);
++        if (remote_all) std::fprintf(stderr,"ATTN_WORKER %s visits=%llu payload_main_to_worker=%llu payload_worker_to_main=%llu mapped_t1_visits=%llu\n",
++            phase,(unsigned long long)worker_visits,(unsigned long long)worker_out_bytes,(unsigned long long)worker_in_bytes,(unsigned long long)worker_mapped_visits);
+     }
+     int remote_device = -1;
+     cudaStream_t remote_stream = nullptr;
+@@ -1100,7 +1134,7 @@
+ 
+     bool remote_kv(int il) const { return remote_all || (remote_full && !m->hp.is_swa(il)); }
+ 
+-    void run_remote_full(int il, int T, float *srcQ, float *srcR, float *srcGate) {
++    float* run_remote_full(int il, int T, float *srcQ, float *srcR, float *srcGate) {
+         const auto &hp = m->hp;
+         const int q_dim = (int)hp.q_dim, kv_dim = (int)hp.kv_dim;
+         const int rel_dim = (int)(hp.n_rel * hp.n_head);
+@@ -1108,6 +1142,7 @@
+             (size_t)T * q_dim, (size_t)T * rel_dim, (size_t)T * q_dim, (size_t)T * kv_dim, (size_t)T * kv_dim, (size_t)T * hp.n_head, 1};
+         const void *src[] = {srcQ, srcR, srcGate, K_conv, V_conv, sink, pos0_d};
+         size_t off = 0;
++        const bool mapped_t1 = T==1 && worker_mapped_main!=nullptr;
+         const bool swa = hp.is_swa(il);
+         const int splits = remote_all && !swa && T == 1 && pos+1 >= 2048 ? astra_time_splits() : kAttnSplit;
+         if (remote_all) {
+@@ -1120,8 +1155,10 @@
+                 longest = std::max(longest,payload.count[i]);
+                 off += counts[i];
+             }
+-            pack_attention_worker<<<dim3((longest+255)/256,7),256,0,st>>>(payload,(unsigned*)worker_packet);
+-            if (!remote_peer)
++            float* packet = mapped_t1 ? worker_mapped_main : worker_packet;
++            pack_attention_worker<<<dim3((longest+255)/256,7),256,0,st>>>(payload,(unsigned*)packet);
++            if (mapped_t1) ++worker_mapped_visits;
++            if (!mapped_t1 && !remote_peer)
+                 CK(cudaMemcpyAsync(remote_host,worker_packet,off*sizeof(float),cudaMemcpyDeviceToHost,st));
+             ++worker_visits;
+             worker_out_bytes += off*sizeof(float);
+@@ -1136,18 +1173,20 @@
+         {
+             DeviceScope remote(remote_device);
+             CK(cudaStreamWaitEvent(remote_stream, remote_ready, 0));
+-            if (remote_peer)
+-                CK(cudaMemcpyPeerAsync(remote_buf,remote_device,worker_packet,device,off*sizeof(float),remote_stream));
+-            else
+-                CK(cudaMemcpyAsync(remote_buf, remote_host, off * sizeof(float), cudaMemcpyHostToDevice, remote_stream));
+-            float *pQ = remote_buf;
++            if (!mapped_t1) {
++                if (remote_peer)
++                    CK(cudaMemcpyPeerAsync(remote_buf,remote_device,worker_packet,device,off*sizeof(float),remote_stream));
++                else
++                    CK(cudaMemcpyAsync(remote_buf, remote_host, off * sizeof(float), cudaMemcpyHostToDevice, remote_stream));
++            }
++            float *pQ = mapped_t1 ? worker_mapped_remote : remote_buf;
+             float *pR = pQ + counts[0];
+             float *pGate = pR + counts[1];
+             float *remote_keys = pGate + counts[2];
+             float *remote_values = remote_keys + counts[3];
+             float *remote_sink = remote_values + counts[4];
+             int32_t *remote_position = reinterpret_cast<int32_t *>(remote_sink + counts[5]);
+-            float *remote_output = remote_buf + off;
++            float *remote_output = mapped_t1 ? worker_mapped_remote+worker_mapped_output : remote_buf+off;
+ 
+             k_clip_norm_kv_store_q8<<<dim3((unsigned)hp.n_head_kv, (unsigned)T), 32, 0, remote_stream>>>(
+                 remote_keys, remote_values, kq[(size_t)il], ks[(size_t)il], vq[(size_t)il], vs[(size_t)il], (int)hp.n_head_kv, hp.qk_clip,
+@@ -1179,12 +1218,16 @@
+                     (int)hp.n_head, (int)hp.n_head_kv, (int)hp.n_rel_ext, kv_cap[(size_t)il], (int)swa, (int)hp.n_swa, remote_position, kq_scale);
+             }
+ 
+-            if (!remote_peer) CK(cudaMemcpyAsync(remote_host + off, remote_output, (size_t)T * q_dim * sizeof(float), cudaMemcpyDeviceToHost, remote_stream));
++            if (!mapped_t1 && !remote_peer) CK(cudaMemcpyAsync(remote_host + off, remote_output, (size_t)T * q_dim * sizeof(float), cudaMemcpyDeviceToHost, remote_stream));
+             CK(cudaEventRecord(remote_done, remote_stream));
+         }
+         CK(cudaStreamWaitEvent(st, remote_done, 0));
++        // The following projection runs on st after the worker event. The next
++        // layer's pack cannot overwrite this page until that projection completes.
++        if (mapped_t1) return worker_mapped_main+worker_mapped_output;
+         if (remote_peer) CK(cudaMemcpyPeerAsync(att,device,remote_buf+off,remote_device,(size_t)T*q_dim*sizeof(float),st));
+         else CK(cudaMemcpyAsync(att, remote_host + off, (size_t)T * q_dim * sizeof(float), cudaMemcpyHostToDevice, st));
++        return att;
+     }
+ 
+     void init_remote_full() {
+@@ -1193,6 +1236,7 @@
+         const size_t count = (size_t)tmax * (3 * hp.q_dim + hp.n_rel * hp.n_head + 2 * hp.kv_dim + hp.n_head) + 1;
+         if (remote_all) {
+             remote_peer = attention_enable_peer(device,remote_device) && attention_enable_peer(remote_device,device);
++            init_worker_mapping();
+             CK(cudaMalloc(&worker_packet,count*sizeof(float)));
+             size_t full_bytes=0,swa_bytes=0;
+             for(int il=0;il<hp.n_layer;++il) {
+@@ -1403,6 +1447,7 @@
+             cudaFree(p);
+         for (auto *p : prefix_vs)
+             cudaFree(p);
++        if(worker_mapped_host) cudaFreeHost(worker_mapped_host);
+         cudaFree(worker_packet);
+         cudaFreeHost(prefix_stage);
+         for (size_t il = 0; il < kq.size(); ++il) {
+@@ -2637,8 +2682,9 @@
+                     pR, L.attn_rel_clip, hp.rel_clip, (int) hp.n_rel, (int) hp.n_head, apply_tau, pos0_d, (int) hp.log_scale_floor, hp.log_scale_alpha);
+             }
+ 
++            float* attention_result=att;
+             if (remote_all || (remote_full && !is_swa && (!full_kv_local_prefix || full_kv_promoted))) {
+-                run_remote_full(il, T, pQ, pR, pGate);
++                attention_result=run_remote_full(il, T, pQ, pR, pGate);
+             } else {
+                 const bool local_full = remote_full && !is_swa && full_kv_local_prefix && !full_kv_promoted;
+                 auto &active_kq = local_full ? prefix_kq : this->kq;
+@@ -2741,7 +2787,7 @@
+             if (!kv_q8) {
+                 k_mul_sigmoid<<<(unsigned) (((int64_t) T * q_dim + 255) / 256), 256, 0, st>>>(att, pGate, (int64_t) T * q_dim);
+             }
+-            project(att, L.attn_output, wo, T, N, q_dim);
++            project(attention_result, L.attn_output, wo, T, N, q_dim);
+             const bool do_push = (ip % hp.attn_res_block_size == 0);
+             if (save_conv_trace)
+                 k_shortconv_trace<<<(unsigned) ((N + 255) / 256), 256, 0, st>>>(
+@@ -3730,6 +3776,7 @@
+     int full_kv_local_prefix = 0;
+     bool split_full_attn_remote = false;
+     int attention_worker = -1;
++    bool attention_worker_mapped = false;
+     bool split_depth_mix = false;
+     bool gpu_full_vocab = false;
+     bool dspark_gpu_pq = false;
+@@ -3791,6 +3838,7 @@
+             else if (a == "--expert-dense-device") expert_dense_device = (int) value;
+             else expert_hot_mib = (int) value;
+         }
++        else if (a == "--attention-worker-mapped-t1") attention_worker_mapped=true;
+         else if (a == "--expert-vram") expert_vram = std::atof(next_arg());
+         else if (a == "--cpu-threads" || a == "--pool-workers") cpu_threads = std::atoi(next_arg());
+         else if (a == "--dump-logits") dump_logits_path = next_arg();
+@@ -3892,6 +3940,9 @@
+ 
+     Model m;
+     CK(cudaGetDevice(&m.main_device));
++    if (attention_worker_mapped && attention_worker < 0) {
++        std::fprintf(stderr,"--attention-worker-mapped-t1 requires --attention-worker-device\n");return 2;
++    }
+     if (attention_worker >= 0) {
+         int count=0;CK(cudaGetDeviceCount(&count));
+         if(attention_worker>=count || attention_worker==m.main_device || layer_split_device>=0 ||
+@@ -3931,6 +3982,7 @@
+     E.device = m.main_device;
+     E.role = layer_split_device >= 0 ? Engine::Role::Outer : Engine::Role::All;
+     if (attention_worker>=0) {
++        E.worker_mapped_requested=attention_worker_mapped;
+         E.remote_all=true;
+         E.remote_full=true;
+         E.remote_device=attention_worker;

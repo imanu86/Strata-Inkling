@@ -1,0 +1,603 @@
+diff --git a/engine/src/inkling2/astra_control_streams.cuh b/engine/src/inkling2/astra_control_streams.cuh
+new file mode 100644
+--- /dev/null
++++ b/engine/src/inkling2/astra_control_streams.cuh
+@@ -0,0 +1,64 @@
++#pragma once
++
++// The two additional lanes own all mutable storage touched by K and V.
++// The original Engine stream, handle and scratch are used for Q. Recording
++// the fork and join also makes these dependencies part of a captured graph.
++struct AstraControlLane {
++    cudaStream_t stream = nullptr;
++    cublasHandle_t blas = nullptr;
++    cudaEvent_t done = nullptr;
++    void* blas_workspace = nullptr;
++    float* scratch = nullptr;
++
++    void init(int n, int rank, int rows) {
++        constexpr size_t workspace_bytes = 4 * 1024 * 1024;
++        CK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
++        CK(cudaEventCreateWithFlags(&done, cudaEventDisableTiming));
++        CKB(cublasCreate(&blas));
++        CKB(cublasSetStream(blas, stream));
++        CK(cudaMalloc(&blas_workspace, workspace_bytes));
++        CKB(cublasSetWorkspace(blas, blas_workspace, workspace_bytes));
++        CK(cudaMalloc(&scratch, (size_t)rows * (4 * n + rank) * sizeof(float)));
++    }
++
++    void run(const PhysLayer& layer, int mod, const float* cur, const float* msg,
++             float* out, int t, int n, int rank, float eps) {
++        float* prep = scratch;
++        float* down = prep + (size_t)t * 2 * n;
++        float* gain = down + (size_t)t * rank;
++        float* forget = gain + (size_t)t * n;
++        k_control_prep<<<dim3(2,t),kThreads,0,stream>>>(cur,msg,prep,n,eps);
++        const float alpha = 1.0f, beta = 0.0f;
++        auto project = [&](const DenseMat& matrix, const float* x, float* y,
++                           int width, int outputs) {
++            CKB(cublasSgemm(blas, CUBLAS_OP_T, CUBLAS_OP_N, outputs, t, width,
++                &alpha, (const float*)matrix.d, width, x, width, &beta, y, outputs));
++        };
++        project(layer.loop_down[mod], prep, down, 2 * n, rank);
++        project(layer.loop_gain[mod], down, gain, rank, n);
++        project(layer.loop_forget[mod], down, forget, rank, n);
++        const int size = n * t;
++        k_control_combine<<<(size+255)/256,256,0,stream>>>(cur,msg,gain,forget,out,size);
++        CK(cudaEventRecord(done, stream));
++    }
++
++    ~AstraControlLane() {
++        if (blas) cublasDestroy(blas);
++        if (stream) cudaStreamDestroy(stream);
++        if (done) cudaEventDestroy(done);
++        cudaFree(blas_workspace);
++        cudaFree(scratch);
++    }
++};
++
++struct AstraControlStreams {
++    cudaEvent_t ready = nullptr;
++    AstraControlLane lanes[2];
++    AstraControlStreams(int n, int rank, int rows) {
++        CK(cudaEventCreateWithFlags(&ready, cudaEventDisableTiming));
++        for (auto& lane : lanes) lane.init(n, rank, rows);
++    }
++    ~AstraControlStreams() {
++        if (ready) cudaEventDestroy(ready);
++    }
++};
+diff --git a/engine/src/inkling2/inkling2_engine.cu b/engine/src/inkling2/inkling2_engine.cu
+--- a/engine/src/inkling2/inkling2_engine.cu
++++ b/engine/src/inkling2/inkling2_engine.cu
+@@ -56,7 +56,16 @@
+ static bool verify_fusion_on() { static const bool on = std::getenv("STRATA_DSPARK_FUSION") && std::strcmp(std::getenv("STRATA_DSPARK_FUSION"),"1")==0;return on; }
+ #include "astra_pp_mma.cuh"
+ #include "astra_verify_gu.cuh"
++#include "verify_expert_pair.cuh"
+ #include "astra_verify_bf16.cuh"
++#include "verify_next_attention.cuh"
++static bool verify_attention_enabled() {
++    static const bool enabled = [] {
++        const char* value = std::getenv("STRATA_IK2_VERIFY_ATTN_EXACT");
++        return value && std::strcmp(value, "1") == 0;
++    }();
++    return enabled;
++}
+ 
+ static bool astra_nv_enabled() {
+     static const bool on = std::getenv("STRATA_IK2_ASTRA_NV") && std::strcmp(std::getenv("STRATA_IK2_ASTRA_NV"), "1") == 0;
+@@ -754,6 +763,7 @@
+ }
+ 
+ #include "inkling2_pq.cuh"
++#include "astra_control_streams.cuh"
+ 
+ struct Engine {
+     std::unique_ptr<GpuPqSampler> gpu_pq;
+@@ -792,10 +802,12 @@
+ 
+     // DSpark is allocated on the outer/head device; the core only captures its local taps/undo state.
+     DsparkEngine* dspark = nullptr;
++    float* vf_scores=nullptr;
+     VFConvRows vf_rows{};
+     VFWinner* vf_tiles=nullptr;
+     int verify_max_t = 1;
+     bool verify_bf16_thin = false;
++    std::unique_ptr<AstraControlStreams> verify_control_streams;
+     size_t layer_conv_floats = 0, local_conv_floats = 0;
+     std::vector<int> trace_slot;
+     SwaLayerPtrs swa_ptrs{};
+@@ -1288,6 +1300,10 @@
+         if (verify_core_graph) cudaGraphExecDestroy(verify_core_graph);
+         for (auto graph : outer_graph) if (graph) cudaGraphExecDestroy(graph);
+         for (auto g : layer_pre_graph) if (g) cudaGraphExecDestroy(g);
++        if (verify_control_streams) {
++            CK(cudaStreamSynchronize(st));
++            verify_control_streams.reset();
++        }
+         if (remote_full) {
+             CK(cudaStreamSynchronize(st));
+             DeviceScope remote(remote_device);
+@@ -1354,7 +1370,7 @@
+         cudaFree(sampling_mass);
+         cudaFree(tok_d);
+         cudaFree(pos0_d);
+-        cudaFree(pick_d);cudaFree(vf_tiles);
++        cudaFree(vf_scores);cudaFree(pick_d);cudaFree(vf_tiles);
+         cudaFree(d_miss);
+         cudaFree(ecpu);
+         cudaFreeHost(h_tok_buf);
+@@ -1403,6 +1419,12 @@
+         CK(cudaStreamCreate(&st));
+         CKB(cublasCreate(&blas));
+         CKB(cublasSetStream(blas, st));
++        const char* control = std::getenv("STRATA_IK2_VERIFY_CONTROL_STREAMS");
++        if (control && std::strcmp(control, "1") == 0 && role == Role::Core &&
++            verify_max_t > 1 && N == 2304 && hp.loop_gate_rank == 64) {
++            verify_control_streams = std::make_unique<AstraControlStreams>((int)N, 64, std::min(verify_max_t, 5));
++            std::fprintf(stderr, "strata-inkling2: parallel F32 Q/K/V verify controls on core GPU %d\n", device);
++        }
+         gemm = std::make_unique<strata::prefill::Gemm>();
+         if (!gemm->init(st, m->has_quant_dense || draft_quant ? (size_t) (8 * 1024 * 1024) : 4096, err)) return false;
+ 
+@@ -1483,7 +1505,12 @@
+         d_f32(&att_gate, (size_t) tmax * hp.q_dim);
+         d_f32(&wo, (size_t) tmax * N);
+         if (split_depth_mix) d_f32(&depth_mix_partials, (size_t) std::min(tmax, 16) * 4 * 8 * 8);
+-        d_f32(&attn_split, (size_t) astra_time_splits() * hp.n_head * 130);
++        size_t split_buf=astra_time_splits();
++        if(verify_max_t>=5 && verify_attention_enabled()){
++            split_buf=std::max<size_t>(split_buf,20);
++            d_f32(&vf_scores, (size_t)5*hp.n_head*hp.n_swa);
++        }
++        d_f32(&attn_split,split_buf*hp.n_head*130);
+ 
+         const int64_t max_ent = (int64_t) tmax * hp.n_expert_used;
+         d_f32(&router_logits, (size_t) tmax * hp.n_expert);
+@@ -1722,7 +1749,24 @@
+         k_control_combine<<<(unsigned) ((tot + 255) / 256), 256, 0, st>>>(c, msg, ctrl_g, ctrl_f, out, tot);
+     }
+ 
+-    void run_controls_qkv(const float* q, const float* k, const float* v, const PhysLayer& L, int T) {
++    void run_controls_qkv(const float* q, const float* k, const float* v, const PhysLayer& L, int T, bool verify) {
++        if (verify && verify_control_streams && T >= 2 && T <= 5) {
++            bool f32_controls = true;
++            for (int i = 0; i < 3; ++i)
++                f32_controls = f32_controls && L.loop_down[i].type == 0 &&
++                    L.loop_gain[i].type == 0 && L.loop_forget[i].type == 0;
++            if (f32_controls) {
++                auto& branch = *verify_control_streams;
++                const int n = (int)m->hp.n_embd, rank = (int)m->hp.loop_gate_rank;
++                CK(cudaEventRecord(branch.ready, st));
++                for (auto& lane : branch.lanes) CK(cudaStreamWaitEvent(lane.stream, branch.ready, 0));
++                branch.lanes[0].run(L, 1, k, msg1, in_k, T, n, rank, m->hp.rms_eps);
++                branch.lanes[1].run(L, 2, v, msg2, in_v, T, n, rank, m->hp.rms_eps);
++                run_control(q, msg0, L, 0, in_q, T);
++                for (auto& lane : branch.lanes) CK(cudaStreamWaitEvent(st, lane.done, 0));
++                return;
++            }
++        }
+         bool f32 = batch_qkv_control_t1 && T == 1 && m->hp.loop_gate_rank == 64 && (m->hp.n_embd % 4) == 0;
+         if (f32) {
+             for (int i = 0; i < 3; ++i)
+@@ -1972,10 +2016,15 @@
+             L.L.tail_off && L.L.situ && !L.L.had_block && !L.L.gu_nib) {
+             AstraQ* hq = (AstraQ*)escr;
+             astra_pp_input<<<T * 9, 256, 0, st>>>(x_norm, (AstraQ*)xq);
++            if(T==5 && verify_expert_pair_enabled()){
++                verify_gu_pair<<<dim3(1152/32,n_ent),256,0,st>>>(L.d_blobs,L.stride,L.d_slot_of,ids,L.L,(const AstraQ*)xq,hq);
++                verify_down_pair<<<dim3(2304/16,n_ent),256,0,st>>>(L.d_blobs,L.stride,L.d_slot_of,ids,L.L,hq,eparts);
++            }else{
+             astra_verify_gu_situ_q8<<<dim3(1152 / 32, n_ent), 256, 0, st>>>(
+                 L.d_blobs, L.stride, L.d_slot_of, ids, L.L, (const AstraQ*)xq, hq);
+             astra_down<<<dim3(2304 / 16, n_ent), 256, 0, st>>>(
+                 L.d_blobs, L.stride, L.d_slot_of, ids, L.L, hq, eparts);
++            }
+             k_combine_experts<<<dim3(9, T), 256, 0, st>>>(eparts, ewts, moe_raw, N, Kp);
+             return;
+         }
+@@ -2362,7 +2411,7 @@
+                 float* outs[3] = {in_q, in_k, in_v};
+                 run_mix_normed(norm_blocks, cur, false, L.attn_res_query, outs, is_swa ? 1 : 3, T, is_swa ? 1 : 0);
+                 if (has_msg) {
+-                    run_controls_qkv(in_q, in_k, in_v, L, T);
++                    run_controls_qkv(in_q, in_k, in_v, L, T, save_conv_trace);
+                 }
+                 if (is_swa && has_msg) {
+                     k_rms_norm_3<<<dim3(3, (unsigned) T), kThreads, 0, st>>>(in_q, in_k, in_v, L.attn_norm, N, hp.rms_eps);
+@@ -2377,7 +2426,7 @@
+                 }
+             } else {
+                 if (has_msg) {
+-                    run_controls_qkv(cur, cur, cur, L, T);
++                    run_controls_qkv(cur, cur, cur, L, T, save_conv_trace);
+                     if (is_swa) {
+                         k_rms_norm_3<<<dim3(3, (unsigned) T), kThreads, 0, st>>>(in_q, in_k, in_v, L.attn_norm, N, hp.rms_eps);
+                     } else {
+@@ -2513,7 +2562,20 @@
+                 const float kq_scale = 1.0f / std::sqrt((float)hp.head_dim);
+                 if (kv_q8) {
+                     if (hp.n_head == 3 * hp.n_head_kv && hp.head_dim == 128) {
+-                        if (T == 1) {
++                        if(T==5 && save_conv_trace && is_swa && verify_attention_enabled()){
++                            int rows=T*(int)hp.n_head;
++                            verify_swa_scores<<<dim3((unsigned)((hp.n_swa+63)/64),(unsigned)rows),256,0,st>>>(pQ,
++                                active_kq[(size_t)il],active_ks[(size_t)il],rel_tab,sink,vf_scores,(int)hp.n_head,(int)hp.n_head_kv,
++                                (int)hp.n_rel_ext,active_cap[(size_t)il],(int)hp.n_swa,pos0_d,kq_scale);
++                            verify_swa_weighted<<<(unsigned)(rows*4),128,0,st>>>(active_vq[(size_t)il],active_vs[(size_t)il],vf_scores,
++                                attn_split,(int)hp.n_head,(int)hp.n_head_kv,(int)hp.n_swa,active_cap[(size_t)il],pos0_d);
++                            verify_swa_combine<<<(unsigned)rows,128,0,st>>>(attn_split,pGate,att);
++                        }else if(T==5 && save_conv_trace && verify_attention_enabled()){
++                            verify_q8_one_head<<<dim3((unsigned)hp.n_head,(unsigned)T),128,0,st>>>(pQ,
++                                active_kq[(size_t)il],active_ks[(size_t)il],active_vq[(size_t)il],active_vs[(size_t)il],rel_tab,sink,
++                                pGate,att,(int)hp.n_head,(int)hp.n_head_kv,(int)hp.n_rel_ext,active_cap[(size_t)il],is_swa?1:0,
++                                (int)hp.n_swa,pos0_d,kq_scale);
++                        }else if (T == 1) {
+                             const int count = long_full && !is_swa ? astra_time_splits() : kAttnSplit;
+                             k_attn_q8_gqa3_split<<<dim3((unsigned)hp.n_head_kv, (unsigned)count), 128, 0, st>>>(
+                                 pQ, active_kq[(size_t)il], active_ks[(size_t)il], active_vq[(size_t)il], active_vs[(size_t)il], rel_tab,
+diff --git a/engine/src/inkling2/verify_expert_pair.cuh b/engine/src/inkling2/verify_expert_pair.cuh
+new file mode 100644
+--- /dev/null
++++ b/engine/src/inkling2/verify_expert_pair.cuh
+@@ -0,0 +1,149 @@
++#pragma once
++
++static bool verify_expert_pair_enabled() {
++    static const bool enabled=[] {
++        const char* v=std::getenv("STRATA_IK2_VERIFY_EXPERT_PAIR");
++        return v && std::strcmp(v,"1")==0;
++    }();
++    return enabled;
++}
++
++// Each expert can be selected at most once per token. Pair consecutive
++// occurrences in the five top-8 lists. The leader owns the original output
++// slots of the two entries; unpaired entries run an ordinary one-input dot.
++__device__ __forceinline__ int verify_expert_partner(const int* ids,int entry) {
++    const int lane=threadIdx.x&31, expert=ids[entry];
++    const unsigned low=__ballot_sync(~0u,ids[lane]==expert);
++    const unsigned high=__ballot_sync(~0u,lane<8 && ids[32+lane]==expert);
++    const unsigned long long mask=((unsigned long long)high<<32)|low;
++    const unsigned long long bit=1ull<<entry;
++    if(__popcll(mask&(bit-1))&1)return -2;
++    const unsigned long long following=mask&~(bit|(bit-1));
++    return __ffsll(following)-1;
++}
++
++template<bool Pair>
++__device__ __forceinline__ float2 verify_weight_dot(
++    const unsigned* row,int k,const AstraQ& a,const AstraQ* b) {
++    const unsigned* block=row+(k/2)*9;
++    const unsigned scales=block[0]>>(16*(k&1));
++    const unsigned* qs=block+1+4*(k&1);
++    float2 sum=make_float2(0.f,0.f);
++    #pragma unroll
++    for(int h=0;h<2;++h) {
++        const unsigned lo=qs[h*2],hi=qs[h*2+1];
++        const int w0=astra_decode_four(lo),w1=astra_decode_four(lo>>16);
++        const int w2=astra_decode_four(hi),w3=astra_decode_four(hi>>16);
++        const float scale=astra_scale((scales>>(8*h))&255);
++        const int j=4*h;
++        int va=__dp4a(w0,(int)a.word[j],0);
++        va=__dp4a(w1,(int)a.word[j+1],va);
++        va=__dp4a(w2,(int)a.word[j+2],va);
++        va=__dp4a(w3,(int)a.word[j+3],va);
++        sum.x+=(scale*a.scale)*(float)va;
++        if constexpr(Pair){
++            int vb=__dp4a(w0,(int)b->word[j],0);
++            vb=__dp4a(w1,(int)b->word[j+1],vb);
++            vb=__dp4a(w2,(int)b->word[j+2],vb);
++            vb=__dp4a(w3,(int)b->word[j+3],vb);
++            sum.y+=(scale*b->scale)*(float)vb;
++        }
++    }
++    return sum;
++}
++
++template<bool Pair>
++__device__ __forceinline__ void verify_gu_pair_body(const uint8_t* blob,K::NativeExpertLayout L,
++    const AstraQ* input,AstraQ* hidden,int entry,int partner) {
++    const int lane=threadIdx.x&31,warp=threadIdx.x/32,first=blockIdx.x*32;
++    __shared__ AstraQ x[Pair?2:1][72];
++    __shared__ float2 products[Pair?2:1][32];
++    const float* scale=(const float*)(blob+L.tail_off);
++    #pragma unroll
++    for(int t=0;t<(Pair?2:1);++t){
++        const AstraQ* token=input+(t==0?entry:partner)/8*72;
++        for(int k=warp;k<72;k+=8){
++            if(lane<8)x[t][k].word[lane]=token[k].word[lane];
++            if(lane==8)x[t][k].scale=token[k].scale;
++        }
++    }
++    __syncthreads();
++    #pragma unroll 1
++    for(int sub=warp;sub<32;sub+=8){
++        const unsigned* g=(const unsigned*)(blob+(first+sub)*L.gu_row);
++        const unsigned* u=(const unsigned*)(blob+L.up_off+(first+sub)*L.gu_row);
++        float vg[2]={},vu[2]={};
++        #pragma unroll
++        for(int start=0;start<72;start+=32){
++            const int k=start+lane;
++            if(k<72){
++                const AstraQ* buddy=Pair?&x[Pair?1:0][k]:nullptr;
++                const float2 gate=verify_weight_dot<Pair>(g,k,x[0][k],buddy);
++                const float2 up=verify_weight_dot<Pair>(u,k,x[0][k],buddy);
++                vg[0]+=gate.x;vu[0]+=up.x;
++                if constexpr(Pair){vg[1]+=gate.y;vu[1]+=up.y;}
++            }
++        }
++        #pragma unroll
++        for(int t=0;t<(Pair?2:1);++t){
++            #pragma unroll
++            for(int d=16;d;d>>=1){
++                vg[t]+=__shfl_xor_sync(~0u,vg[t],d);
++                vu[t]+=__shfl_xor_sync(~0u,vu[t],d);
++            }
++            if(!lane)products[t][sub]=make_float2(vg[t]*scale[0],vu[t]*scale[1]);
++        }
++    }
++    __syncthreads();
++    if(!warp){
++        #pragma unroll
++        for(int t=0;t<(Pair?2:1);++t){
++            const float2 gu=products[t][lane];
++            const float beta=L.situ_beta,lb=L.situ_linear_beta;
++            const float gate=beta*tanhf(gu.x/beta)*(1.f/(1.f+__expf(-gu.x)));
++            const float up=lb>0.f ? lb*tanhf(gu.y/lb) : gu.y;
++            astra_store_q(gate*up,hidden,(t==0?entry:partner)*1152+first+lane);
++        }
++    }
++}
++
++__global__ void __launch_bounds__(256) verify_gu_pair(const uint8_t* blobs,size_t stride,
++    const int* slots,const int* ids,K::NativeExpertLayout L,const AstraQ* x,AstraQ* h){
++    const int e=blockIdx.y,p=verify_expert_partner(ids,e);
++    if(p==-2)return;
++    const uint8_t* blob=blobs+slots[ids[e]]*stride;
++    if(p<0)verify_gu_pair_body<false>(blob,L,x,h,e,p);
++    else verify_gu_pair_body<true>(blob,L,x,h,e,p);
++}
++
++template<bool Pair>
++__device__ __forceinline__ void verify_down_pair_body(const unsigned* row,const AstraQ* hidden,
++    float* parts,int e,int p,int r,float scale){
++    const int lane=threadIdx.x&15;
++    const AstraQ* a=hidden+e*36;
++    const AstraQ* b=Pair?hidden+p*36:nullptr;
++    float2 v=verify_weight_dot<Pair>(row,lane,a[lane],Pair?b+lane:nullptr);
++    if(lane<4){
++        float2 w=verify_weight_dot<Pair>(row,32+lane,a[32+lane],Pair?b+32+lane:nullptr);
++        v.x+=w.x;if constexpr(Pair)v.y+=w.y;
++    }
++    float2 w=verify_weight_dot<Pair>(row,16+lane,a[16+lane],Pair?b+16+lane:nullptr);
++    v.x+=w.x;if constexpr(Pair)v.y+=w.y;
++    #pragma unroll
++    for(int d=8;d;d>>=1){
++        v.x+=__shfl_xor_sync(~0u,v.x,d,16);
++        if constexpr(Pair)v.y+=__shfl_xor_sync(~0u,v.y,d,16);
++    }
++    if(!lane){parts[e*2304+r]=v.x*scale;if constexpr(Pair)parts[p*2304+r]=v.y*scale;}
++}
++__global__ void __launch_bounds__(256) verify_down_pair(const uint8_t* blobs,size_t stride,
++    const int* slots,const int* ids,K::NativeExpertLayout L,const AstraQ* h,float* parts){
++    const int e=blockIdx.y,p=verify_expert_partner(ids,e);
++    if(p==-2)return;
++    const int r=blockIdx.x*16+threadIdx.x/16;
++    const uint8_t* blob=blobs+slots[ids[e]]*stride;
++    const unsigned* row=(const unsigned*)(blob+L.down_off+r*L.d_row);
++    const float scale=((const float*)(blob+L.tail_off))[2];
++    if(p<0)verify_down_pair_body<false>(row,h,parts,e,p,r,scale);
++    else verify_down_pair_body<true>(row,h,parts,e,p,r,scale);
++}
+diff --git a/engine/src/inkling2/verify_next_attention.cuh b/engine/src/inkling2/verify_next_attention.cuh
+new file mode 100644
+--- /dev/null
++++ b/engine/src/inkling2/verify_next_attention.cuh
+@@ -0,0 +1,193 @@
++#pragma once
++
++// Each query head owns one CTA. The original four lane-strided recurrences
++// are combined in their original order. Explicit RN intrinsics reproduce
++// the reference SM75/SM86 SASS for the weighted V updates.
++__global__ void verify_q8_one_head(const float* __restrict__ Q,
++                               const int8_t* __restrict__ kq, const __half* __restrict__ ks,
++                               const int8_t* __restrict__ vq, const __half* __restrict__ vs,
++                               const float* __restrict__ rel_tab, const float* __restrict__ sink,
++                               const float* __restrict__ gate, float* __restrict__ out,
++                               int n_head, int n_head_kv, int n_ext, int cap, int is_swa, int n_swa,
++                               const int32_t* __restrict__ pos0, float kq_scale) {
++    __shared__ float sq[1][128];
++    __shared__ float s_m[1][4];
++    __shared__ float s_l[1][4];
++    __shared__ float s_acc[1][4][128];
++    const int hkv = blockIdx.x / 3, t = blockIdx.y;
++    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
++    const int kv_dim = n_head_kv * 128;
++    const int h0 = blockIdx.x;
++    if (threadIdx.x < 128) {
++#pragma unroll
++        for (int g = 0; g < 1; ++g) {
++            sq[g][threadIdx.x] = Q[((size_t) t * n_head + (h0 + g)) * 128 + threadIdx.x];
++        }
++    }
++    __syncthreads();
++
++    const int base4 = lane * 4;
++    float q[1][4];
++#pragma unroll
++    for (int g = 0; g < 1; ++g) {
++        q[g][0] = sq[g][base4];
++        q[g][1] = sq[g][base4 + 1];
++        q[g][2] = sq[g][base4 + 2];
++        q[g][3] = sq[g][base4 + 3];
++    }
++
++    const int pos_q = pos0[0] + t;
++    const int j0 = is_swa ? max(0, pos_q - n_swa + 1) : 0;
++    const int j1 = pos_q + 1;
++    const bool pow2_cap = (cap & (cap - 1)) == 0;
++    const int cap_mask = cap - 1;
++
++    float neg_sink[1];
++    const float* rt[1];
++#pragma unroll
++    for (int g = 0; g < 1; ++g) {
++        const int h = h0 + g;
++        rt[g] = rel_tab + ((size_t) t * n_head + h) * n_ext;
++        neg_sink[g] = -sink[(size_t) t * n_head + h];
++    }
++
++    float m[1], l[1], acc[1][4];
++#pragma unroll
++    for (int g = 0; g < 1; ++g) {
++        m[g] = (warp == 0) ? 0.0f : -1e30f;
++        l[g] = (warp == 0) ? 1.0f : 0.0f;
++#pragma unroll
++        for (int i = 0; i < 4; ++i) acc[g][i] = 0.0f;
++    }
++
++    for (int j = j0 + warp; j < j1; j += 4) {
++        const int slot = is_swa ? (pow2_cap ? (j & cap_mask) : (j % cap)) : j;
++        const size_t idx = (size_t) slot * n_head_kv + hkv;
++        const float d_k = __half2float(ks[idx]);
++        const float d_v = __half2float(vs[idx]);
++        const int8_t* kj = kq + (size_t) slot * kv_dim + hkv * 128;
++        const int8_t* vj = vq + (size_t) slot * kv_dim + hkv * 128;
++        const char4 kc4 = *reinterpret_cast<const char4*>(kj + base4);
++        const float k0 = (float) kc4.x, k1 = (float) kc4.y, k2 = (float) kc4.z, k3 = (float) kc4.w;
++        const char4 vc4 = *reinterpret_cast<const char4*>(vj + base4);
++        const float v0 = (float) vc4.x, v1 = (float) vc4.y, v2 = (float) vc4.z, v3 = (float) vc4.w;
++        const int dist = pos_q - j;
++        const float dkkq = d_k * kq_scale;
++
++        float dot0 = q[0][0] * k0 + q[0][1] * k1 + q[0][2] * k2 + q[0][3] * k3;
++#pragma unroll
++        for (int o = 16; o > 0; o >>= 1) {
++            dot0 += __shfl_xor_sync(0xffffffffu, dot0, o);
++        }
++        const float dots[1] = {dot0};
++#pragma unroll
++        for (int g = 0; g < 1; ++g) {
++            const float bias = dist < n_ext ? rt[g][dist] : neg_sink[g];
++            const float sc = dots[g] * dkkq + bias;
++            const float m_new = fmaxf(m[g], sc);
++            const float alpha = l[g] > 0.0f ? __expf(m[g] - m_new) : 0.0f;
++            const float p = __expf(sc - m_new);
++            const float pv = p * d_v;
++            l[g] = l[g] * alpha + p;
++            acc[g][0] = __fmaf_rn(pv, v0, __fmul_rn(acc[g][0], alpha));
++            acc[g][1] = __fmaf_rn(pv, v1, __fmul_rn(acc[g][1], alpha));
++            acc[g][2] = __fmaf_rn(pv, v2, __fmul_rn(acc[g][2], alpha));
++            acc[g][3] = __fmaf_rn(pv, v3, __fmul_rn(acc[g][3], alpha));
++            m[g] = m_new;
++        }
++    }
++
++#pragma unroll
++    for (int g = 0; g < 1; ++g) {
++        if (lane == 0) {
++            s_m[g][warp] = m[g];
++            s_l[g][warp] = l[g];
++        }
++        s_acc[g][warp][base4] = acc[g][0];
++        s_acc[g][warp][base4 + 1] = acc[g][1];
++        s_acc[g][warp][base4 + 2] = acc[g][2];
++        s_acc[g][warp][base4 + 3] = acc[g][3];
++    }
++    __syncthreads();
++    if (threadIdx.x < 128) {
++#pragma unroll
++        for (int g = 0; g < 1; ++g) {
++            float mg = s_m[g][0];
++            for (int w = 1; w < 4; ++w) if (s_l[g][w] > 0.0f && s_m[g][w] > mg) mg = s_m[g][w];
++            float lg = 0.0f, og = 0.0f;
++            for (int w = 0; w < 4; ++w) {
++                if (s_l[g][w] > 0.0f) {
++                    const float c = __expf(s_m[g][w] - mg);
++                    lg += s_l[g][w] * c;
++                    og += s_acc[g][w][threadIdx.x] * c;
++                }
++            }
++            const size_t oi = ((size_t) t * n_head + (h0 + g)) * 128 + threadIdx.x;
++            float val = __fdividef(og, lg);
++            if (gate) val *= sigmf(gate[oi]);
++            out[oi] = val;
++        }
++    }
++}
++
++// A different schedule for the same four online-softmax recurrences. The score
++// producer expands temporal parallelism without partitioning a recurrence.
++__global__ void verify_swa_scores(const float* Q,const int8_t* kq,const __half* ks,
++                                  const float* rel,const float* sink,float* scores,
++                                  int H,int HK,int extent,int cap,int window,const int* pos,float scale){
++    const int row=blockIdx.y,t=row/H,h=row%H,kv=h/3;
++    const int qpos=*pos+t,first=max(0,qpos-window+1),n=qpos-first+1;
++    const int warp=threadIdx.x/32,lane=threadIdx.x%32;
++    const float4 q=((const float4*)(Q+row*128))[lane];
++    const int end=min(n,((int)blockIdx.x+1)*64);
++    for(int j=blockIdx.x*64+warp;j<end;j+=8){
++        const int loc=first+j;
++        const int slot=(cap&(cap-1)) ? loc%cap : loc&(cap-1);
++        const size_t head=(size_t)slot*HK+kv;
++        const char4 k=((const char4*)(kq+head*128))[lane];
++        float dot=q.x*(float)k.x+q.y*(float)k.y+q.z*(float)k.z+q.w*(float)k.w;
++        #pragma unroll
++        for(int o=16;o;o>>=1)dot+=__shfl_xor_sync(0xffffffffu,dot,o);
++        if(!lane){
++            const int dist=qpos-loc;
++            const float bias=dist<extent?rel[(size_t)row*extent+dist]:-sink[row];
++            const float dkkq=__half2float(ks[head])*scale;
++            scores[(size_t)row*window+j]=dot*dkkq+bias;
++        }
++    }
++}
++
++__global__ void verify_swa_weighted(const int8_t* vq,const __half* vs,const float* scores,
++                                     float* part,int H,int HK,int window,int cap,const int* pos){
++    const int row=blockIdx.x/4, w=blockIdx.x%4,hkv=(row%H)/3;
++    const int qpos=*pos+row/H,first=max(0,qpos-window+1),n=qpos-first+1;
++    float m=w==0?0.f:-1e30f,l=w==0?1.f:0.f,acc=0.f;
++    for(int j=w;j<n;j+=4){
++        const int loc=first+j,slot=(cap&(cap-1)) ? loc%cap : loc&(cap-1);
++        const size_t head=(size_t)slot*HK+hkv;
++        const float sc=scores[(size_t)row*window+j];
++        const float next=fmaxf(m,sc);
++        const float alpha=l>0?__expf(m-next):0.f;
++        const float p=__expf(sc-next),pv=p*__half2float(vs[head]);
++        l=l*alpha+p;
++        acc=__fmaf_rn(pv,(float)vq[head*128+threadIdx.x],__fmul_rn(acc,alpha));
++        m=next;
++    }
++    float* dst=part+(size_t)blockIdx.x*130;
++    dst[threadIdx.x]=acc;if(threadIdx.x==0){dst[128]=m;dst[129]=l;}
++}
++__global__ void verify_swa_combine(const float* part,const float* gate,float* out){
++    int row=blockIdx.x,d=threadIdx.x;
++    const float* base=part+(size_t)row*4*130;
++    float m=base[128];
++    #pragma unroll
++    for(int w=1;w<4;++w){const float* p=base+w*130;if(p[129]>0 && p[128]>m)m=p[128];}
++    float l=0.f,o=0.f;
++    #pragma unroll
++    for(int w=0;w<4;++w){
++        const float* p=base+w*130;
++        if(p[129]>0){float c=__expf(p[128]-m);l+=p[129]*c;o+=p[d]*c;}
++    }
++    size_t i=(size_t)row*128+d;
++    float v=__fdividef(o,l);if(gate)v*=sigmf(gate[i]);out[i]=v;
++}
+diff --git a/engine/src/inkling2/verify_replay.cuh b/engine/src/inkling2/verify_replay.cuh
+--- a/engine/src/inkling2/verify_replay.cuh
++++ b/engine/src/inkling2/verify_replay.cuh
+@@ -70,7 +70,7 @@
+             for(int j=0;j<=w.count;++j)e.forward(&w.ids[j],1,false,nullptr,false,true);
+             reference_next=e.forward(&next,1,false,nullptr,false,true);
+         }
+-        if(i==0) if(const char* file=std::getenv("VW_LOGITS_OUT")) {
++        if(i==(std::getenv("VW_LOGITS_ROUND")?std::atoi(std::getenv("VW_LOGITS_ROUND")):0)) if(const char* file=std::getenv("VW_LOGITS_OUT")) {
+             state(true);
+             std::vector<float> logits;
+             e.forward(w.ids.data(),width,true,&logits,true,true,spec);

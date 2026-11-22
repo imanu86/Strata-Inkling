@@ -1,0 +1,1110 @@
+{
+  "runs": {
+    "dual-ar-A": {
+      "binary_sha256": "848d9297342299ae25c5d1ae9566f5950a5946f6b78d5073b754f18a85eb7e9f",
+      "args": [
+        "--serve",
+        "--native",
+        "Inkling-2-Mini-UD-Q3_K_XL.gguf",
+        "--max-context",
+        "262144",
+        "--chunk",
+        "64",
+        "--kv-q8",
+        "--layer-split-device",
+        "1",
+        "--split-core-graph",
+        "--split-outer-graph",
+        "--batch-qkv-control-t1",
+        "--gpu-full-vocab",
+        "--split-depth-mix"
+      ],
+      "env": {
+        "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+        "STRATA_IK2_ASTRA_NV": "1",
+        "STRATA_ATTN_PREP_T1": "1",
+        "STRATA_IK2_ASTRA_TIME_SPLIT": "48",
+        "STRATA_IK2_ASTRA_PP_MMA": "1",
+        "STRATA_DSPARK_FUSION": "1",
+        "STRATA_IK2_VERIFY_FUSED_GU": "1",
+        "STRATA_IK2_VERIFY_BF16_THIN": "1",
+        "STRATA_IK2_VERIFY_ATTN": "0",
+        "STRATA_IK2_VERIFY_ATTN_EXACT": "0",
+        "STRATA_IK2_VERIFY_CONTROL_STREAMS": "0",
+        "STRATA_IK2_VERIFY_EXPERT_PAIR": "0"
+      },
+      "visible_devices_in_order": [
+        "2080 Ti",
+        "3080 Ti"
+      ],
+      "gpu_state_before": "name, pstate, temperature.gpu, clocks.current.sm [MHz], clocks.current.memory [MHz], memory.used [MiB], pcie.link.width.current, power.draw [W]\nNVIDIA GeForce RTX 3080 Ti, P8, 38, 210 MHz, 405 MHz, 0 MiB, 4, 9.20 W\nNVIDIA GeForce RTX 3060, P8, 34, 210 MHz, 405 MHz, 1662 MiB, 4, 12.34 W\nNVIDIA GeForce RTX 2080 Ti, P8, 28, 300 MHz, 405 MHz, 0 MiB, 16, 6.29 W\n",
+      "prompt_tokens": 3215,
+      "prompt_sha256_csv_ids": "d598b71c430736b9b83118dc1c171737f7f235062f81b74961e09df6dea0531f",
+      "reused": 0,
+      "generated": 256,
+      "output_sha256_csv_ids": "632ed965bfdd94cd19c48e80d214aa07da98bf6def3489d0455426a764649332",
+      "prefill_tps": 445.1909682315048,
+      "decode_forward_tps": 86.79078315918451,
+      "request_wall_seconds": 10.155999999959022,
+      "resident_experts": [
+        "1536/1536",
+        "1536/1536"
+      ]
+    },
+    "final-A": {
+      "binary_sha256": "047b5ecdb93520a387ade75b6bf40461eb19113be4ac538cdbf7cfeca1a36f78",
+      "args": [
+        "--serve",
+        "--native",
+        "Inkling-2-Mini-UD-Q3_K_XL.gguf",
+        "--max-context",
+        "262144",
+        "--chunk",
+        "64",
+        "--kv-q8",
+        "--batch-qkv-control-t1",
+        "--gpu-full-vocab",
+        "--split-depth-mix"
+      ],
+      "env": {
+        "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+        "STRATA_IK2_ASTRA_NV": "1",
+        "STRATA_ATTN_PREP_T1": "1",
+        "STRATA_IK2_ASTRA_TIME_SPLIT": "48",
+        "STRATA_IK2_ASTRA_PP_MMA": "1",
+        "STRATA_DSPARK_FUSION": "1",
+        "STRATA_IK2_VERIFY_FUSED_GU": "1",
+        "STRATA_IK2_VERIFY_BF16_THIN": "1",
+        "STRATA_IK2_VERIFY_ATTN": "0",
+        "STRATA_IK2_VERIFY_ATTN_EXACT": "0",
+        "STRATA_IK2_VERIFY_CONTROL_STREAMS": "0",
+        "STRATA_IK2_VERIFY_EXPERT_PAIR": "0"
+      },
+      "visible_devices_in_order": [
+        "3080 Ti"
+      ],
+      "gpu_state_before": "name, pstate, temperature.gpu, clocks.current.sm [MHz], clocks.current.memory [MHz], memory.used [MiB], pcie.link.width.current, power.draw [W]\nNVIDIA GeForce RTX 3080 Ti, P3, 51, 465 MHz, 5001 MHz, 0 MiB, 4, 107.46 W\nNVIDIA GeForce RTX 3060, P8, 34, 210 MHz, 405 MHz, 1662 MiB, 4, 12.34 W\nNVIDIA GeForce RTX 2080 Ti, P8, 29, 300 MHz, 405 MHz, 0 MiB, 16, 6.43 W\n",
+      "prompt_tokens": 3215,
+      "prompt_sha256_csv_ids": "d598b71c430736b9b83118dc1c171737f7f235062f81b74961e09df6dea0531f",
+      "reused": 0,
+      "generated": 256,
+      "output_sha256_csv_ids": "402264415a8d594d45d70e8a091120a8e79d86fae6e1cf36b104bff387ae0b7b",
+      "prefill_tps": 38.33216111239812,
+      "decode_forward_tps": 39.431871776831066,
+      "request_wall_seconds": 90.34399999992456,
+      "resident_experts": [
+        "1155/3072"
+      ]
+    },
+    "final-B1": {
+      "binary_sha256": "047b5ecdb93520a387ade75b6bf40461eb19113be4ac538cdbf7cfeca1a36f78",
+      "args": [
+        "--serve",
+        "--native",
+        "Inkling-2-Mini-UD-Q3_K_XL.gguf",
+        "--max-context",
+        "262144",
+        "--chunk",
+        "64",
+        "--kv-q8",
+        "--batch-qkv-control-t1",
+        "--gpu-full-vocab",
+        "--split-depth-mix",
+        "--host-kv-ring",
+        "8192",
+        "--host-kv-stage",
+        "8256",
+        "--host-kv-tiled"
+      ],
+      "env": {
+        "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+        "STRATA_IK2_ASTRA_NV": "1",
+        "STRATA_ATTN_PREP_T1": "1",
+        "STRATA_IK2_ASTRA_TIME_SPLIT": "48",
+        "STRATA_IK2_ASTRA_PP_MMA": "1",
+        "STRATA_DSPARK_FUSION": "1",
+        "STRATA_IK2_VERIFY_FUSED_GU": "1",
+        "STRATA_IK2_VERIFY_BF16_THIN": "1",
+        "STRATA_IK2_VERIFY_ATTN": "0",
+        "STRATA_IK2_VERIFY_ATTN_EXACT": "0",
+        "STRATA_IK2_VERIFY_CONTROL_STREAMS": "0",
+        "STRATA_IK2_VERIFY_EXPERT_PAIR": "0"
+      },
+      "visible_devices_in_order": [
+        "3080 Ti"
+      ],
+      "gpu_state_before": "name, pstate, temperature.gpu, clocks.current.sm [MHz], clocks.current.memory [MHz], memory.used [MiB], pcie.link.width.current, power.draw [W]\nNVIDIA GeForce RTX 3080 Ti, P5, 51, 1935 MHz, 9251 MHz, 0 MiB, 4, 119.88 W\nNVIDIA GeForce RTX 3060, P8, 34, 210 MHz, 405 MHz, 1662 MiB, 4, 12.33 W\nNVIDIA GeForce RTX 2080 Ti, P8, 29, 300 MHz, 405 MHz, 0 MiB, 16, 6.53 W\n",
+      "prompt_tokens": 3215,
+      "prompt_sha256_csv_ids": "d598b71c430736b9b83118dc1c171737f7f235062f81b74961e09df6dea0531f",
+      "reused": 0,
+      "generated": 256,
+      "output_sha256_csv_ids": "0069fa7da50ee2cd7f194ae1cfa06d6691d8809a6c8fc51d53d8a4a89a26507b",
+      "prefill_tps": 128.29645059788538,
+      "decode_forward_tps": 75.53541277881453,
+      "request_wall_seconds": 28.453000000095926,
+      "resident_experts": [
+        "2275/3072"
+      ]
+    },
+    "final-B2": {
+      "binary_sha256": "047b5ecdb93520a387ade75b6bf40461eb19113be4ac538cdbf7cfeca1a36f78",
+      "args": [
+        "--serve",
+        "--native",
+        "Inkling-2-Mini-UD-Q3_K_XL.gguf",
+        "--max-context",
+        "262144",
+        "--chunk",
+        "64",
+        "--kv-q8",
+        "--batch-qkv-control-t1",
+        "--gpu-full-vocab",
+        "--split-depth-mix",
+        "--host-kv-ring",
+        "8192",
+        "--host-kv-stage",
+        "8256",
+        "--host-kv-tiled"
+      ],
+      "env": {
+        "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+        "STRATA_IK2_ASTRA_NV": "1",
+        "STRATA_ATTN_PREP_T1": "1",
+        "STRATA_IK2_ASTRA_TIME_SPLIT": "48",
+        "STRATA_IK2_ASTRA_PP_MMA": "1",
+        "STRATA_DSPARK_FUSION": "1",
+        "STRATA_IK2_VERIFY_FUSED_GU": "1",
+        "STRATA_IK2_VERIFY_BF16_THIN": "1",
+        "STRATA_IK2_VERIFY_ATTN": "0",
+        "STRATA_IK2_VERIFY_ATTN_EXACT": "0",
+        "STRATA_IK2_VERIFY_CONTROL_STREAMS": "0",
+        "STRATA_IK2_VERIFY_EXPERT_PAIR": "0"
+      },
+      "visible_devices_in_order": [
+        "3080 Ti"
+      ],
+      "gpu_state_before": "name, pstate, temperature.gpu, clocks.current.sm [MHz], clocks.current.memory [MHz], memory.used [MiB], pcie.link.width.current, power.draw [W]\nNVIDIA GeForce RTX 3080 Ti, P3, 51, 420 MHz, 5001 MHz, 0 MiB, 4, 96.83 W\nNVIDIA GeForce RTX 3060, P8, 34, 210 MHz, 405 MHz, 1662 MiB, 4, 12.34 W\nNVIDIA GeForce RTX 2080 Ti, P8, 29, 300 MHz, 405 MHz, 0 MiB, 16, 6.23 W\n",
+      "prompt_tokens": 3215,
+      "prompt_sha256_csv_ids": "d598b71c430736b9b83118dc1c171737f7f235062f81b74961e09df6dea0531f",
+      "reused": 0,
+      "generated": 256,
+      "output_sha256_csv_ids": "0069fa7da50ee2cd7f194ae1cfa06d6691d8809a6c8fc51d53d8a4a89a26507b",
+      "prefill_tps": 128.23488962226747,
+      "decode_forward_tps": 73.59732163472638,
+      "request_wall_seconds": 28.546999999904074,
+      "resident_experts": [
+        "2275/3072"
+      ]
+    },
+    "final-10k": {
+      "binary_sha256": "047b5ecdb93520a387ade75b6bf40461eb19113be4ac538cdbf7cfeca1a36f78",
+      "args": [
+        "--serve",
+        "--native",
+        "Inkling-2-Mini-UD-Q3_K_XL.gguf",
+        "--max-context",
+        "262144",
+        "--chunk",
+        "64",
+        "--kv-q8",
+        "--batch-qkv-control-t1",
+        "--gpu-full-vocab",
+        "--split-depth-mix",
+        "--host-kv-ring",
+        "8192",
+        "--host-kv-stage",
+        "8256",
+        "--host-kv-tiled"
+      ],
+      "env": {
+        "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+        "STRATA_IK2_ASTRA_NV": "1",
+        "STRATA_ATTN_PREP_T1": "1",
+        "STRATA_IK2_ASTRA_TIME_SPLIT": "48",
+        "STRATA_IK2_ASTRA_PP_MMA": "1",
+        "STRATA_DSPARK_FUSION": "1",
+        "STRATA_IK2_VERIFY_FUSED_GU": "1",
+        "STRATA_IK2_VERIFY_BF16_THIN": "1",
+        "STRATA_IK2_VERIFY_ATTN": "0",
+        "STRATA_IK2_VERIFY_ATTN_EXACT": "0",
+        "STRATA_IK2_VERIFY_CONTROL_STREAMS": "0",
+        "STRATA_IK2_VERIFY_EXPERT_PAIR": "0"
+      },
+      "visible_devices_in_order": [
+        "3080 Ti"
+      ],
+      "gpu_state_before": "name, pstate, temperature.gpu, clocks.current.sm [MHz], clocks.current.memory [MHz], memory.used [MiB], pcie.link.width.current, power.draw [W]\nNVIDIA GeForce RTX 3080 Ti, P3, 51, 315 MHz, 5001 MHz, 0 MiB, 4, 88.86 W\nNVIDIA GeForce RTX 3060, P8, 34, 210 MHz, 405 MHz, 1662 MiB, 4, 12.40 W\nNVIDIA GeForce RTX 2080 Ti, P3, 32, 480 MHz, 5000 MHz, 0 MiB, 16, 41.32 W\n",
+      "prompt_tokens": 10000,
+      "prompt_sha256_csv_ids": "4c0b198a6cefb5402d92548dcab9914443b2c13e253ca99ea945a9dc8bbd229c",
+      "reused": 0,
+      "generated": 128,
+      "output_sha256_csv_ids": "88a11d4ba3f16ec70860d2ad24c4b2d657fd62955ff08c3f33f01434b57f7038",
+      "prefill_tps": 123.6676205150237,
+      "decode_forward_tps": 48.81311112477707,
+      "request_wall_seconds": 83.48399999993853,
+      "resident_experts": [
+        "2275/3072"
+      ]
+    },
+    "tiny-B1": {
+      "binary_sha256": "3ba3813a5ae64133338b1e4ce4af5cff6d9bece366817e14e76122b43187b6e5",
+      "args": [
+        "--serve",
+        "--native",
+        "Inkling-2-Mini-UD-Q3_K_XL.gguf",
+        "--max-context",
+        "262144",
+        "--chunk",
+        "64",
+        "--kv-q8",
+        "--batch-qkv-control-t1",
+        "--gpu-full-vocab",
+        "--split-depth-mix",
+        "--host-kv-ring",
+        "64",
+        "--host-kv-stage",
+        "256",
+        "--host-kv-tiled",
+        "--host-kv-all"
+      ],
+      "env": {
+        "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+        "STRATA_IK2_ASTRA_NV": "1",
+        "STRATA_ATTN_PREP_T1": "1",
+        "STRATA_IK2_ASTRA_TIME_SPLIT": "48",
+        "STRATA_IK2_ASTRA_PP_MMA": "1",
+        "STRATA_DSPARK_FUSION": "1",
+        "STRATA_IK2_VERIFY_FUSED_GU": "1",
+        "STRATA_IK2_VERIFY_BF16_THIN": "1",
+        "STRATA_IK2_VERIFY_ATTN": "0",
+        "STRATA_IK2_VERIFY_ATTN_EXACT": "0",
+        "STRATA_IK2_VERIFY_CONTROL_STREAMS": "0",
+        "STRATA_IK2_VERIFY_EXPERT_PAIR": "0"
+      },
+      "visible_devices_in_order": [
+        "3080 Ti"
+      ],
+      "gpu_state_before": "name, pstate, temperature.gpu, clocks.current.sm [MHz], clocks.current.memory [MHz], memory.used [MiB], pcie.link.width.current, power.draw [W]\nNVIDIA GeForce RTX 3080 Ti, P3, 51, 420 MHz, 5001 MHz, 0 MiB, 4, 98.82 W\nNVIDIA GeForce RTX 3060, P8, 35, 210 MHz, 405 MHz, 1672 MiB, 4, 13.16 W\nNVIDIA GeForce RTX 2080 Ti, P8, 29, 300 MHz, 405 MHz, 0 MiB, 16, 5.81 W\n",
+      "prompt_tokens": 3215,
+      "prompt_sha256_csv_ids": "d598b71c430736b9b83118dc1c171737f7f235062f81b74961e09df6dea0531f",
+      "reused": 0,
+      "generated": 256,
+      "output_sha256_csv_ids": "da5cb440f31f0c507e6080e58a6e1b654dc3a8a82d84ea629eb7cbf299fa989c",
+      "prefill_tps": 130.38782571101922,
+      "decode_forward_tps": 23.052014384456974,
+      "request_wall_seconds": 35.73400000005495,
+      "resident_experts": [
+        "2358/3072"
+      ]
+    },
+    "tiny-A": {
+      "binary_sha256": "3ba3813a5ae64133338b1e4ce4af5cff6d9bece366817e14e76122b43187b6e5",
+      "args": [
+        "--serve",
+        "--native",
+        "Inkling-2-Mini-UD-Q3_K_XL.gguf",
+        "--max-context",
+        "262144",
+        "--chunk",
+        "64",
+        "--kv-q8",
+        "--batch-qkv-control-t1",
+        "--gpu-full-vocab",
+        "--split-depth-mix",
+        "--host-kv-ring",
+        "8192",
+        "--host-kv-stage",
+        "8256",
+        "--host-kv-tiled"
+      ],
+      "env": {
+        "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+        "STRATA_IK2_ASTRA_NV": "1",
+        "STRATA_ATTN_PREP_T1": "1",
+        "STRATA_IK2_ASTRA_TIME_SPLIT": "48",
+        "STRATA_IK2_ASTRA_PP_MMA": "1",
+        "STRATA_DSPARK_FUSION": "1",
+        "STRATA_IK2_VERIFY_FUSED_GU": "1",
+        "STRATA_IK2_VERIFY_BF16_THIN": "1",
+        "STRATA_IK2_VERIFY_ATTN": "0",
+        "STRATA_IK2_VERIFY_ATTN_EXACT": "0",
+        "STRATA_IK2_VERIFY_CONTROL_STREAMS": "0",
+        "STRATA_IK2_VERIFY_EXPERT_PAIR": "0"
+      },
+      "visible_devices_in_order": [
+        "3080 Ti"
+      ],
+      "gpu_state_before": "name, pstate, temperature.gpu, clocks.current.sm [MHz], clocks.current.memory [MHz], memory.used [MiB], pcie.link.width.current, power.draw [W]\nNVIDIA GeForce RTX 3080 Ti, P3, 55, 1950 MHz, 9251 MHz, 0 MiB, 4, 123.23 W\nNVIDIA GeForce RTX 3060, P8, 35, 210 MHz, 405 MHz, 1672 MiB, 4, 12.39 W\nNVIDIA GeForce RTX 2080 Ti, P8, 29, 300 MHz, 405 MHz, 0 MiB, 16, 6.05 W\n",
+      "prompt_tokens": 3215,
+      "prompt_sha256_csv_ids": "d598b71c430736b9b83118dc1c171737f7f235062f81b74961e09df6dea0531f",
+      "reused": 0,
+      "generated": 256,
+      "output_sha256_csv_ids": "0069fa7da50ee2cd7f194ae1cfa06d6691d8809a6c8fc51d53d8a4a89a26507b",
+      "prefill_tps": 128.2703452128031,
+      "decode_forward_tps": 73.8969789176266,
+      "request_wall_seconds": 28.530999999959022,
+      "resident_experts": [
+        "2275/3072"
+      ]
+    },
+    "tiny-B2": {
+      "binary_sha256": "3ba3813a5ae64133338b1e4ce4af5cff6d9bece366817e14e76122b43187b6e5",
+      "args": [
+        "--serve",
+        "--native",
+        "Inkling-2-Mini-UD-Q3_K_XL.gguf",
+        "--max-context",
+        "262144",
+        "--chunk",
+        "64",
+        "--kv-q8",
+        "--batch-qkv-control-t1",
+        "--gpu-full-vocab",
+        "--split-depth-mix",
+        "--host-kv-ring",
+        "64",
+        "--host-kv-stage",
+        "256",
+        "--host-kv-tiled",
+        "--host-kv-all"
+      ],
+      "env": {
+        "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+        "STRATA_IK2_ASTRA_NV": "1",
+        "STRATA_ATTN_PREP_T1": "1",
+        "STRATA_IK2_ASTRA_TIME_SPLIT": "48",
+        "STRATA_IK2_ASTRA_PP_MMA": "1",
+        "STRATA_DSPARK_FUSION": "1",
+        "STRATA_IK2_VERIFY_FUSED_GU": "1",
+        "STRATA_IK2_VERIFY_BF16_THIN": "1",
+        "STRATA_IK2_VERIFY_ATTN": "0",
+        "STRATA_IK2_VERIFY_ATTN_EXACT": "0",
+        "STRATA_IK2_VERIFY_CONTROL_STREAMS": "0",
+        "STRATA_IK2_VERIFY_EXPERT_PAIR": "0"
+      },
+      "visible_devices_in_order": [
+        "3080 Ti"
+      ],
+      "gpu_state_before": "name, pstate, temperature.gpu, clocks.current.sm [MHz], clocks.current.memory [MHz], memory.used [MiB], pcie.link.width.current, power.draw [W]\nNVIDIA GeForce RTX 3080 Ti, P2, 55, 1950 MHz, 9251 MHz, 0 MiB, 4, 124.92 W\nNVIDIA GeForce RTX 3060, P8, 35, 210 MHz, 405 MHz, 1672 MiB, 4, 12.17 W\nNVIDIA GeForce RTX 2080 Ti, P8, 29, 300 MHz, 405 MHz, 0 MiB, 16, 5.33 W\n",
+      "prompt_tokens": 3215,
+      "prompt_sha256_csv_ids": "d598b71c430736b9b83118dc1c171737f7f235062f81b74961e09df6dea0531f",
+      "reused": 0,
+      "generated": 256,
+      "output_sha256_csv_ids": "da5cb440f31f0c507e6080e58a6e1b654dc3a8a82d84ea629eb7cbf299fa989c",
+      "prefill_tps": 130.37672181419512,
+      "decode_forward_tps": 23.124930851922453,
+      "request_wall_seconds": 35.703000000095926,
+      "resident_experts": [
+        "2358/3072"
+      ]
+    },
+    "tiny-free": {
+      "binary_sha256": "3ba3813a5ae64133338b1e4ce4af5cff6d9bece366817e14e76122b43187b6e5",
+      "args": [
+        "--serve",
+        "--native",
+        "Inkling-2-Mini-UD-Q3_K_XL.gguf",
+        "--max-context",
+        "262144",
+        "--chunk",
+        "64",
+        "--kv-q8",
+        "--batch-qkv-control-t1",
+        "--gpu-full-vocab",
+        "--split-depth-mix",
+        "--host-kv-ring",
+        "64",
+        "--host-kv-stage",
+        "256",
+        "--host-kv-tiled",
+        "--host-kv-all"
+      ],
+      "env": {
+        "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+        "STRATA_IK2_ASTRA_NV": "1",
+        "STRATA_ATTN_PREP_T1": "1",
+        "STRATA_IK2_ASTRA_TIME_SPLIT": "48",
+        "STRATA_IK2_ASTRA_PP_MMA": "1",
+        "STRATA_DSPARK_FUSION": "1",
+        "STRATA_IK2_VERIFY_FUSED_GU": "1",
+        "STRATA_IK2_VERIFY_BF16_THIN": "1",
+        "STRATA_IK2_VERIFY_ATTN": "0",
+        "STRATA_IK2_VERIFY_ATTN_EXACT": "0",
+        "STRATA_IK2_VERIFY_CONTROL_STREAMS": "0",
+        "STRATA_IK2_VERIFY_EXPERT_PAIR": "0"
+      },
+      "visible_devices_in_order": [
+        "3080 Ti"
+      ],
+      "gpu_state_before": "name, pstate, temperature.gpu, clocks.current.sm [MHz], clocks.current.memory [MHz], memory.used [MiB], pcie.link.width.current, power.draw [W]\nNVIDIA GeForce RTX 3080 Ti, P3, 53, 390 MHz, 5001 MHz, 0 MiB, 4, 101.08 W\nNVIDIA GeForce RTX 3060, P8, 34, 210 MHz, 405 MHz, 1672 MiB, 4, 12.44 W\nNVIDIA GeForce RTX 2080 Ti, P8, 29, 300 MHz, 405 MHz, 0 MiB, 16, 6.55 W\n",
+      "prompt_tokens": 136,
+      "prompt_sha256_csv_ids": "69782439c27266df4d2221b00aaa81f85fc78d825680064766a9d52256f9a26a",
+      "reused": 0,
+      "generated": 321,
+      "output_sha256_csv_ids": "625619acd556c6cdb8ec3d076bf11f75d939690cd6e0c69ee5515b4ab39a9811",
+      "prefill_tps": 138.5140296379284,
+      "decode_forward_tps": 52.82018523378709,
+      "request_wall_seconds": 7.047000000020489,
+      "resident_experts": [
+        "2358/3072"
+      ],
+      "python_tests": {
+        "passed": 305,
+        "total": 305,
+        "first_error": null
+      }
+    },
+    "tiny-10k": {
+      "binary_sha256": "3ba3813a5ae64133338b1e4ce4af5cff6d9bece366817e14e76122b43187b6e5",
+      "args": [
+        "--serve",
+        "--native",
+        "Inkling-2-Mini-UD-Q3_K_XL.gguf",
+        "--max-context",
+        "262144",
+        "--chunk",
+        "64",
+        "--kv-q8",
+        "--batch-qkv-control-t1",
+        "--gpu-full-vocab",
+        "--split-depth-mix",
+        "--host-kv-ring",
+        "64",
+        "--host-kv-stage",
+        "256",
+        "--host-kv-tiled",
+        "--host-kv-all"
+      ],
+      "env": {
+        "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+        "STRATA_IK2_ASTRA_NV": "1",
+        "STRATA_ATTN_PREP_T1": "1",
+        "STRATA_IK2_ASTRA_TIME_SPLIT": "48",
+        "STRATA_IK2_ASTRA_PP_MMA": "1",
+        "STRATA_DSPARK_FUSION": "1",
+        "STRATA_IK2_VERIFY_FUSED_GU": "1",
+        "STRATA_IK2_VERIFY_BF16_THIN": "1",
+        "STRATA_IK2_VERIFY_ATTN": "0",
+        "STRATA_IK2_VERIFY_ATTN_EXACT": "0",
+        "STRATA_IK2_VERIFY_CONTROL_STREAMS": "0",
+        "STRATA_IK2_VERIFY_EXPERT_PAIR": "0"
+      },
+      "visible_devices_in_order": [
+        "3080 Ti"
+      ],
+      "gpu_state_before": "name, pstate, temperature.gpu, clocks.current.sm [MHz], clocks.current.memory [MHz], memory.used [MiB], pcie.link.width.current, power.draw [W]\nNVIDIA GeForce RTX 3080 Ti, P3, 52, 390 MHz, 5001 MHz, 0 MiB, 4, 77.76 W\nNVIDIA GeForce RTX 3060, P8, 35, 210 MHz, 405 MHz, 1672 MiB, 4, 12.30 W\nNVIDIA GeForce RTX 2080 Ti, P8, 29, 300 MHz, 405 MHz, 0 MiB, 16, 7.66 W\n",
+      "prompt_tokens": 10000,
+      "prompt_sha256_csv_ids": "4c0b198a6cefb5402d92548dcab9914443b2c13e253ca99ea945a9dc8bbd229c",
+      "reused": 0,
+      "generated": 128,
+      "output_sha256_csv_ids": "17428da9225a7cc00d97a9caa21068a50d68cea36683c17e17ad359d899b1cef",
+      "prefill_tps": 122.2718550853537,
+      "decode_forward_tps": 13.348412484864792,
+      "request_wall_seconds": 91.31299999996554,
+      "resident_experts": [
+        "2358/3072"
+      ]
+    },
+    "worker-B1": {
+      "binary_sha256": "a4b078a4c676e81fd3469cbdc52629e7fd5121ff92885ba4bfb023d7eae0de38",
+      "args": [
+        "--serve",
+        "--native",
+        "Inkling-2-Mini-UD-Q3_K_XL.gguf",
+        "--max-context",
+        "262144",
+        "--chunk",
+        "64",
+        "--kv-q8",
+        "--batch-qkv-control-t1",
+        "--gpu-full-vocab",
+        "--split-depth-mix",
+        "--attention-worker-device",
+        "1"
+      ],
+      "env": {
+        "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+        "STRATA_IK2_ASTRA_NV": "1",
+        "STRATA_ATTN_PREP_T1": "1",
+        "STRATA_IK2_ASTRA_TIME_SPLIT": "48",
+        "STRATA_IK2_ASTRA_PP_MMA": "1",
+        "STRATA_DSPARK_FUSION": "1",
+        "STRATA_IK2_VERIFY_FUSED_GU": "1",
+        "STRATA_IK2_VERIFY_BF16_THIN": "1",
+        "STRATA_IK2_VERIFY_ATTN": "0",
+        "STRATA_IK2_VERIFY_ATTN_EXACT": "0",
+        "STRATA_IK2_VERIFY_CONTROL_STREAMS": "0",
+        "STRATA_IK2_VERIFY_EXPERT_PAIR": "0"
+      },
+      "visible_devices_in_order": [
+        "3080 Ti",
+        "2080 Ti"
+      ],
+      "gpu_state_before": "name, pstate, temperature.gpu, clocks.current.sm [MHz], clocks.current.memory [MHz], memory.used [MiB], pcie.link.width.current, power.draw [W]\nNVIDIA GeForce RTX 3080 Ti, P3, 51, 525 MHz, 5001 MHz, 0 MiB, 4, 116.39 W\nNVIDIA GeForce RTX 3060, P5, 34, 210 MHz, 810 MHz, 1672 MiB, 4, 12.81 W\nNVIDIA GeForce RTX 2080 Ti, P8, 31, 435 MHz, 405 MHz, 0 MiB, 16, 5.79 W\n",
+      "prompt_tokens": 3215,
+      "prompt_sha256_csv_ids": "d598b71c430736b9b83118dc1c171737f7f235062f81b74961e09df6dea0531f",
+      "reused": 0,
+      "generated": 256,
+      "output_sha256_csv_ids": "457e1d9836dfa557d2f0509566d501d0a028af880f01f8534e0b649f2bd39d32",
+      "prefill_tps": 101.06347697968891,
+      "decode_forward_tps": 22.133591413902497,
+      "request_wall_seconds": 43.34299999999348,
+      "resident_experts": [
+        "2360/3072"
+      ]
+    },
+    "worker-A": {
+      "binary_sha256": "a4b078a4c676e81fd3469cbdc52629e7fd5121ff92885ba4bfb023d7eae0de38",
+      "args": [
+        "--serve",
+        "--native",
+        "Inkling-2-Mini-UD-Q3_K_XL.gguf",
+        "--max-context",
+        "262144",
+        "--chunk",
+        "64",
+        "--kv-q8",
+        "--batch-qkv-control-t1",
+        "--gpu-full-vocab",
+        "--split-depth-mix",
+        "--host-kv-ring",
+        "64",
+        "--host-kv-stage",
+        "256",
+        "--host-kv-tiled",
+        "--host-kv-all"
+      ],
+      "env": {
+        "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+        "STRATA_IK2_ASTRA_NV": "1",
+        "STRATA_ATTN_PREP_T1": "1",
+        "STRATA_IK2_ASTRA_TIME_SPLIT": "48",
+        "STRATA_IK2_ASTRA_PP_MMA": "1",
+        "STRATA_DSPARK_FUSION": "1",
+        "STRATA_IK2_VERIFY_FUSED_GU": "1",
+        "STRATA_IK2_VERIFY_BF16_THIN": "1",
+        "STRATA_IK2_VERIFY_ATTN": "0",
+        "STRATA_IK2_VERIFY_ATTN_EXACT": "0",
+        "STRATA_IK2_VERIFY_CONTROL_STREAMS": "0",
+        "STRATA_IK2_VERIFY_EXPERT_PAIR": "0"
+      },
+      "visible_devices_in_order": [
+        "3080 Ti"
+      ],
+      "gpu_state_before": "name, pstate, temperature.gpu, clocks.current.sm [MHz], clocks.current.memory [MHz], memory.used [MiB], pcie.link.width.current, power.draw [W]\nNVIDIA GeForce RTX 3080 Ti, P3, 49, 1350 MHz, 5001 MHz, 0 MiB, 4, 66.94 W\nNVIDIA GeForce RTX 3060, P5, 34, 210 MHz, 810 MHz, 1672 MiB, 4, 12.87 W\nNVIDIA GeForce RTX 2080 Ti, P8, 31, 330 MHz, 405 MHz, 0 MiB, 16, 6.68 W\n",
+      "prompt_tokens": 3215,
+      "prompt_sha256_csv_ids": "d598b71c430736b9b83118dc1c171737f7f235062f81b74961e09df6dea0531f",
+      "reused": 0,
+      "generated": 256,
+      "output_sha256_csv_ids": "da5cb440f31f0c507e6080e58a6e1b654dc3a8a82d84ea629eb7cbf299fa989c",
+      "prefill_tps": 130.4177098731277,
+      "decode_forward_tps": 23.19408996396275,
+      "request_wall_seconds": 35.65599999995902,
+      "resident_experts": [
+        "2358/3072"
+      ]
+    },
+    "worker-B2": {
+      "binary_sha256": "a4b078a4c676e81fd3469cbdc52629e7fd5121ff92885ba4bfb023d7eae0de38",
+      "args": [
+        "--serve",
+        "--native",
+        "Inkling-2-Mini-UD-Q3_K_XL.gguf",
+        "--max-context",
+        "262144",
+        "--chunk",
+        "64",
+        "--kv-q8",
+        "--batch-qkv-control-t1",
+        "--gpu-full-vocab",
+        "--split-depth-mix",
+        "--attention-worker-device",
+        "1"
+      ],
+      "env": {
+        "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+        "STRATA_IK2_ASTRA_NV": "1",
+        "STRATA_ATTN_PREP_T1": "1",
+        "STRATA_IK2_ASTRA_TIME_SPLIT": "48",
+        "STRATA_IK2_ASTRA_PP_MMA": "1",
+        "STRATA_DSPARK_FUSION": "1",
+        "STRATA_IK2_VERIFY_FUSED_GU": "1",
+        "STRATA_IK2_VERIFY_BF16_THIN": "1",
+        "STRATA_IK2_VERIFY_ATTN": "0",
+        "STRATA_IK2_VERIFY_ATTN_EXACT": "0",
+        "STRATA_IK2_VERIFY_CONTROL_STREAMS": "0",
+        "STRATA_IK2_VERIFY_EXPERT_PAIR": "0"
+      },
+      "visible_devices_in_order": [
+        "3080 Ti",
+        "2080 Ti"
+      ],
+      "gpu_state_before": "name, pstate, temperature.gpu, clocks.current.sm [MHz], clocks.current.memory [MHz], memory.used [MiB], pcie.link.width.current, power.draw [W]\nNVIDIA GeForce RTX 3080 Ti, P3, 54, 1950 MHz, 9251 MHz, 0 MiB, 4, 122.86 W\nNVIDIA GeForce RTX 3060, P8, 34, 210 MHz, 810 MHz, 1672 MiB, 4, 12.69 W\nNVIDIA GeForce RTX 2080 Ti, P8, 30, 300 MHz, 405 MHz, 0 MiB, 16, 7.13 W\n",
+      "prompt_tokens": 3215,
+      "prompt_sha256_csv_ids": "d598b71c430736b9b83118dc1c171737f7f235062f81b74961e09df6dea0531f",
+      "reused": 0,
+      "generated": 256,
+      "output_sha256_csv_ids": "457e1d9836dfa557d2f0509566d501d0a028af880f01f8534e0b649f2bd39d32",
+      "prefill_tps": 102.1311255644214,
+      "decode_forward_tps": 22.470959589283733,
+      "request_wall_seconds": 42.82799999997951,
+      "resident_experts": [
+        "2360/3072"
+      ]
+    },
+    "worker-free": {
+      "binary_sha256": "a4b078a4c676e81fd3469cbdc52629e7fd5121ff92885ba4bfb023d7eae0de38",
+      "args": [
+        "--serve",
+        "--native",
+        "Inkling-2-Mini-UD-Q3_K_XL.gguf",
+        "--max-context",
+        "262144",
+        "--chunk",
+        "64",
+        "--kv-q8",
+        "--batch-qkv-control-t1",
+        "--gpu-full-vocab",
+        "--split-depth-mix",
+        "--attention-worker-device",
+        "1"
+      ],
+      "env": {
+        "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+        "STRATA_IK2_ASTRA_NV": "1",
+        "STRATA_ATTN_PREP_T1": "1",
+        "STRATA_IK2_ASTRA_TIME_SPLIT": "48",
+        "STRATA_IK2_ASTRA_PP_MMA": "1",
+        "STRATA_DSPARK_FUSION": "1",
+        "STRATA_IK2_VERIFY_FUSED_GU": "1",
+        "STRATA_IK2_VERIFY_BF16_THIN": "1",
+        "STRATA_IK2_VERIFY_ATTN": "0",
+        "STRATA_IK2_VERIFY_ATTN_EXACT": "0",
+        "STRATA_IK2_VERIFY_CONTROL_STREAMS": "0",
+        "STRATA_IK2_VERIFY_EXPERT_PAIR": "0"
+      },
+      "visible_devices_in_order": [
+        "3080 Ti",
+        "2080 Ti"
+      ],
+      "gpu_state_before": "name, pstate, temperature.gpu, clocks.current.sm [MHz], clocks.current.memory [MHz], memory.used [MiB], pcie.link.width.current, power.draw [W]\nNVIDIA GeForce RTX 3080 Ti, P3, 49, 360 MHz, 5001 MHz, 0 MiB, 4, 65.63 W\nNVIDIA GeForce RTX 3060, P8, 35, 210 MHz, 405 MHz, 1672 MiB, 4, 12.39 W\nNVIDIA GeForce RTX 2080 Ti, P8, 31, 330 MHz, 405 MHz, 0 MiB, 16, 7.03 W\n",
+      "prompt_tokens": 136,
+      "prompt_sha256_csv_ids": "69782439c27266df4d2221b00aaa81f85fc78d825680064766a9d52256f9a26a",
+      "reused": 0,
+      "generated": 321,
+      "output_sha256_csv_ids": "625619acd556c6cdb8ec3d076bf11f75d939690cd6e0c69ee5515b4ab39a9811",
+      "prefill_tps": 101.70353419781337,
+      "decode_forward_tps": 22.19580305109058,
+      "request_wall_seconds": 15.765999999945052,
+      "resident_experts": [
+        "2360/3072"
+      ],
+      "python_tests": {
+        "passed": 305,
+        "total": 305,
+        "first_error": null
+      }
+    },
+    "worker-10k": {
+      "binary_sha256": "a4b078a4c676e81fd3469cbdc52629e7fd5121ff92885ba4bfb023d7eae0de38",
+      "args": [
+        "--serve",
+        "--native",
+        "Inkling-2-Mini-UD-Q3_K_XL.gguf",
+        "--max-context",
+        "262144",
+        "--chunk",
+        "64",
+        "--kv-q8",
+        "--batch-qkv-control-t1",
+        "--gpu-full-vocab",
+        "--split-depth-mix",
+        "--attention-worker-device",
+        "1"
+      ],
+      "env": {
+        "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+        "STRATA_IK2_ASTRA_NV": "1",
+        "STRATA_ATTN_PREP_T1": "1",
+        "STRATA_IK2_ASTRA_TIME_SPLIT": "48",
+        "STRATA_IK2_ASTRA_PP_MMA": "1",
+        "STRATA_DSPARK_FUSION": "1",
+        "STRATA_IK2_VERIFY_FUSED_GU": "1",
+        "STRATA_IK2_VERIFY_BF16_THIN": "1",
+        "STRATA_IK2_VERIFY_ATTN": "0",
+        "STRATA_IK2_VERIFY_ATTN_EXACT": "0",
+        "STRATA_IK2_VERIFY_CONTROL_STREAMS": "0",
+        "STRATA_IK2_VERIFY_EXPERT_PAIR": "0"
+      },
+      "visible_devices_in_order": [
+        "3080 Ti",
+        "2080 Ti"
+      ],
+      "gpu_state_before": "name, pstate, temperature.gpu, clocks.current.sm [MHz], clocks.current.memory [MHz], memory.used [MiB], pcie.link.width.current, power.draw [W]\nNVIDIA GeForce RTX 3080 Ti, P5, 47, 225 MHz, 810 MHz, 0 MiB, 4, 63.84 W\nNVIDIA GeForce RTX 3060, P8, 34, 210 MHz, 405 MHz, 1672 MiB, 4, 12.36 W\nNVIDIA GeForce RTX 2080 Ti, P8, 31, 300 MHz, 405 MHz, 0 MiB, 16, 7.48 W\n",
+      "prompt_tokens": 10000,
+      "prompt_sha256_csv_ids": "4c0b198a6cefb5402d92548dcab9914443b2c13e253ca99ea945a9dc8bbd229c",
+      "reused": 0,
+      "generated": 128,
+      "output_sha256_csv_ids": "17428da9225a7cc00d97a9caa21068a50d68cea36683c17e17ad359d899b1cef",
+      "prefill_tps": 100.74767874829472,
+      "decode_forward_tps": 22.828998220416672,
+      "request_wall_seconds": 104.84400000004098,
+      "resident_experts": [
+        "2360/3072"
+      ]
+    },
+    "mapped-B1": {
+      "binary_sha256": "dbe95d143841a8783fca949c91fb76674b65c878546350e3c5fd90cd5e8a4fd9",
+      "args": [
+        "--serve",
+        "--native",
+        "Inkling-2-Mini-UD-Q3_K_XL.gguf",
+        "--max-context",
+        "262144",
+        "--chunk",
+        "64",
+        "--kv-q8",
+        "--batch-qkv-control-t1",
+        "--gpu-full-vocab",
+        "--split-depth-mix",
+        "--attention-worker-device",
+        "1",
+        "--attention-worker-mapped-t1"
+      ],
+      "env": {
+        "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+        "STRATA_IK2_ASTRA_NV": "1",
+        "STRATA_ATTN_PREP_T1": "1",
+        "STRATA_IK2_ASTRA_TIME_SPLIT": "48",
+        "STRATA_IK2_ASTRA_PP_MMA": "1",
+        "STRATA_DSPARK_FUSION": "1",
+        "STRATA_IK2_VERIFY_FUSED_GU": "1",
+        "STRATA_IK2_VERIFY_BF16_THIN": "1",
+        "STRATA_IK2_VERIFY_ATTN": "0",
+        "STRATA_IK2_VERIFY_ATTN_EXACT": "0",
+        "STRATA_IK2_VERIFY_CONTROL_STREAMS": "0",
+        "STRATA_IK2_VERIFY_EXPERT_PAIR": "0"
+      },
+      "visible_devices_in_order": [
+        "3080 Ti",
+        "2080 Ti"
+      ],
+      "gpu_state_before": "name, pstate, temperature.gpu, clocks.current.sm [MHz], clocks.current.memory [MHz], memory.used [MiB], pcie.link.width.current, power.draw [W]\nNVIDIA GeForce RTX 3080 Ti, P2, 53, 1950 MHz, 9251 MHz, 0 MiB, 4, 121.22 W\nNVIDIA GeForce RTX 3060, P8, 34, 210 MHz, 405 MHz, 1672 MiB, 4, 12.26 W\nNVIDIA GeForce RTX 2080 Ti, P8, 32, 435 MHz, 405 MHz, 0 MiB, 16, 6.16 W\n",
+      "prompt_tokens": 3215,
+      "prompt_sha256_csv_ids": "d598b71c430736b9b83118dc1c171737f7f235062f81b74961e09df6dea0531f",
+      "reused": 0,
+      "generated": 256,
+      "output_sha256_csv_ids": "457e1d9836dfa557d2f0509566d501d0a028af880f01f8534e0b649f2bd39d32",
+      "prefill_tps": 101.0308287010515,
+      "decode_forward_tps": 32.070913190955245,
+      "request_wall_seconds": 39.78100000007544,
+      "resident_experts": [
+        "2360/3072"
+      ]
+    },
+    "mapped-A": {
+      "binary_sha256": "dbe95d143841a8783fca949c91fb76674b65c878546350e3c5fd90cd5e8a4fd9",
+      "args": [
+        "--serve",
+        "--native",
+        "Inkling-2-Mini-UD-Q3_K_XL.gguf",
+        "--max-context",
+        "262144",
+        "--chunk",
+        "64",
+        "--kv-q8",
+        "--batch-qkv-control-t1",
+        "--gpu-full-vocab",
+        "--split-depth-mix",
+        "--attention-worker-device",
+        "1"
+      ],
+      "env": {
+        "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+        "STRATA_IK2_ASTRA_NV": "1",
+        "STRATA_ATTN_PREP_T1": "1",
+        "STRATA_IK2_ASTRA_TIME_SPLIT": "48",
+        "STRATA_IK2_ASTRA_PP_MMA": "1",
+        "STRATA_DSPARK_FUSION": "1",
+        "STRATA_IK2_VERIFY_FUSED_GU": "1",
+        "STRATA_IK2_VERIFY_BF16_THIN": "1",
+        "STRATA_IK2_VERIFY_ATTN": "0",
+        "STRATA_IK2_VERIFY_ATTN_EXACT": "0",
+        "STRATA_IK2_VERIFY_CONTROL_STREAMS": "0",
+        "STRATA_IK2_VERIFY_EXPERT_PAIR": "0"
+      },
+      "visible_devices_in_order": [
+        "3080 Ti",
+        "2080 Ti"
+      ],
+      "gpu_state_before": "name, pstate, temperature.gpu, clocks.current.sm [MHz], clocks.current.memory [MHz], memory.used [MiB], pcie.link.width.current, power.draw [W]\nNVIDIA GeForce RTX 3080 Ti, P3, 51, 765 MHz, 5001 MHz, 0 MiB, 4, 66.76 W\nNVIDIA GeForce RTX 3060, P8, 34, 210 MHz, 405 MHz, 1672 MiB, 4, 12.36 W\nNVIDIA GeForce RTX 2080 Ti, P8, 32, 435 MHz, 405 MHz, 0 MiB, 16, 6.68 W\n",
+      "prompt_tokens": 3215,
+      "prompt_sha256_csv_ids": "d598b71c430736b9b83118dc1c171737f7f235062f81b74961e09df6dea0531f",
+      "reused": 0,
+      "generated": 256,
+      "output_sha256_csv_ids": "457e1d9836dfa557d2f0509566d501d0a028af880f01f8534e0b649f2bd39d32",
+      "prefill_tps": 100.3246587089293,
+      "decode_forward_tps": 22.51202406932644,
+      "request_wall_seconds": 43.375,
+      "resident_experts": [
+        "2360/3072"
+      ]
+    },
+    "mapped-B2": {
+      "binary_sha256": "dbe95d143841a8783fca949c91fb76674b65c878546350e3c5fd90cd5e8a4fd9",
+      "args": [
+        "--serve",
+        "--native",
+        "Inkling-2-Mini-UD-Q3_K_XL.gguf",
+        "--max-context",
+        "262144",
+        "--chunk",
+        "64",
+        "--kv-q8",
+        "--batch-qkv-control-t1",
+        "--gpu-full-vocab",
+        "--split-depth-mix",
+        "--attention-worker-device",
+        "1",
+        "--attention-worker-mapped-t1"
+      ],
+      "env": {
+        "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+        "STRATA_IK2_ASTRA_NV": "1",
+        "STRATA_ATTN_PREP_T1": "1",
+        "STRATA_IK2_ASTRA_TIME_SPLIT": "48",
+        "STRATA_IK2_ASTRA_PP_MMA": "1",
+        "STRATA_DSPARK_FUSION": "1",
+        "STRATA_IK2_VERIFY_FUSED_GU": "1",
+        "STRATA_IK2_VERIFY_BF16_THIN": "1",
+        "STRATA_IK2_VERIFY_ATTN": "0",
+        "STRATA_IK2_VERIFY_ATTN_EXACT": "0",
+        "STRATA_IK2_VERIFY_CONTROL_STREAMS": "0",
+        "STRATA_IK2_VERIFY_EXPERT_PAIR": "0"
+      },
+      "visible_devices_in_order": [
+        "3080 Ti",
+        "2080 Ti"
+      ],
+      "gpu_state_before": "name, pstate, temperature.gpu, clocks.current.sm [MHz], clocks.current.memory [MHz], memory.used [MiB], pcie.link.width.current, power.draw [W]\nNVIDIA GeForce RTX 3080 Ti, P3, 50, 1335 MHz, 5001 MHz, 0 MiB, 4, 67.17 W\nNVIDIA GeForce RTX 3060, P8, 34, 210 MHz, 405 MHz, 1672 MiB, 4, 12.02 W\nNVIDIA GeForce RTX 2080 Ti, P8, 32, 330 MHz, 405 MHz, 0 MiB, 16, 7.14 W\n",
+      "prompt_tokens": 3215,
+      "prompt_sha256_csv_ids": "d598b71c430736b9b83118dc1c171737f7f235062f81b74961e09df6dea0531f",
+      "reused": 0,
+      "generated": 256,
+      "output_sha256_csv_ids": "457e1d9836dfa557d2f0509566d501d0a028af880f01f8534e0b649f2bd39d32",
+      "prefill_tps": 102.05743341585753,
+      "decode_forward_tps": 31.48334716131326,
+      "request_wall_seconds": 39.60900000005495,
+      "resident_experts": [
+        "2360/3072"
+      ]
+    },
+    "mapped-10k": {
+      "binary_sha256": "dbe95d143841a8783fca949c91fb76674b65c878546350e3c5fd90cd5e8a4fd9",
+      "args": [
+        "--serve",
+        "--native",
+        "Inkling-2-Mini-UD-Q3_K_XL.gguf",
+        "--max-context",
+        "262144",
+        "--chunk",
+        "64",
+        "--kv-q8",
+        "--batch-qkv-control-t1",
+        "--gpu-full-vocab",
+        "--split-depth-mix",
+        "--attention-worker-device",
+        "1",
+        "--attention-worker-mapped-t1"
+      ],
+      "env": {
+        "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+        "STRATA_IK2_ASTRA_NV": "1",
+        "STRATA_ATTN_PREP_T1": "1",
+        "STRATA_IK2_ASTRA_TIME_SPLIT": "48",
+        "STRATA_IK2_ASTRA_PP_MMA": "1",
+        "STRATA_DSPARK_FUSION": "1",
+        "STRATA_IK2_VERIFY_FUSED_GU": "1",
+        "STRATA_IK2_VERIFY_BF16_THIN": "1",
+        "STRATA_IK2_VERIFY_ATTN": "0",
+        "STRATA_IK2_VERIFY_ATTN_EXACT": "0",
+        "STRATA_IK2_VERIFY_CONTROL_STREAMS": "0",
+        "STRATA_IK2_VERIFY_EXPERT_PAIR": "0"
+      },
+      "visible_devices_in_order": [
+        "3080 Ti",
+        "2080 Ti"
+      ],
+      "gpu_state_before": "name, pstate, temperature.gpu, clocks.current.sm [MHz], clocks.current.memory [MHz], memory.used [MiB], pcie.link.width.current, power.draw [W]\nNVIDIA GeForce RTX 3080 Ti, P3, 51, 825 MHz, 5001 MHz, 0 MiB, 4, 67.55 W\nNVIDIA GeForce RTX 3060, P8, 34, 210 MHz, 405 MHz, 1672 MiB, 4, 12.39 W\nNVIDIA GeForce RTX 2080 Ti, P8, 32, 435 MHz, 405 MHz, 0 MiB, 16, 7.78 W\n",
+      "prompt_tokens": 10000,
+      "prompt_sha256_csv_ids": "4c0b198a6cefb5402d92548dcab9914443b2c13e253ca99ea945a9dc8bbd229c",
+      "reused": 0,
+      "generated": 128,
+      "output_sha256_csv_ids": "17428da9225a7cc00d97a9caa21068a50d68cea36683c17e17ad359d899b1cef",
+      "prefill_tps": 100.80680728208215,
+      "decode_forward_tps": 35.696216763168245,
+      "request_wall_seconds": 102.78100000007544,
+      "resident_experts": [
+        "2360/3072"
+      ]
+    },
+    "mapped-free": {
+      "binary_sha256": "dbe95d143841a8783fca949c91fb76674b65c878546350e3c5fd90cd5e8a4fd9",
+      "args": [
+        "--serve",
+        "--native",
+        "Inkling-2-Mini-UD-Q3_K_XL.gguf",
+        "--max-context",
+        "262144",
+        "--chunk",
+        "64",
+        "--kv-q8",
+        "--batch-qkv-control-t1",
+        "--gpu-full-vocab",
+        "--split-depth-mix",
+        "--attention-worker-device",
+        "1",
+        "--attention-worker-mapped-t1"
+      ],
+      "env": {
+        "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+        "STRATA_IK2_ASTRA_NV": "1",
+        "STRATA_ATTN_PREP_T1": "1",
+        "STRATA_IK2_ASTRA_TIME_SPLIT": "48",
+        "STRATA_IK2_ASTRA_PP_MMA": "1",
+        "STRATA_DSPARK_FUSION": "1",
+        "STRATA_IK2_VERIFY_FUSED_GU": "1",
+        "STRATA_IK2_VERIFY_BF16_THIN": "1",
+        "STRATA_IK2_VERIFY_ATTN": "0",
+        "STRATA_IK2_VERIFY_ATTN_EXACT": "0",
+        "STRATA_IK2_VERIFY_CONTROL_STREAMS": "0",
+        "STRATA_IK2_VERIFY_EXPERT_PAIR": "0"
+      },
+      "visible_devices_in_order": [
+        "3080 Ti",
+        "2080 Ti"
+      ],
+      "gpu_state_before": "name, pstate, temperature.gpu, clocks.current.sm [MHz], clocks.current.memory [MHz], memory.used [MiB], pcie.link.width.current, power.draw [W]\nNVIDIA GeForce RTX 3080 Ti, P0, 58, 1935 MHz, 9501 MHz, 0 MiB, 4, 127.61 W\nNVIDIA GeForce RTX 3060, P5, 34, 210 MHz, 810 MHz, 1672 MiB, 4, 12.62 W\nNVIDIA GeForce RTX 2080 Ti, P3, 40, 840 MHz, 5000 MHz, 0 MiB, 16, 43.02 W\n",
+      "prompt_tokens": 136,
+      "prompt_sha256_csv_ids": "69782439c27266df4d2221b00aaa81f85fc78d825680064766a9d52256f9a26a",
+      "reused": 0,
+      "generated": 321,
+      "output_sha256_csv_ids": "625619acd556c6cdb8ec3d076bf11f75d939690cd6e0c69ee5515b4ab39a9811",
+      "prefill_tps": 104.6604691251616,
+      "decode_forward_tps": 33.32423859321727,
+      "request_wall_seconds": 10.90700000000652,
+      "resident_experts": [
+        "2360/3072"
+      ],
+      "python_tests": {
+        "passed": 305,
+        "total": 305,
+        "first_error": null
+      }
+    },
+    "split-10k": {
+      "binary_sha256": "848d9297342299ae25c5d1ae9566f5950a5946f6b78d5073b754f18a85eb7e9f",
+      "args": [
+        "--serve",
+        "--native",
+        "Inkling-2-Mini-UD-Q3_K_XL.gguf",
+        "--max-context",
+        "262144",
+        "--chunk",
+        "64",
+        "--kv-q8",
+        "--layer-split-device",
+        "1",
+        "--split-core-graph",
+        "--split-outer-graph",
+        "--batch-qkv-control-t1",
+        "--gpu-full-vocab",
+        "--split-depth-mix"
+      ],
+      "env": {
+        "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+        "STRATA_IK2_ASTRA_NV": "1",
+        "STRATA_ATTN_PREP_T1": "1",
+        "STRATA_IK2_ASTRA_TIME_SPLIT": "48",
+        "STRATA_IK2_ASTRA_PP_MMA": "1",
+        "STRATA_DSPARK_FUSION": "1",
+        "STRATA_IK2_VERIFY_FUSED_GU": "1",
+        "STRATA_IK2_VERIFY_BF16_THIN": "1",
+        "STRATA_IK2_VERIFY_ATTN": "0",
+        "STRATA_IK2_VERIFY_ATTN_EXACT": "0",
+        "STRATA_IK2_VERIFY_CONTROL_STREAMS": "0",
+        "STRATA_IK2_VERIFY_EXPERT_PAIR": "0"
+      },
+      "visible_devices_in_order": [
+        "2080 Ti",
+        "3080 Ti"
+      ],
+      "gpu_state_before": "name, pstate, temperature.gpu, clocks.current.sm [MHz], clocks.current.memory [MHz], memory.used [MiB], pcie.link.width.current, power.draw [W]\nNVIDIA GeForce RTX 3080 Ti, P3, 52, 405 MHz, 5001 MHz, 0 MiB, 4, 111.90 W\nNVIDIA GeForce RTX 3060, P8, 35, 210 MHz, 405 MHz, 1672 MiB, 4, 12.54 W\nNVIDIA GeForce RTX 2080 Ti, P8, 33, 435 MHz, 405 MHz, 0 MiB, 16, 7.17 W\n",
+      "prompt_tokens": 10000,
+      "prompt_sha256_csv_ids": "4c0b198a6cefb5402d92548dcab9914443b2c13e253ca99ea945a9dc8bbd229c",
+      "reused": 0,
+      "generated": 128,
+      "output_sha256_csv_ids": "ec7b4d8d8da8917825d4250ced81e5a645cbf6c5a710dde151a40574d01c561f",
+      "prefill_tps": 411.1982440190188,
+      "decode_forward_tps": 84.74802477044629,
+      "request_wall_seconds": 25.828000000095926,
+      "resident_experts": [
+        "1536/1536",
+        "1536/1536"
+      ]
+    }
+  },
+  "logit_checks": {
+    "gate-tiny": {
+      "1153": {
+        "changed_bits": 0,
+        "relative_l2": 0.0,
+        "max_abs": 0.0,
+        "argmax": [
+          1719,
+          1719
+        ]
+      },
+      "3215": {
+        "changed_bits": 0,
+        "relative_l2": 0.0,
+        "max_abs": 0.0,
+        "argmax": [
+          371,
+          371
+        ]
+      }
+    },
+    "gate-worker": {
+      "1153": {
+        "changed_bits": 0,
+        "relative_l2": 0.0,
+        "max_abs": 0.0,
+        "argmax": [
+          1719,
+          1719
+        ]
+      },
+      "3215": {
+        "changed_bits": 0,
+        "relative_l2": 0.0,
+        "max_abs": 0.0,
+        "argmax": [
+          371,
+          371
+        ]
+      }
+    },
+    "gate-mapped": {
+      "1153": {
+        "changed_bits": 0,
+        "relative_l2": 0.0,
+        "max_abs": 0.0,
+        "argmax": [
+          1719,
+          1719
+        ]
+      }
+    }
+  }
+}

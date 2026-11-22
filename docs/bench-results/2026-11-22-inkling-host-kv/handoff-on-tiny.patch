@@ -1,0 +1,145 @@
+--- a/engine/src/inkling2/inkling2_engine.cu
++++ b/engine/src/inkling2/inkling2_engine.cu
+@@ -3369,6 +3369,8 @@
+     return true;
+ }
+ 
++#include "ar_prefill_handoff.cuh"
++
+ std::vector<int32_t> parse_id_list(const std::string& s) {
+     std::vector<int32_t> out;
+     std::stringstream ss(s);
+@@ -4188,6 +4190,8 @@
+         return 0;
+     }
+ 
++    const auto handoff_ready = Clock::now();
++    std::fprintf(stderr,"HANDOFF ready\n"); std::fflush(stderr);
+     std::vector<int32_t> prompt = parse_id_list(tokens_str);
+     if(const char* path=std::getenv("VW_PROMPT")){
+         std::ifstream f(path);prompt.clear();int id;while(f>>id)prompt.push_back(id);if(prompt.empty()||!f.eof())return 21;
+@@ -4218,7 +4222,11 @@
+     std::vector<float> dumped;
+     const auto t_pp0 = Clock::now();
+     int32_t next_tok = 0;
+-    for (size_t off = 0; off < prompt.size(); off += (size_t) chunk) {
++    const char* restore_path = std::getenv("STRATA_AR_IMPORT");
++    const char* save_path = std::getenv("STRATA_AR_EXPORT");
++    if (restore_path && save_path) return 22;
++    if (restore_path) next_tok = read_ar_handoff(E,prompt,restore_path);
++    for (size_t off = restore_path ? prompt.size() : 0; off < prompt.size(); off += (size_t) chunk) {
+         const int tc = (int) std::min<size_t>((size_t) chunk, prompt.size() - off);
+         const bool is_last = (off + (size_t) tc == prompt.size());
+         const int p0 = (int) E.pos;
+@@ -4229,6 +4237,7 @@
+         if (profile) { CK(cudaStreamSynchronize(E.st)); E.p_rebal_ms += ms_since(tr0); }
+     }
+     const double pp_ms = ms_since(t_pp0);
++    if (save_path) write_ar_handoff(E,prompt,next_tok,save_path);
+     if (profile) { E.print_prof("pp"); E.reset_prof(); }
+ 
+     if (!dump_logits_path.empty() && !dumped.empty()) {
+@@ -4253,7 +4262,13 @@
+             [&](int32_t tok) -> bool { gen.push_back(tok); cli_hist.push_back(tok); return true; }, [] { return false; });
+     } else {
+         for (int step = 1; step < max_new; ++step) {
+-            next_tok = E.forward(&next_tok, 1);
++            if(step == 1 && std::getenv("STRATA_AR_NEXT_LOGITS")) {
++                std::vector<float> next_logits;
++                next_tok=E.forward(&next_tok,1,true,&next_logits);
++                std::ofstream f(std::getenv("STRATA_AR_NEXT_LOGITS"),std::ios::binary);
++                f.write((const char*)next_logits.data(),next_logits.size()*sizeof(float));
++                if(!f || next_logits.size()!=(size_t)m.hp.vocab_unpadded) ar_handoff_error("follow-up logits");
++            } else next_tok = E.forward(&next_tok, 1);
+             gen.push_back(next_tok);
+             const auto tr0 = Clock::now();
+             if (E.any_hybrid() && (step % 8 == 0)) E.rebalance(E.core_all_gpu ? 4 : 6);
+@@ -4262,7 +4277,8 @@
+     }
+     const double tg_ms = ms_since(t_tg0);
+     E.hostkv.stats("DONE-cumulative");
+-                E.print_replica_stats("DONE");
++                std::fprintf(stderr,"HANDOFF finish ready_to_finish_ms=%.4f\n",ms_since(handoff_ready)); std::fflush(stderr);
++    E.print_replica_stats("DONE");
+     if (profile) E.print_prof("tg");
+     if (dspark)
+         std::fprintf(stderr, "strata-inkling2: dspark accepted=%lld offered=%lld draft_calls=%lld draft_ms=%.1f inject_ms=%.1f\n",
+--- /dev/null
++++ b/engine/src/inkling2/ar_prefill_handoff.cuh
+@@ -0,0 +1,76 @@
++#pragma once
++// Lab-only AR transfer. Both processes use the same GGUF, prompt, Q8 KV and chunk.
++[[noreturn]] static void ar_handoff_error(const char* msg) {
++    std::fprintf(stderr,"AR handoff error: %s\n",msg); std::exit(22);
++}
++struct ArHandoffHeader {
++    uint32_t magic=0x31485241, version=1, chunk=0, rows=0, next=0;
++    uint32_t n_layer=0,kv_dim=0,heads=0,swa=0;
++    uint64_t snapshot_bytes=0;
++};
++static ArHandoffHeader ar_header(Engine& e,const std::vector<int32_t>& ids) {
++    const auto& hp=e.m->hp;
++    if(!e.kv_q8||e.dspark||e.remote_full||(e.split_peer&&e.split_peer->remote_full)||
++       ids.empty()||ids.size()>=(size_t)e.ctx) ar_handoff_error("requires local Q8 AR, matching context/chunk and nonempty prefix");
++    ArHandoffHeader h{}; h.chunk=e.tmax; h.rows=(uint32_t)ids.size();h.n_layer=(uint32_t)hp.n_layer;
++    h.kv_dim=(uint32_t)hp.kv_dim;h.heads=(uint32_t)hp.n_head_kv;h.swa=(uint32_t)hp.n_swa;
++    h.snapshot_bytes=(uint64_t)hp.n_layer*hp.n_sconv_channels()*3*sizeof(float);
++    for(int il=0;il<hp.n_layer;++il)if(hp.is_swa(il))
++        h.snapshot_bytes+=(uint64_t)e.kv_cap[il]*(2*h.kv_dim+2*h.heads*sizeof(__half));
++    return h;
++}
++static void write_ar_handoff(Engine& e,const std::vector<int32_t>& ids,int next,const char* path) {
++    auto start=Clock::now();auto h=ar_header(e,ids);h.next=next;
++    if(e.pos!=(int64_t)ids.size()||next<0||next>=e.m->hp.vocab_unpadded||e.hostkv.ring)
++        ar_handoff_error("export requires the device-absolute full KV and exact prefix position");
++    const auto snap=e.save_checkpoint(ids);
++    if(snap.data.size()!=h.snapshot_bytes) ar_handoff_error("native snapshot size");
++    const double state_ms=ms_since(start);
++    std::ofstream f(path,std::ios::binary);size_t payload=0;double full_d2h_ms=0;
++    auto write=[&](const void* p,size_t n){f.write((const char*)p,n);if(!f)ar_handoff_error("file write");payload+=n;};
++    write(&h,sizeof(h));write(ids.data(),ids.size()*sizeof(int32_t));write(snap.data.data(),snap.data.size());
++    std::vector<uint8_t> scratch((size_t)h.rows*h.kv_dim);
++    for(int il=0;il<(int)h.n_layer;++il)if(!e.m->hp.is_swa(il)) {
++        auto& lane=e.runtime_for(il);DeviceScope own(lane.device);
++        auto pull=[&](const void* p,size_t row) {
++            const size_t n=(size_t)h.rows*row;auto t=Clock::now();
++            CK(cudaMemcpyAsync(scratch.data(),p,n,cudaMemcpyDeviceToHost,lane.st));CK(cudaStreamSynchronize(lane.st));
++            full_d2h_ms+=ms_since(t);write(scratch.data(),n);
++        };
++        pull(lane.kq[il],h.kv_dim);pull(lane.vq[il],h.kv_dim);
++        pull(lane.ks[il],h.heads*sizeof(__half));pull(lane.vs[il],h.heads*sizeof(__half));
++    }
++    f.close();if(!f)ar_handoff_error("file close");
++    std::fprintf(stderr,"HANDOFF export bytes=%zu snapshot_ms=%.4f full_d2h_ms=%.4f total_ms=%.4f\n",payload,state_ms,full_d2h_ms,ms_since(start));
++}
++static int read_ar_handoff(Engine& e,const std::vector<int32_t>& ids,const char* path) {
++    const auto start=Clock::now();auto expected=ar_header(e,ids);
++    std::ifstream f(path,std::ios::binary);size_t payload=0;double io_ms=0;
++    auto read=[&](void* p,size_t n){auto t=Clock::now();f.read((char*)p,n);if(!f)ar_handoff_error("truncated handoff");payload+=n;io_ms+=ms_since(t);};
++    ArHandoffHeader h{};read(&h,sizeof(h));
++    if(h.magic!=expected.magic||h.version!=expected.version||h.chunk!=expected.chunk||h.rows!=expected.rows||
++       h.n_layer!=expected.n_layer||h.kv_dim!=expected.kv_dim||h.heads!=expected.heads||h.swa!=expected.swa||
++       h.snapshot_bytes!=expected.snapshot_bytes||h.next>=(uint32_t)e.m->hp.vocab_unpadded)ar_handoff_error("incompatible snapshot");
++    Engine::StateCheckpoint cp;cp.tokens.resize(h.rows);
++    read(cp.tokens.data(),cp.tokens.size()*sizeof(int32_t));if(cp.tokens!=ids)ar_handoff_error("prefix identity");
++    cp.data.resize((size_t)h.snapshot_bytes);read(cp.data.data(),cp.data.size());
++    std::vector<uint8_t> scratch((size_t)h.rows*h.kv_dim);
++    for(int il=0;il<(int)h.n_layer;++il)if(!e.m->hp.is_swa(il)) {
++        auto& lane=e.runtime_for(il);DeviceScope own(lane.device);
++        if(lane.hostkv.ring) {
++            const auto host=lane.hostkv.host[il];
++            read(host.k,(size_t)h.rows*h.kv_dim);read(host.v,(size_t)h.rows*h.kv_dim);
++            read(host.ks,(size_t)h.rows*h.heads*sizeof(__half));read(host.vs,(size_t)h.rows*h.heads*sizeof(__half));
++        } else {
++            auto push=[&](void* p,size_t row){size_t n=(size_t)h.rows*row;read(scratch.data(),n);
++                CK(cudaMemcpyAsync(p,scratch.data(),n,cudaMemcpyHostToDevice,lane.st));CK(cudaStreamSynchronize(lane.st));};
++            push(lane.kq[il],h.kv_dim);push(lane.vq[il],h.kv_dim);push(lane.ks[il],h.heads*sizeof(__half));push(lane.vs[il],h.heads*sizeof(__half));
++        }
++    }
++    if(f.peek()!=EOF)ar_handoff_error("trailing data");
++    auto t=Clock::now();
++    e.restore_checkpoint(cp);
++    {DeviceScope own(e.device);CK(cudaStreamSynchronize(e.st));}
++    std::fprintf(stderr,"HANDOFF import bytes=%zu io_ms=%.4f restore_ms=%.4f total_ms=%.4f\n",payload,io_ms,ms_since(t),ms_since(start));
++    return (int)h.next;
++}

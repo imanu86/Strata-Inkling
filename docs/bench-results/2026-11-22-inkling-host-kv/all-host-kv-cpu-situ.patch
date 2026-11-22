@@ -1,0 +1,650 @@
+diff --git a/engine/src/inkling2/attention_prep_t1.cuh b/engine/src/inkling2/attention_prep_t1.cuh
+--- a/engine/src/inkling2/attention_prep_t1.cuh
++++ b/engine/src/inkling2/attention_prep_t1.cuh
+@@ -13,6 +13,7 @@
+     const int32_t *pos;
+     int heads, kv_heads, cap, swa, floor_n, n_ext, max_rel;
+     float q_clip, r_clip, alpha, eps;
++    int full_ring=0;
+ };
+ 
+ // Each lane owns the same components, and reduces its sum in the same order,
+@@ -89,7 +90,7 @@
+ #pragma unroll
+     for (int o = 16; o > 0; o >>= 1) peak = fmaxf(peak, __shfl_xor_sync(0xffffffffu, peak, o));
+     float inv = peak > 0.0f ? (127.0f / peak) : 0.0f;
+-    int slot = a.swa ? (((a.cap & (a.cap - 1)) == 0) ? pos & (a.cap - 1) : pos % a.cap) : pos;
++    int slot = (a.swa || a.full_ring) ? (((a.cap & (a.cap - 1)) == 0) ? pos & (a.cap - 1) : pos % a.cap) : pos;
+     int8_t* dst = (value ? a.vq : a.kq) + ((size_t)slot * a.kv_heads + head) * 128;
+ #pragma unroll
+     for (int i = 0; i < 4; ++i) dst[i * 32 + lane] = (int8_t)__float2int_rn(v[i] * inv);
+diff --git a/engine/src/inkling2/host_kv_ring.cuh b/engine/src/inkling2/host_kv_ring.cuh
+new file mode 100644
+--- /dev/null
++++ b/engine/src/inkling2/host_kv_ring.cuh
+@@ -0,0 +1,180 @@
++#pragma once
++
++struct HostKvViews {
++    int8_t* k=nullptr;
++    int8_t* v=nullptr;
++    __half* ks=nullptr;
++    __half* vs=nullptr;
++};
++
++static HostKvViews host_kv_views(void* base,int cap,int dim,int heads) {
++    auto* k=(int8_t*)base;
++    auto* v=k+(size_t)cap*dim;
++    auto* ks=(__half*)(v+(size_t)cap*dim);
++    return {k,v,ks,ks+(size_t)cap*heads};
++}
++
++// All reads in the fast path remain in VRAM. Write-through keeps the mapped
++// pinned copy authoritative, including when an older prefix is reused.
++__global__ void host_kv_mirror(HostKvViews ring,HostKvViews absolute,const int32_t* pos,
++                               int cap,int dim,int heads) {
++    const int p=pos[0]+blockIdx.y,slot=p%cap;
++    const int i=blockIdx.x*blockDim.x+threadIdx.x;
++    if(i<dim/4) {
++        ((int*)absolute.k)[(size_t)p*(dim/4)+i]=((const int*)ring.k)[(size_t)slot*(dim/4)+i];
++        ((int*)absolute.v)[(size_t)p*(dim/4)+i]=((const int*)ring.v)[(size_t)slot*(dim/4)+i];
++    }
++    if(i<heads) {
++        absolute.ks[(size_t)p*heads+i]=ring.ks[(size_t)slot*heads+i];
++        absolute.vs[(size_t)p*heads+i]=ring.vs[(size_t)slot*heads+i];
++    }
++}
++
++// A single shared device window serves all SWA layers. The producer has already
++// written its quantized keys, values and scales to the mapped host ring on this
++// stream. Copy only the union of causal windows, preserving its physical slots.
++__global__ void host_kv_stage_swa(HostKvViews dst, HostKvViews src, const int32_t* pos,
++                                  int cap, int window, int dim, int heads) {
++    const int absolute = pos[0] - window + 1 + (int)blockIdx.x;
++    if (absolute < 0) return;
++    const int slot = absolute % cap;
++    const size_t word0 = (size_t)slot * (dim / sizeof(int));
++    for (int i = threadIdx.x; i < dim / (int)sizeof(int); i += blockDim.x) {
++        ((int*)dst.k)[word0 + i] = ((const int*)src.k)[word0 + i];
++        ((int*)dst.v)[word0 + i] = ((const int*)src.v)[word0 + i];
++    }
++    for (int h = threadIdx.x; h < heads; h += blockDim.x) {
++        const size_t i = (size_t)slot * heads + h;
++        dst.ks[i] = src.ks[i];
++        dst.vs[i] = src.vs[i];
++    }
++}
++
++static void host_kv_copy(HostKvViews dst,int dst_pos,HostKvViews src,int src_pos,
++                         int rows,int dim,int heads,cudaMemcpyKind kind,cudaStream_t stream) {
++    if(rows<=0)return;
++    CK(cudaMemcpyAsync(dst.k+(size_t)dst_pos*dim,src.k+(size_t)src_pos*dim,(size_t)rows*dim,kind,stream));
++    CK(cudaMemcpyAsync(dst.v+(size_t)dst_pos*dim,src.v+(size_t)src_pos*dim,(size_t)rows*dim,kind,stream));
++    CK(cudaMemcpyAsync(dst.ks+(size_t)dst_pos*heads,src.ks+(size_t)src_pos*heads,(size_t)rows*heads*sizeof(__half),kind,stream));
++    CK(cudaMemcpyAsync(dst.vs+(size_t)dst_pos*heads,src.vs+(size_t)src_pos*heads,(size_t)rows*heads*sizeof(__half),kind,stream));
++}
++
++#include "host_kv_tile.cuh"
++
++struct HostKvRing {
++    bool tiled=false;
++    bool all_swa=false, direct_swa=false;
++    int swa_layers=0;
++    size_t swa_host_bytes=0, swa_device_bytes=0;
++    void* swa_storage=nullptr;
++    HostKvViews swa_workspace{};
++    float* states=nullptr;
++    size_t state_bytes=0;
++    void allocate_states(int tmax,int splits,int query_heads) {
++        if(!tiled)return;
++        state_bytes=(size_t)std::max(tmax,splits)*query_heads*4*130*sizeof(float);
++        CK(cudaMalloc(&states,state_bytes));
++    }
++    int ring=0,stage=0,dim=0,heads=0,full_layers=0,last_tier=-1;
++    uint64_t forward_counts[3]{},mirror_bytes=0,prefix_h2d=0;
++    size_t host_bytes=0;
++    std::vector<void*> pages;
++    std::vector<HostKvViews> host,mapped;
++    void* staging=nullptr;
++    HostKvViews workspace{};
++    size_t row_bytes() const {return (size_t)2*dim+2*heads*sizeof(__half);}
++    bool init(int layers,int context,int dimension,int kv_heads,int device,std::string& err) {
++        if(!ring)return true;
++        dim=dimension;heads=kv_heads;
++        int supported=0;CK(cudaDeviceGetAttribute(&supported,cudaDevAttrCanMapHostMemory,device));
++        if(!supported){err="host KV requires mapped pinned host memory";return false;}
++        pages.resize(layers,nullptr);host.resize(layers);mapped.resize(layers);
++        if(stage>0) {
++            auto rc=cudaMalloc(&staging,(size_t)stage*row_bytes());
++            if(rc!=cudaSuccess){err=std::string("host KV device staging: ")+cudaGetErrorString(rc);return false;}
++            workspace=host_kv_views(staging,stage,dim,heads);
++        }
++        return true;
++    }
++    bool add_layer(int layer,int context,std::string& err,bool swa=false) {
++        const size_t bytes=(size_t)context*row_bytes();
++        auto rc=cudaHostAlloc(&pages[layer],bytes,cudaHostAllocMapped);
++        if(rc!=cudaSuccess){err=std::string("host KV pinned allocation: ")+cudaGetErrorString(rc);return false;}
++        void* mapped_base=nullptr;
++        rc=cudaHostGetDevicePointer(&mapped_base,pages[layer],0);
++        if(rc!=cudaSuccess){err=std::string("host KV mapping: ")+cudaGetErrorString(rc);return false;}
++        host[layer]=host_kv_views(pages[layer],context,dim,heads);
++        mapped[layer]=host_kv_views(mapped_base,context,dim,heads);
++        if (swa) {
++            ++swa_layers;
++            swa_host_bytes += bytes;
++            std::memset(pages[layer], 0, bytes);
++            if (!direct_swa && !swa_storage) {
++                rc = cudaMalloc(&swa_storage, bytes);
++                if (rc != cudaSuccess) {
++                    err = std::string("host SWA device window: ") + cudaGetErrorString(rc);
++                    return false;
++                }
++                swa_device_bytes = bytes;
++                swa_workspace = host_kv_views(swa_storage,context,dim,heads);
++            }
++        } else {
++            host_bytes += bytes;
++            ++full_layers;
++        }
++        return true;
++    }
++    ~HostKvRing(){
++        if(swa_storage)cudaFree(swa_storage);
++        if(states)cudaFree(states);
++        if(staging)cudaFree(staging);
++        for(void* page:pages)if(page)cudaFreeHost(page);
++    }
++    void record(int pos,int rows) {
++        const int end=pos+rows,tier=end<=ring?0:(end<=stage?1:2);
++        ++forward_counts[tier];
++        mirror_bytes+=(uint64_t)rows*row_bytes()*full_layers;
++        if(tier==1 || (tier==2 && tiled))prefix_h2d+=(uint64_t)(end-ring)*row_bytes()*full_layers;
++        if(tier!=last_tier){
++            std::fprintf(stderr,"HOSTKV tier=%s pos=%d T=%d visible=%d ring=%d stage=%d\n",
++                         tier==0?"device-ring":tier==1?"dma-stage":tiled?"dma-tiles":"mapped-host",pos,rows,end,ring,stage);
++            last_tier=tier;
++        }
++    }
++    HostKvViews read(int layer,HostKvViews device_ring,int end,cudaStream_t stream) {
++        if(end<=ring)return device_ring;
++        if(end>stage)return mapped[layer];
++        const int cold=end-ring;
++        host_kv_copy(workspace,0,host[layer],0,cold,dim,heads,cudaMemcpyHostToDevice,stream);
++        const int slot=cold%ring,first=ring-slot;
++        host_kv_copy(workspace,cold,device_ring,slot,first,dim,heads,cudaMemcpyDeviceToDevice,stream);
++        host_kv_copy(workspace,cold+first,device_ring,0,ring-first,dim,heads,cudaMemcpyDeviceToDevice,stream);
++        return workspace;
++    }
++    void attend_tiles(int layer,HostKvViews device_ring,const float* q,const float* rel,const float* sink,
++                      const float* gate,float* out,float* split_out,int pos,int rows,int H,int extent,
++                      int native_splits,float scale,cudaStream_t stream) {
++        const int end=pos+rows,cold=end-ring,splits=rows==1?native_splits:1;
++        const dim3 grid(H,splits,rows);
++        for(int first=0;first<cold;first+=stage){
++            const int n=std::min(stage,cold-first);
++            host_kv_copy(workspace,0,host[layer],first,n,dim,heads,cudaMemcpyHostToDevice,stream);
++            host_kv_tile_step<<<grid,128,0,stream>>>(q,workspace,rel,sink,states,H,heads,extent,
++                                                    pos,first,first+n,0,splits,scale);
++        }
++        host_kv_tile_step<<<grid,128,0,stream>>>(q,device_ring,rel,sink,states,H,heads,extent,
++                                                pos,cold,end,ring,splits,scale);
++        host_kv_tile_finish<<<grid,128,0,stream>>>(states,gate,out,split_out,H,splits,rows==1);
++        if(rows==1)k_attn_split_combine<<<H,128,0,stream>>>(split_out,gate,out,H,splits);
++    }
++    void restore(int layer,HostKvViews device_ring,int end,cudaStream_t stream) {
++        const int begin=std::max(0,end-ring),slot=begin%ring,rows=end-begin,first=std::min(rows,ring-slot);
++        host_kv_copy(device_ring,slot,host[layer],begin,first,dim,heads,cudaMemcpyHostToDevice,stream);
++        host_kv_copy(device_ring,0,host[layer],begin+first,rows-first,dim,heads,cudaMemcpyHostToDevice,stream);
++    }
++    void stats(const char* where) const {
++        if(ring)std::fprintf(stderr,"HOSTKV %s device_fwds=%llu stage_fwds=%llu overflow_fwds=%llu mirror_bytes=%llu cold_dma_h2d_bytes=%llu\n",
++            where,(unsigned long long)forward_counts[0],(unsigned long long)forward_counts[1],
++            (unsigned long long)forward_counts[2],(unsigned long long)mirror_bytes,(unsigned long long)prefix_h2d);
++    }
++};
+diff --git a/engine/src/inkling2/host_kv_tile.cuh b/engine/src/inkling2/host_kv_tile.cuh
+new file mode 100644
+--- /dev/null
++++ b/engine/src/inkling2/host_kv_tile.cuh
+@@ -0,0 +1,80 @@
++#pragma once
++
++// A tile boundary checkpoints each original warp's FP32 recurrence. It does
++// not introduce a softmax partition or change the sequence of that warp.
++__global__ void host_kv_tile_step(const float* q,HostKvViews kv,const float* rel,const float* sink,
++                                  float* states,int H,int HK,int extent,int pos,int first,int end,
++                                  int ring_cap,int splits,float scale) {
++    const int h=blockIdx.x,sp=blockIdx.y,t=blockIdx.z;
++    const int warp=threadIdx.x/32,lane=threadIdx.x%32,hkv=h/3;
++    const int row=t*H+h,qpos=pos+t;
++    const float4 query=((const float4*)(q+(size_t)row*128))[lane];
++    float* state=states+(((size_t)row*splits+sp)*4+warp)*130;
++    const bool has_sink=sp==0 && warp==0;
++    float maximum=first?state[128]:(has_sink?0.f:-1e30f);
++    float weight=first?state[129]:(has_sink?1.f:0.f);
++    float acc[4]={};
++    if(first){
++        #pragma unroll
++        for(int d=0;d<4;++d)acc[d]=state[4*lane+d];
++    }
++    const int stride=4*splits,base=sp*4+warp;
++    int j=base;
++    if(j<first)j+=((first-j+stride-1)/stride)*stride;
++    for(;j<min(end,qpos+1);j+=stride){
++        const int slot=ring_cap ? j%ring_cap : j-first;
++        const size_t key=(size_t)slot*HK+hkv;
++        const char4 k=((const char4*)(kv.k+key*128))[lane];
++        const char4 v=((const char4*)(kv.v+key*128))[lane];
++        // Both native kernels compile the y product first on SM86.
++        float dot=__fmaf_rn(query.x,(float)k.x,__fmul_rn(query.y,(float)k.y));
++        dot=__fmaf_rn(query.z,(float)k.z,dot);
++        dot=__fmaf_rn(query.w,(float)k.w,dot);
++        #pragma unroll
++        for(int off=16;off;off>>=1)dot+=__shfl_xor_sync(~0u,dot,off);
++        const int dist=qpos-j;
++        const float bias=dist<extent ? rel[(size_t)row*extent+dist] : -sink[row];
++        const float score=__fmaf_rn(dot,__fmul_rn(__half2float(kv.ks[key]),scale),bias);
++        const float next=fmaxf(maximum,score);
++        const float alpha=weight>0?__expf(maximum-next):0.f;
++        const float p=__expf(score-next),pv=__fmul_rn(p,__half2float(kv.vs[key]));
++        weight=__fmaf_rn(weight,alpha,p);
++        acc[0]=__fmaf_rn(pv,(float)v.x,__fmul_rn(acc[0],alpha));
++        acc[1]=__fmaf_rn(pv,(float)v.y,__fmul_rn(acc[1],alpha));
++        acc[2]=__fmaf_rn(pv,(float)v.z,__fmul_rn(acc[2],alpha));
++        acc[3]=__fmaf_rn(pv,(float)v.w,__fmul_rn(acc[3],alpha));
++        maximum=next;
++    }
++    #pragma unroll
++    for(int d=0;d<4;++d)state[4*lane+d]=acc[d];
++    if(!lane){state[128]=maximum;state[129]=weight;}
++}
++
++__global__ void host_kv_tile_finish(const float* states,const float* gate,float* out,
++                                    float* split_out,int H,int splits,bool decode){
++    const int h=blockIdx.x,sp=blockIdx.y,t=blockIdx.z,d=threadIdx.x;
++    const float* base=states+(((size_t)t*H+h)*splits+sp)*4*130;
++    float maximum=-1e30f;
++    #pragma unroll
++    for(int w=0;w<4;++w){
++        const float* s=base+130*w;
++        if(s[129]>0.f && s[128]>maximum)maximum=s[128];
++    }
++    float l=0.f,o=0.f;
++    #pragma unroll
++    for(int w=0;w<4;++w){
++        const float* s=base+130*w;
++        if(s[129]>0.f){
++            const float c=__expf(s[128]-maximum);
++            l=__fmaf_rn(s[129],c,l);o=__fmaf_rn(s[d],c,o);
++        }
++    }
++    if(decode){
++        float* dst=split_out+((size_t)sp*H+h)*130;
++        dst[d]=o;
++        if(!d){dst[128]=maximum;dst[129]=l;}
++    }else{
++        const size_t i=((size_t)t*H+h)*128+d;
++        float a=__fdividef(o,l);if(gate)a*=sigmf(gate[i]);out[i]=a;
++    }
++}
+diff --git a/engine/src/inkling2/inkling2_engine.cu b/engine/src/inkling2/inkling2_engine.cu
+--- a/engine/src/inkling2/inkling2_engine.cu
++++ b/engine/src/inkling2/inkling2_engine.cu
+@@ -765,7 +765,10 @@
+ #include "inkling2_pq.cuh"
+ #include "astra_control_streams.cuh"
+ 
++#include "host_kv_ring.cuh"
++
+ struct Engine {
++    HostKvRing hostkv;
+     std::unique_ptr<GpuPqSampler> gpu_pq;
+     double *sampling_mass = nullptr;
+     double sample_u = -1.0;
+@@ -1187,6 +1190,7 @@
+     };
+ 
+     StateCheckpoint save_checkpoint(const std::vector<int32_t>& tokens) {
++        if (hostkv.all_swa) CK(cudaStreamSynchronize(st));
+         const auto& hp = m->hp;
+         const size_t conv_bytes = (size_t) hp.n_sconv_channels() * 3 * sizeof(float);
+         size_t total = (size_t) hp.n_layer * conv_bytes;
+@@ -1213,7 +1217,11 @@
+             pull(lane.conv_hist[(size_t) il], conv_bytes);
+             if (!hp.is_swa(il)) continue;
+             const size_t cap = (size_t) kv_cap[(size_t) il];
+-            if (kv_q8) {
++            if (lane.hostkv.all_swa) {
++                const size_t bytes = cap * lane.hostkv.row_bytes();
++                std::memcpy(cp.data.data() + off, lane.hostkv.pages[il], bytes);
++                off += bytes;
++            } else if (kv_q8) {
+                 pull(lane.kq[(size_t) il], cap * (size_t) hp.kv_dim);
+                 pull(lane.vq[(size_t) il], cap * (size_t) hp.kv_dim);
+                 pull(lane.ks[(size_t) il], cap * (size_t) hp.n_head_kv * sizeof(__half));
+@@ -1234,6 +1242,7 @@
+     }
+ 
+     void restore_checkpoint(const StateCheckpoint& cp) {
++        if (hostkv.all_swa) CK(cudaStreamSynchronize(st));
+         Engine &full_lane = remote_full ? *this : (split_peer ? *split_peer : *this);
+         if (cp.full_kv_remote && full_lane.full_kv_local_prefix && !full_lane.full_kv_promoted) {
+             DeviceScope owner(full_lane.device);
+@@ -1256,7 +1265,11 @@
+             push(lane.conv_hist[(size_t) il], conv_bytes);
+             if (!hp.is_swa(il)) continue;
+             const size_t cap = (size_t) kv_cap[(size_t) il];
+-            if (kv_q8) {
++            if (lane.hostkv.all_swa) {
++                const size_t bytes = cap * lane.hostkv.row_bytes();
++                std::memcpy(lane.hostkv.pages[il], cp.data.data() + off, bytes);
++                off += bytes;
++            } else if (kv_q8) {
+                 push(lane.kq[(size_t) il], cap * (size_t) hp.kv_dim);
+                 push(lane.vq[(size_t) il], cap * (size_t) hp.kv_dim);
+                 push(lane.ks[(size_t) il], cap * (size_t) hp.n_head_kv * sizeof(__half));
+@@ -1267,6 +1280,11 @@
+             }
+         }
+         pos = (int64_t) cp.tokens.size();
++        if(hostkv.ring){
++            for(int il=0;il<(int)hp.n_layer;++il)if(!hp.is_swa(il)){
++                hostkv.restore(il,{kq[il],vq[il],ks[il],vs[il]},(int)pos,st);
++            }
++        }
+         if (dspark && role != Role::Core && !cp.dspark_data.empty()) {
+             DeviceScope owner(device);
+             dspark->restore_checkpoint(cp.dspark_data.data(), (int) pos, st);
+@@ -1322,6 +1340,8 @@
+             DeviceScope kv_owner(remote_kv((int)il) ? remote_device : device);
+             cudaFree(kc[il]);
+             cudaFree(vc[il]);
++            // Mapped SWA storage belongs to HostKvRing (cudaFreeHost).
++            if (hostkv.all_swa && m->hp.is_swa((int)il)) continue;
+             cudaFree(kq[il]);
+             cudaFree(vq[il]);
+             cudaFree(ks[il]);
+@@ -1438,6 +1458,9 @@
+         vq.resize((size_t) hp.n_layer, nullptr);
+         ks.resize((size_t) hp.n_layer, nullptr);
+         vs.resize((size_t) hp.n_layer, nullptr);
++        if(hostkv.tiled && (hp.n_head!=3*hp.n_head_kv || hp.head_dim!=128)){err="host KV tiled requires GQA3 and 128 head dim";return false;}
++        hostkv.allocate_states(tmax,astra_time_splits(),(int)hp.n_head);
++        if(!hostkv.init((int)hp.n_layer,ctx,(int)hp.kv_dim,(int)hp.n_head_kv,device,err))return false;
+         kv_cap.resize((size_t) hp.n_layer);
+         conv_hist.resize((size_t) hp.n_layer);
+         layer_conv_floats = (size_t) hp.n_sconv_channels() * 3;
+@@ -1445,14 +1468,21 @@
+         for (int il = 0; il < hp.n_layer; ++il) {
+             // All T rows are stored before attention. Keep the union needed by the earliest
+             // and latest query: window + T - 1 positions, while attention still uses window.
+-            const int cap = hp.is_swa(il) ? (int) hp.n_swa + tmax - 1 : ctx;
++            const bool host_full=hostkv.ring && !hp.is_swa(il);
++            const int cap = hp.is_swa(il) ? (int) hp.n_swa + tmax - 1 : host_full ? hostkv.ring : ctx;
++            if(host_full && !hostkv.add_layer(il,ctx,err))return false;
+             kv_cap[(size_t) il] = cap;
+             if (!owns_virtual(il)) continue;
+             trace_slot[(size_t) il] = (int) (local_conv_floats / layer_conv_floats);
+             local_conv_floats += layer_conv_floats;
+             {
+                 DeviceScope kv_owner(remote_kv(il) ? remote_device : device);
+-                if (kv_q8) {
++                if (hostkv.all_swa && hp.is_swa(il)) {
++                    if (!hostkv.add_layer(il,cap,err,true)) return false;
++                    const HostKvViews pinned = hostkv.mapped[il];
++                    kq[il] = pinned.k; vq[il] = pinned.v;
++                    ks[il] = pinned.ks; vs[il] = pinned.vs;
++                } else if (kv_q8) {
+                     CK(cudaMalloc(&kq[(size_t)il], (size_t)cap * hp.kv_dim * sizeof(int8_t)));
+                     CK(cudaMalloc(&vq[(size_t)il], (size_t)cap * hp.kv_dim * sizeof(int8_t)));
+                     CK(cudaMalloc(&ks[(size_t)il], (size_t)cap * hp.n_head_kv * sizeof(__half)));
+@@ -1465,6 +1495,21 @@
+             CK(cudaMalloc(&conv_hist[(size_t) il], (size_t) hp.n_sconv_channels() * 3 * sizeof(float)));
+         }
+ 
++        if(hostkv.tiled)std::fprintf(stderr,"HOSTKV tiled enabled, state_bytes=%llu\n",(unsigned long long)hostkv.state_bytes);
++        if(hostkv.ring)std::fprintf(stderr,
++            "HOSTKV layers=%d context=%d device_ring=%d stage=%d host_pinned_bytes=%llu device_full_ring_bytes=%llu shared_staging_bytes=%llu\n",
++            hostkv.full_layers,ctx,hostkv.ring,hostkv.stage,(unsigned long long)hostkv.host_bytes,
++            (unsigned long long)(hostkv.full_layers*(size_t)hostkv.ring*hostkv.row_bytes()),
++            (unsigned long long)(hostkv.stage*hostkv.row_bytes()));
++        if (hostkv.all_swa) {
++            const size_t device_kv = hostkv.full_layers * (size_t)hostkv.ring * hostkv.row_bytes()
++                                   + (size_t)hostkv.stage * hostkv.row_bytes() + hostkv.swa_device_bytes;
++            std::fprintf(stderr,"HOSTKV all_swa=%s swa_layers=%d swa_capacity=%d swa_pinned_bytes=%llu "
++                         "shared_swa_device_bytes=%llu total_device_kv_bytes=%llu total_with_tile_states_bytes=%llu\n",
++                         hostkv.direct_swa ? "mapped" : "stage",hostkv.swa_layers,(int)hp.n_swa+tmax-1,
++                         (unsigned long long)hostkv.swa_host_bytes,(unsigned long long)hostkv.swa_device_bytes,
++                         (unsigned long long)device_kv,(unsigned long long)(device_kv + hostkv.state_bytes));
++        }
+         auto d_f32 = [](float** p, size_t n) { CK(cudaMalloc(p, n * sizeof(float))); };
+         for (int b = 0; b < 9; ++b) {
+             d_f32(&norm_blk_buf[b], (size_t) tmax * N);
+@@ -2325,6 +2370,7 @@
+             }
+         }
+         CK(cudaMemcpyAsync(ffn_inp, h_tok_buf, (size_t) T * N * sizeof(float), cudaMemcpyHostToDevice, st));
++        if(hostkv.ring)hostkv.record((int)pos,T);
+         pos0_host = (int32_t) pos;
+         CK(cudaMemcpyAsync(pos0_d, &pos0_host, sizeof(int32_t), cudaMemcpyHostToDevice, st));
+         k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(ffn_inp, m->tok_embd_norm, cur, N, hp.rms_eps);
+@@ -2531,6 +2577,7 @@
+                 auto &active_ks = local_full ? prefix_ks : this->ks;
+                 auto &active_vs = local_full ? prefix_vs : this->vs;
+                 auto &active_cap = local_full ? prefix_cap : this->kv_cap;
++                const bool host_full=hostkv.ring && !is_swa;
+                 const int max_rel = is_swa ? std::min<int>((int)hp.n_swa, (int)hp.n_rel_ext) : (int)hp.n_rel_ext;
+                 if (fused_prep) {
+                     const AttentionPrepT1 prep{
+@@ -2539,12 +2586,12 @@
+                         active_kq[(size_t)il], active_vq[(size_t)il], active_ks[(size_t)il], active_vs[(size_t)il],
+                         L.attn_rel_bias, sink, rel_tab, pos0_d, (int)hp.n_head, (int)hp.n_head_kv, active_cap[(size_t)il],
+                         (int)is_swa, (int)hp.log_scale_floor, (int)hp.n_rel_ext, max_rel, hp.qk_clip,
+-                        hp.rel_clip, hp.log_scale_alpha, hp.rms_eps};
++                        hp.rel_clip, hp.log_scale_alpha, hp.rms_eps,(int)host_full};
+                     k_attention_prep_t1<<<(unsigned)(hp.n_head + 2 * hp.n_head_kv), 128, 0, st>>>(prep);
+                 } else if (kv_q8) {
+                     k_clip_norm_kv_store_q8<<<dim3((unsigned)hp.n_head_kv, (unsigned)T), 32, 0, st>>>(
+                         K_conv, V_conv, active_kq[(size_t)il], active_ks[(size_t)il], active_vq[(size_t)il], active_vs[(size_t)il],
+-                        (int)hp.n_head_kv, hp.qk_clip, hp.rms_eps, pos0_d, active_cap[(size_t)il], is_swa ? 1 : 0);
++                        (int)hp.n_head_kv, hp.qk_clip, hp.rms_eps, pos0_d, active_cap[(size_t)il], is_swa || host_full ? 1 : 0);
+                 } else {
+                     k_clip_and_tau<<<dim3((unsigned)hp.n_head_kv, (unsigned)T), 32, 0, st>>>(K_conv, nullptr, hp.qk_clip, (int)hp.head_dim,
+                                                                                              (int)hp.n_head_kv, 0, pos0_d,
+@@ -2560,37 +2607,56 @@
+                         pR, L.attn_rel_bias, sink, rel_tab, (int)hp.n_head, (int)hp.n_rel, (int)hp.n_rel_ext, max_rel, pos0_d, T);
+                 }
+                 const float kq_scale = 1.0f / std::sqrt((float)hp.head_dim);
+-                if (kv_q8) {
++                HostKvViews read{active_kq[(size_t)il],active_vq[(size_t)il],active_ks[(size_t)il],active_vs[(size_t)il]};
++                if (is_swa && hostkv.all_swa && !hostkv.direct_swa) {
++                    // The launch shape is independent of pos for graph replay at T=1.
++                    // All T rows have been written to this layer's pinned ring.
++                    const int window=(int)hp.n_swa;
++                    host_kv_stage_swa<<<window+T-1,256,0,st>>>(hostkv.swa_workspace,read,pos0_d,
++                        active_cap[(size_t)il],window,(int)hp.kv_dim,(int)hp.n_head_kv);
++                    read=hostkv.swa_workspace;
++                }
++                const bool use_tiles=host_full && hostkv.tiled && pos+T>hostkv.stage;
++                if(host_full){
++                    const int dim=(int)hp.kv_dim,heads=(int)hp.n_head_kv;
++                    host_kv_mirror<<<dim3((unsigned)((dim/4+127)/128),(unsigned)T),128,0,st>>>(
++                        read,hostkv.mapped[il],pos0_d,hostkv.ring,dim,heads);
++                    if(!use_tiles)read=hostkv.read(il,read,(int)pos+T,st);
++                }
++                if(use_tiles){
++                    hostkv.attend_tiles(il,read,pQ,rel_tab,sink,pGate,att,attn_split,(int)pos,T,(int)hp.n_head,
++                                        (int)hp.n_rel_ext,long_full?astra_time_splits():kAttnSplit,kq_scale,st);
++                }else if (kv_q8) {
+                     if (hp.n_head == 3 * hp.n_head_kv && hp.head_dim == 128) {
+                         if(T==5 && save_conv_trace && is_swa && verify_attention_enabled()){
+                             int rows=T*(int)hp.n_head;
+                             verify_swa_scores<<<dim3((unsigned)((hp.n_swa+63)/64),(unsigned)rows),256,0,st>>>(pQ,
+-                                active_kq[(size_t)il],active_ks[(size_t)il],rel_tab,sink,vf_scores,(int)hp.n_head,(int)hp.n_head_kv,
++                                read.k,read.ks,rel_tab,sink,vf_scores,(int)hp.n_head,(int)hp.n_head_kv,
+                                 (int)hp.n_rel_ext,active_cap[(size_t)il],(int)hp.n_swa,pos0_d,kq_scale);
+-                            verify_swa_weighted<<<(unsigned)(rows*4),128,0,st>>>(active_vq[(size_t)il],active_vs[(size_t)il],vf_scores,
++                            verify_swa_weighted<<<(unsigned)(rows*4),128,0,st>>>(read.v,read.vs,vf_scores,
+                                 attn_split,(int)hp.n_head,(int)hp.n_head_kv,(int)hp.n_swa,active_cap[(size_t)il],pos0_d);
+                             verify_swa_combine<<<(unsigned)rows,128,0,st>>>(attn_split,pGate,att);
+                         }else if(T==5 && save_conv_trace && verify_attention_enabled()){
+                             verify_q8_one_head<<<dim3((unsigned)hp.n_head,(unsigned)T),128,0,st>>>(pQ,
+-                                active_kq[(size_t)il],active_ks[(size_t)il],active_vq[(size_t)il],active_vs[(size_t)il],rel_tab,sink,
++                                read.k,read.ks,read.v,read.vs,rel_tab,sink,
+                                 pGate,att,(int)hp.n_head,(int)hp.n_head_kv,(int)hp.n_rel_ext,active_cap[(size_t)il],is_swa?1:0,
+                                 (int)hp.n_swa,pos0_d,kq_scale);
+                         }else if (T == 1) {
+                             const int count = long_full && !is_swa ? astra_time_splits() : kAttnSplit;
+                             k_attn_q8_gqa3_split<<<dim3((unsigned)hp.n_head_kv, (unsigned)count), 128, 0, st>>>(
+-                                pQ, active_kq[(size_t)il], active_ks[(size_t)il], active_vq[(size_t)il], active_vs[(size_t)il], rel_tab,
++                                pQ, read.k, read.ks, read.v, read.vs, rel_tab,
+                                 sink, attn_split, (int)hp.n_head, (int)hp.n_head_kv, (int)hp.n_rel_ext, active_cap[(size_t)il],
+                                 is_swa ? 1 : 0, (int)hp.n_swa, pos0_d, kq_scale, count);
+                             k_attn_split_combine<<<(unsigned)hp.n_head, 128, 0, st>>>(attn_split, pGate, att, (int)hp.n_head, count);
+                         } else {
+                             k_attn_q8_gqa3_pp<<<dim3((unsigned)hp.n_head_kv, (unsigned)T), 128, 0, st>>>(
+-                                pQ, active_kq[(size_t)il], active_ks[(size_t)il], active_vq[(size_t)il], active_vs[(size_t)il], rel_tab,
++                                pQ, read.k, read.ks, read.v, read.vs, rel_tab,
+                                 sink, pGate, att, (int)hp.n_head, (int)hp.n_head_kv, (int)hp.n_rel_ext, active_cap[(size_t)il],
+                                 is_swa ? 1 : 0, (int)hp.n_swa, pos0_d, kq_scale);
+                         }
+                     } else {
+                         k_attn_q8<<<dim3((unsigned)hp.n_head, (unsigned)T), 128, 0, st>>>(
+-                            pQ, active_kq[(size_t)il], active_ks[(size_t)il], active_vq[(size_t)il], active_vs[(size_t)il], rel_tab, sink,
++                            pQ, read.k, read.ks, read.v, read.vs, rel_tab, sink,
+                             pGate, att, (int)hp.n_head, (int)hp.n_head_kv, (int)hp.n_rel_ext, active_cap[(size_t)il], is_swa ? 1 : 0,
+                             (int)hp.n_swa, pos0_d, kq_scale);
+                     }
+@@ -2742,7 +2808,8 @@
+                 std::fprintf(stderr, "strata-inkling2: virtual layer %d belongs to the other split runtime\n", il);
+                 std::exit(1);
+             }
+-            const bool core_graph_allowed = role == Role::All || (role == Role::Core && split_core_graph);
++            const bool core_graph_allowed = (role == Role::All || (role == Role::Core && split_core_graph)) &&
++                (!hostkv.ring || pos+T<=hostkv.ring);
+             const bool graph_shape = T == 1 || (T == verify_max_t && state.capture_dspark && save_conv_trace);
+             if (core_graph_allowed && graph_shape && core_all_gpu && !prof_detail && il == (m->split_prelude ? 0 : hp.core_start) &&
+                 n_core > 0) {
+@@ -2779,7 +2846,7 @@
+                 continue;
+             }
+             const bool is_outer = (il < hp.core_start || il >= core_end_virt);
+-            const bool use_pre_graph = (role == Role::All && T == 1 && hybrid && !prof_detail && !pp_streaming && !state.capture_dspark);
++            const bool use_pre_graph = (!hostkv.ring || hp.is_swa(il) || pos+T<=hostkv.ring) && (role == Role::All && T == 1 && hybrid && !prof_detail && !pp_streaming && !state.capture_dspark);
+             const auto tp_ly0 = Clock::now();
+             if (use_pre_graph && (selected_layer_graph[(size_t) il] || !graph_oom)) {
+                 if (!selected_layer_graph[(size_t) il]) {
+@@ -3585,6 +3652,7 @@
+     int draft_max = 3;
+     std::string tokens_str = "1,2";
+     std::string dump_logits_path;
++    int host_ring=0,host_stage=0;bool host_tiled=false,host_all=false,host_swa_mapped=false;
+     int max_ctx = 65536;
+     int chunk = 256;
+     int max_new = 32;
+@@ -3625,6 +3693,18 @@
+         else if (a == "--oracle-force-t1") oracle_force_t1 = std::atoi(next_arg());
+         else if (a == "--draft" || a == "--draft-model") draft_path = next_arg();
+         else if (a == "--spec" || a == "--draft-max") draft_max = std::clamp(std::atoi(next_arg()), 1, 7);
++        else if(a=="--host-kv-all")host_all=true;
++        else if(a=="--host-kv-all-mapped"){host_all=true;host_swa_mapped=true;}
++        else if(a=="--host-kv-tiled")host_tiled=true;
++        else if(a=="--host-kv-ring" || a=="--kv-resident" || a=="--host-kv-stage"){
++            const char* value=next_arg();char* tail=nullptr;
++            long long parsed=std::strtoll(value,&tail,10);
++            if(!*value || *tail || parsed<0 || parsed>2147483647){
++                std::fprintf(stderr,"Invalid %s: %s\n",a.c_str(),value);return 2;
++            }
++            if(a=="--host-kv-stage")host_stage=(int)parsed;
++            else host_ring=(int)parsed;
++        }
+         else if (a == "--max-context") max_ctx = std::atoi(next_arg());
+         else if (a == "--chunk" || a == "--prefill") chunk = std::atoi(next_arg());
+         else if (a == "--max-new" || a == "-n") max_new = std::atoi(next_arg());
+@@ -3701,6 +3781,15 @@
+         std::fprintf(stderr, "strata-inkling2: remote full attention requires layer split, Q8, no DSpark or replica\n");
+         return 2;
+     }
++    if(host_all && !host_ring){std::fprintf(stderr,"--host-kv-all requires --host-kv-ring\n");return 2;}
++    if(host_tiled && !host_stage){std::fprintf(stderr,"--host-kv-tiled requires positive --host-kv-stage\n");return 2;}
++    if(host_stage && !host_ring){
++        std::fprintf(stderr,"--host-kv-stage requires --host-kv-ring\n");return 2;
++    }
++    if(host_ring && (!kv_q8 || !draft_path.empty() || layer_split_device>=0 || expert_replica_device>=0 || expert_dense_device>=0 ||
++        host_ring<chunk || host_ring>max_ctx || host_stage>max_ctx || (host_stage && host_stage<=host_ring))){
++        std::fprintf(stderr,"host KV requires single GPU, Q8, AR, chunk <= ring <= context; optional stage must satisfy ring < stage <= context\n");return 2;
++    }
+     if (split_core_graph && layer_split_device < 0) {
+         std::fprintf(stderr, "strata-inkling2: --split-core-graph requires --layer-split-device N\n");
+         return 2;
+@@ -3768,6 +3857,8 @@
+     E.batch_qkv_control_t1 = batch_qkv_control_t1;
+     E.split_depth_mix = split_depth_mix;
+     E.outer_graph_profile_block = profile || profile_detail;
++    E.hostkv.ring=host_ring;E.hostkv.stage=host_stage;E.hostkv.tiled=host_tiled;
++    E.hostkv.all_swa=host_all;E.hostkv.direct_swa=host_swa_mapped;
+     if (!E.init(m, max_ctx, runtime_t, kv_q8, err, verify_t, dm && dm->has_quant_dense, dm ? dm->hp.n_ff : 0)) {
+         std::fprintf(stderr, "strata-inkling2: engine init failed: %s\n", err.c_str());
+         return 1;
+@@ -3892,7 +3983,7 @@
+         });
+ 
+         std::printf("INFO engine=0.2.17-inkling2 context=%d kv=%s kv_resident=%d expert_slots=%d experts=%lld expert_cache_mib=%lld vram_free_mib=%lld pool_workers=%d dspark=%s draft_max=%d\n",
+-                    max_ctx, kv_q8 ? "int8" : "fp16", max_ctx,
++                    max_ctx, kv_q8 ? "int8" : "fp16", host_ring?host_ring:max_ctx,
+                     E.placed_slots, (long long) m.hp.n_phys * m.hp.n_expert,
+                     (long long) (E.placed_bytes >> 20), (long long) (E.vram_free_after_place >> 20),
+                     E.pool_workers, dspark ? "on" : "off", dspark ? draft_max : 0);
+@@ -4089,6 +4180,7 @@
+                             emitted, prompt.size(), pp_ms, tg_ms, finish,
+                             dspark ? (long long) dspark->n_accepted : 0LL, dspark ? (long long) dspark->n_drafted : 0LL, reuse, (long long) E.total_hy_gpu(), lookups, fresh);
+                 std::fflush(stdout);
++                E.hostkv.stats("DONE-cumulative");
+                 E.print_replica_stats("DONE");
+             }
+         }
+@@ -4169,7 +4261,8 @@
+         }
+     }
+     const double tg_ms = ms_since(t_tg0);
+-    E.print_replica_stats("DONE");
++    E.hostkv.stats("DONE-cumulative");
++                E.print_replica_stats("DONE");
+     if (profile) E.print_prof("tg");
+     if (dspark)
+         std::fprintf(stderr, "strata-inkling2: dspark accepted=%lld offered=%lld draft_calls=%lld draft_ms=%.1f inject_ms=%.1f\n",
+diff --git a/engine/src/kernels/cpu/native_expert.cpp b/engine/src/kernels/cpu/native_expert.cpp
+--- a/engine/src/kernels/cpu/native_expert.cpp
++++ b/engine/src/kernels/cpu/native_expert.cpp
+@@ -582,9 +582,18 @@
+     return iq3s_one && gu_type == 21 ? 1 : mt_min;
+ }
+ 
++void native_scaled_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt,
++                           float* const* ff, int r0, int r1);
++
+ template <NativeArithmetic Arithmetic>
+ void native_gu_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* ff,
+                     int r0, int r1) {
++    // The fused IQ/K rows below implement unscaled SwiGLU. An Inkling SITU
++    // layer or a per-expert scale must be applied before the hidden is quantized.
++    if (f.situ || f.tail_off) {
++        native_scaled_gu_rows(f, blob, act, nt, ff, r0, r1);
++        return;
++    }
+     // the multi-token kernels decode the weights once for all tokens: 2.0-2.4x ggml-cpu at three tokens, no faster
+     // at one (all are bound by the codebook lookups, ~5 GB/s per core), measured by native_expert_parity.  AVX-512
+     // first, then the AVX-2 one (Zen 2/3, Intel 12th-14th gen).  STRATA_NO_IQ512 drops an AVX-512 CPU to the
+@@ -733,6 +742,11 @@
+         iq128_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
+         return;
+     }
++    native_scaled_gu_rows(f, blob, act, nt, ff, r0, r1);
++}
++
++void native_scaled_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt,
++                           float* const* ff, int r0, int r1) {
+     const int n = (int) f.n_embd;
+     // NVFP4: the per-expert global scales from the blob's tail (1 and 1 otherwise). s_down goes on the down output:
+     // folded into up it left the hidden near 1e-5, whose Q8_0 block scale is an FP16 subnormal (expert error 2-12%)
