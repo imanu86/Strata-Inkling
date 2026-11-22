@@ -839,3 +839,20 @@ Le richieste HTTP originali del Daily chiedono una spiegazione del sorgente. A p
 La [patch CUDA del candidato](bench-results/2026-11-22-inkling-coding-sm75-sm86/inkling-coding.patch) si applica al commit 5ae3782ec4847321559fc97a8fdc8baad3a6d5b4. Il preset di laboratorio è in D:/ds4_work/inkling2/astra-parallel-1122/bench/inkling-coding-lab.json. I tre controlli sono STRATA_IK2_ASTRA_NV=1, STRATA_ATTN_PREP_T1=1 e STRATA_IK2_ASTRA_TIME_SPLIT=48. L’eseguibile finale ha SHA256 348fc866f6f040eb530cb2a923bc92e610096510063c4f922441c1b2e245867b.
 
 Runner, input, output token per token, file C#/Python e risultati dei test sono sotto D:/ds4_work/inkling2/astra-parallel-1122/bench. Risultati di generazione in coding.json, qualità in tests-summary.json e tempi dei kernel in results.json.
+
+## 22 novembre 2026 — Prefill degli esperti su Tensor Core
+
+La build di laboratorio v3 raggruppa fino a otto righe instradate allo stesso esperto. Esegue le proiezioni NVFP4 gate/up e down sui Tensor Core int8 di Ampere e Turing, mantenendo l'ordine delle somme FP32 del motore. Si attiva durante il prefill sui layer residenti con entrambe le proiezioni NVFP4. Queste proiezioni occupavano il 32,96% del tempo nei 49 chunk centrali della traccia del controllo.
+
+Il confronto B–A–B usa lo stesso eseguibile con `STRATA_IK2_ASTRA_PP_MMA` a 1, 0 e 1. Per ciascun passaggio si riavvia il processo e si esegue il warmup storico. Stessi ID di input, generazione greedy, chunk 64, KV Q8 con capacità 262.144, zero token di prompt riusati. RTX 3080 Ti sul loop centrale, RTX 2080 Ti sui layer esterni.
+
+| Token di input | Output | Prefill B1 / A / B2 (t/s) | Guadagno prefill | Decode B1 / A / B2 (t/s) | Richiesta nativa B1 / A / B2 (s) |
+|---:|---:|---:|---:|---:|---:|
+| 3.215 | 256 | 448,5 / 388,4 / 446,0 | +15,2% | 86,9 / 86,4 / 86,7 | 10,11 / 11,23 / 10,16 |
+| 25.075 | 281 | 367,8 / 321,8 / 366,2 | +14,0% | 79,0 / 80,5 / 79,7 | 71,72 / 81,41 / 72,02 |
+
+Ogni token generato coincide con il controllo in entrambe le prove. Il completamento Python lungo supera 335/335 controlli funzionali in tutti e tre i passaggi. Su due prefissi da 64 e 129 token, tutti i 200.058 logits finali di ciascuno coincidono bit per bit. Il prefill lungo dura 68,17–68,47 s contro 77,92 s di controllo.
+
+La v1 guadagnava il 10–11% ma divergeva al 45º token nel banco corto e al 167º nel lungo. La v2 ripristinava la parità osservata e perdeva il 4,4% sul banco corto. La v3 conserva lo stesso ordine di riduzione della v2 e abbassa il numero di registri per thread da 162–164 a 60 in gate/up e da 104 a 56 in down. Nei 49 chunk centrali, Nsight misura 1,62 s per le proiezioni della v3, rispetto a 2,63 s nel controllo e 3,08 s nella v2.
+
+Per riprodurre la build, applicare prima la patch del candidato coding della sezione precedente e poi la [patch prefill v3](bench-results/2026-11-22-inkling-coding-sm75-sm86/inkling-prefill-mma.patch). La sequenza è stata verificata confrontando i sorgenti risultanti con quelli compilati. Preset locale in `D:/ds4_work/inkling2/prefill-astra-1122/inkling-coding-prefill-v3.json`, risultati in `bench/` sotto la stessa cartella. SHA-256 dell'eseguibile `ed1b2d54f0ec23c5ebfd2d694cbf10a38b3b9aba4a6edd3b327bfebd05bc39f6`.

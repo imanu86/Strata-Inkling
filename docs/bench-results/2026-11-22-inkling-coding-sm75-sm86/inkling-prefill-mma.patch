@@ -1,0 +1,192 @@
+diff --git a/engine/src/inkling2/inkling2_engine.cu b/engine/src/inkling2/inkling2_engine.cu
+--- a/engine/src/inkling2/inkling2_engine.cu
++++ b/engine/src/inkling2/inkling2_engine.cu
+@@ -51,6 +51,7 @@
+ using Clock = std::chrono::steady_clock;
+ namespace K = strata::kernels;
+ #include "astra_nv.cuh"
++#include "astra_pp_mma.cuh"
+ 
+ static bool astra_nv_enabled() {
+     static const bool on = std::getenv("STRATA_IK2_ASTRA_NV") && std::strcmp(std::getenv("STRATA_IK2_ASTRA_NV"), "1") == 0;
+@@ -2011,9 +2012,23 @@
+         if (has_gpu) {
+             k_group_experts<<<1, 128, 0, st>>>(ids, L.d_slot_of, L.d_blobs, L.stride, n_ent, (int) hp.n_expert, L.n_slots,
+                                                grp_ptr, grp_start, n_groups, ent_dst, ent_tok, Kp);
+-            K::quantize_q8_1_rows(x_norm, T, N, xq, st);
+-            K::native_expert_grouped(L.L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok,
+-                                     std::min<int64_t>(n_ent, hp.n_expert), n_ent, xq, escr, eparts, st);
++            if (T > 1 && !need_cpu && astra_pp_mma_enabled() && L.L.gu_type == 40 && L.L.d_type == 40 &&
++                N == 2304 && hp.n_ff == 1152 && Kp == 8 && L.L.tail_off && L.L.situ && !L.L.gu_nib && !L.L.had_block) {
++                const unsigned groups = (unsigned)std::min<int64_t>(n_ent, hp.n_expert);
++                float* gate = (float*)escr;
++                float* up = gate + (size_t)n_ent * 1152;
++                AstraQ* hq = (AstraQ*)(up + (size_t)n_ent * 1152);
++                astra_pp_input<<<T * 9, 256, 0, st>>>(x_norm, (AstraQ*)xq);
++                astra_pp_group_mma<false><<<dim3(2 * 1152 / 16, groups), 256, 0, st>>>(
++                    grp_ptr, grp_start, n_groups, ent_tok, ent_dst, L.L, (const AstraQ*)xq, gate, up);
++                astra_situ<<<n_ent * 1152 / 256, 256, 0, st>>>(gate, up, hq, L.L.situ_beta, L.L.situ_linear_beta);
++                astra_pp_group_mma<true><<<dim3(2304 / 16, groups), 256, 0, st>>>(
++                    grp_ptr, grp_start, n_groups, ent_tok, ent_dst, L.L, hq, eparts, nullptr);
++            } else {
++                K::quantize_q8_1_rows(x_norm, T, N, xq, st);
++                K::native_expert_grouped(L.L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok,
++                                         std::min<int64_t>(n_ent, hp.n_expert), n_ent, xq, escr, eparts, st);
++            }
+         }
+         if (prof_detail) {
+             CK(cudaStreamSynchronize(st));
+@@ -3436,6 +3451,7 @@
+ 
+ int run(int argc, char** argv) {
+     if(astra_time_splits()>kAttnSplit) std::fprintf(stderr,"strata-inkling2: local full Q8 T=1, K/V length >=2048: %d temporal splits; separate short/long CUDA graphs\n",astra_time_splits());
++    if (astra_pp_mma_enabled()) std::fprintf(stderr, "strata-inkling2: Astra grouped int8 MMA register-bounded native sum order enabled for resident NVFP4/NVFP4 prefill (T > 1)\n");
+     if (astra_nv_enabled()) std::fprintf(stderr, "strata-inkling2: Astra NVFP4 T=1 resident experts enabled\n");
+     std::string model_path;
+     std::string draft_path;
+diff --git a/engine/src/inkling2/astra_pp_mma.cuh b/engine/src/inkling2/astra_pp_mma.cuh
+new file mode 100644
+--- /dev/null
++++ b/engine/src/inkling2/astra_pp_mma.cuh
+@@ -0,0 +1,141 @@
++#pragma once
++
++// Eight routed entries form the N dimension of each integer Tensor Core tile.
++// The 16-value K extent is the native NVFP4 scale block. A and B have the
++// same within-block permutation, so all integer dot products are exact.
++static bool astra_pp_mma_enabled() {
++    static const bool enabled = [] {
++        const char* value = std::getenv("STRATA_IK2_ASTRA_PP_MMA");
++        return value && std::strcmp(value, "1") == 0;
++    }();
++    return enabled;
++}
++
++__device__ __forceinline__ void astra_pp_mma16(int (&d)[4], unsigned a0, unsigned a1, unsigned b) {
++    constexpr int zero = 0;
++#if __CUDA_ARCH__ >= 800
++    asm("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%7,%7,%7,%7};"
++        : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
++        : "r"(a0), "r"(a1), "r"(b), "r"(zero));
++#else
++    // The two 8-row Turing MMAs have the same accumulator ownership as Ampere.
++    asm("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0,%1}, {%2}, {%3}, {%4,%4};"
++        : "=r"(d[0]), "=r"(d[1]) : "r"(a0), "r"(b), "r"(zero));
++    asm("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0,%1}, {%2}, {%3}, {%4,%4};"
++        : "=r"(d[2]), "=r"(d[3]) : "r"(a1), "r"(b), "r"(zero));
++#endif
++}
++
++__global__ void astra_pp_input(const float* x, AstraQ* q) {
++    const int i = blockIdx.x * blockDim.x + threadIdx.x;
++    astra_store_q(x[i], q, i);
++}
++
++template<bool Down>
++__global__ void __launch_bounds__(256, 3) astra_pp_group_mma(
++    const unsigned long long* __restrict__ ptrs, const int* __restrict__ starts,
++    const int* __restrict__ groups, const int* __restrict__ tok, const int* __restrict__ dst,
++    K::NativeExpertLayout L, const AstraQ* __restrict__ input,
++    float* __restrict__ first_output, float* __restrict__ up_output) {
++    constexpr int ncols = Down ? 1152 : 2304;
++    constexpr int outcols = Down ? 2304 : 1152;
++    constexpr int kWarps = 8;
++    // Warp w owns native K lanes w, w+8, w+16 and w+24 for these 16 rows.
++    __shared__ float4 partial[kWarps][32];
++    const int group = blockIdx.y;
++    if (group >= *groups) return;
++    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
++    const int row8 = lane >> 2, k4 = lane & 3, col = 2 * k4;
++    const bool up = !Down && blockIdx.x >= 1152 / 16;
++    const int row_base = 16 * blockIdx.x - (up ? 1152 : 0);
++    const uint8_t* blob = (const uint8_t*)ptrs[group];
++    const size_t offset = Down ? L.down_off : (up ? L.up_off : 0);
++    const size_t stride = Down ? L.d_row : L.gu_row;
++    const uint32_t* row0 = (const uint32_t*)(blob + offset + (row_base + row8) * stride);
++    const uint32_t* row1 = (const uint32_t*)(blob + offset + (row_base + row8 + 8) * stride);
++    const float tail = ((const float*)(blob + L.tail_off))[Down ? 2 : (up ? 1 : 0)];
++    float* out = up ? up_output : first_output;
++    const int end = starts[group + 1];
++    for (int base = starts[group]; base < end; base += 8) {
++        // A partial tile repeats its last input into padded columns. Only live
++        // columns are stored, and all 32 lanes participate in every warp MMA.
++        const int entry = min(base + row8, end - 1);
++        const int input_row = Down ? entry : tok[entry];
++        const AstraQ* x = input + (size_t)input_row * (ncols / 32);
++        // Recreate native row_dot_multi<40>'s 32 lane-strided sums and the
++        // exact 16,8,4,2,1 shuffle tree, including its nested pair of K16 dots.
++        // Visit the two native lane pairs in the order in which the +16
++        // butterfly consumes them. Only the current lane, its +16 partner
++        // and the previous folded pair must be live across a loop iteration.
++        float v[4] = {};
++        float low[4] = {};
++#pragma unroll 1
++        for (int visit = 0; visit < 4; ++visit) {
++            float lane_sum[4] = {};
++            const int native_lane = warp + 8 * (visit >> 1) + 16 * (visit & 1);
++#pragma unroll 1
++            for (int k = native_lane; k < ncols / 32; k += 32) {
++                const uint32_t* b0 = row0 + (k / 2) * 9;
++                const uint32_t* b1 = row1 + (k / 2) * 9;
++                const unsigned sc0 = b0[0], sc1 = b1[0];
++                const uint16_t* nib0 = (const uint16_t*)(b0 + 1);
++                const uint16_t* nib1 = (const uint16_t*)(b1 + 1);
++                const AstraQ& q = x[k];
++                const float xscale = q.scale;
++                const float sx0 = __shfl_sync(0xffffffffu, xscale, 4 * col);
++                const float sx1 = __shfl_sync(0xffffffffu, xscale, 4 * (col + 1));
++                float pair[4] = {};
++#pragma unroll
++                for (int h = 0; h < 2; ++h) {
++                    const int sub = 2 * (k & 1) + h;
++                    const unsigned a0 = astra_decode_four(nib0[4 * sub + k4]);
++                    const unsigned a1 = astra_decode_four(nib1[4 * sub + k4]);
++                    int dot[4];
++                    astra_pp_mma16(dot, a0, a1, q.word[4 * h + k4]);
++                    const float w0 = astra_scale((sc0 >> (sub * 8)) & 255);
++                    const float w1 = astra_scale((sc1 >> (sub * 8)) & 255);
++                    pair[0] = __fmaf_rn(__fmul_rn(w0, sx0), (float)dot[0], pair[0]);
++                    pair[1] = __fmaf_rn(__fmul_rn(w0, sx1), (float)dot[1], pair[1]);
++                    pair[2] = __fmaf_rn(__fmul_rn(w1, sx0), (float)dot[2], pair[2]);
++                    pair[3] = __fmaf_rn(__fmul_rn(w1, sx1), (float)dot[3], pair[3]);
++                }
++#pragma unroll
++                for (int j = 0; j < 4; ++j) lane_sum[j] = __fadd_rn(lane_sum[j], pair[j]);
++            }
++#pragma unroll
++            for (int j = 0; j < 4; ++j) {
++                if ((visit & 1) == 0) {
++                    low[j] = lane_sum[j];
++                } else {
++                    const float pair_sum = __fadd_rn(low[j], lane_sum[j]);
++                    v[j] = visit == 1 ? pair_sum : __fadd_rn(v[j], pair_sum);
++                }
++            }
++        }
++        partial[warp][lane] = make_float4(v[0], v[1], v[2], v[3]);
++        __syncthreads();
++        if (warp == 0) {
++            float4 folded[4];
++#pragma unroll
++            for (int w = 0; w < 4; ++w) {
++                const float4 a = partial[w][lane], b = partial[w + 4][lane];
++                folded[w] = make_float4(a.x+b.x, a.y+b.y, a.z+b.z, a.w+b.w);
++            }
++            v[0] = (folded[0].x + folded[2].x) + (folded[1].x + folded[3].x);
++            v[1] = (folded[0].y + folded[2].y) + (folded[1].y + folded[3].y);
++            v[2] = (folded[0].z + folded[2].z) + (folded[1].z + folded[3].z);
++            v[3] = (folded[0].w + folded[2].w) + (folded[1].w + folded[3].w);
++#pragma unroll
++            for (int c = 0; c < 2; ++c) {
++                const int e = base + col + c;
++                if (e < end) {
++                    const size_t pos = (size_t)(Down ? dst[e] : e) * outcols + row_base + row8;
++                    out[pos] = v[c] * tail;
++                    out[pos + 8] = v[c + 2] * tail;
++                }
++            }
++        }
++        // The next tile reuses the same partial storage.
++        if (base + 8 < end) __syncthreads();
++    }
++}
