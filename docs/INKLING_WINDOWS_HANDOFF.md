@@ -670,3 +670,18 @@ Il prototipo loop-message-bank-1122 prepara i quattro messaggi di ciascuno dei 1
 Abbiamo misurato l'effetto dei messaggi su un router reale, strato fisico 6, per la stessa generazione libera da 256 token. Il controllo in parallelo ricostruisce tutti gli otto ID nell'ordine corretto in 510 decisioni su 510, e il motore emette gli stessi 256 ID del riferimento. Sostituendo il messaggio col corrispondente del token precedente, sui 254 confronti possibili per giro coincidono in media 4,44 esperti su 8, sia nel giro 2 sia nel giro 3. L'intero insieme coincide una sola volta per giro. Omettendo il contributo del messaggio le intersezioni medie scendono a 3,99 e salgono a 4,65 rispettivamente. Si tratta di perturbazioni locali con tutta la storia esatta. Non sono state misurate la qualità generativa di tre rami indipendenti o una fusione finale addestrata. I dati sono in qwen-comparison-20261122/idcheck-true-shadow/routing-summary.json.
 
 Infine abbiamo ripartito fra GPU i gruppi di teste di una vera full attention Q8 a T=1. Il core ha sei visite a questo tipo di attenzione. Il microbenchmark usa stati sintetici, KV storica residente e copie reali delle attivazioni via host. Le uscite sono bit per bit identiche per tutti i tagli. A posizione 97793, un'attenzione costa 1,261 ms sulla 3080 Ti sola; 1,461 ms con sei gruppi sulla 3080 Ti e due sulla 3060; 1,748 ms su 3080 Ti e 2080 Ti (5+3); 1,754 ms con tutte e tre (4+3+1). Con la terza scheda si è allungata l'attesa del risultato. Questi sono tempi del singolo strato con copie e sincronizzazioni. Proiezioni e MoE sono esclusi. Dettagli in loop-head-shard-1122/summary.csv.
+
+
+### Dipendenza causale del messaggio fra giri
+
+Sul Daily comunità 4K con apertura visibile, stesso prefisso di 3215 ID, greedy e 128 token generati, abbiamo modificato unicamente il passaggio 1→2 alla posizione 3215. Quattro esecuzioni isolate comprendono controllo, azzeramento del solo messaggio MoE dello strato fisico 6, azzeramento di tutti i 48 messaggi ricevuti dal giro 2 e replica di controllo. Il prefisso e i vettori 1→2 prima dell'intervento sono identici. Il diagnostico legge i messaggi 2→3 effettivi del motore sullo stesso token. Nessun tempo di questa build diagnostica viene usato come benchmark.
+
+Per token e passaggio il banco contiene due stati normalizzati da 2304 float, uno intermedio e quello finale. I dodici strati leggono ciascuno quattro miscele dei due vettori per Q, K, V e MoE. I coefficienti di miscela sono prodotti da softmax dei prodotti scalari con le query apprese. I quattro segnali modulano gli ingressi dei rispettivi moduli. Azzerare un messaggio conserva il controllo appreso e gli fornisce un vettore nullo.
+
+| Intervento sul giro 2 | Vettori 2→3 cambiati | Scarto L2 complessivo rispetto al controllo | Primo ID generato diverso (base 1) |
+|---|---:|---:|---:|
+| Replica di controllo | 0/48 | 0% | nessuno su 128 |
+| Solo messaggio MoE dello strato 6 azzerato | 48/48 | 4,60% | 123 |
+| Tutti i 48 messaggi azzerati | 48/48 | 33,98% | 34 |
+
+Le modifiche mostrano causalità interna per questo token. Il primo token scelto dopo l'intervento rimane uguale, anche nel caso più forte. La configurazione proposta con tre rami perturbati in parallelo e un giro finale di fusione resta una diversa architettura da valutare. Per isolare l'effetto della diversità servono anche due giri senza rumore e tre rami identici con la stessa fusione. Artefatti locali in D:/ds4_work/inkling2/loop-message-causality-1122/result.json e mix.json.
