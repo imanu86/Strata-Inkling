@@ -1,0 +1,199 @@
+diff --git a/engine/src/inkling2/inkling2_engine.cu b/engine/src/inkling2/inkling2_engine.cu
+--- a/engine/src/inkling2/inkling2_engine.cu
++++ b/engine/src/inkling2/inkling2_engine.cu
+@@ -56,6 +56,7 @@
+ static bool verify_fusion_on() { static const bool on = std::getenv("STRATA_DSPARK_FUSION") && std::strcmp(std::getenv("STRATA_DSPARK_FUSION"),"1")==0;return on; }
+ #include "astra_pp_mma.cuh"
+ #include "astra_verify_gu.cuh"
++#include "astra_verify_bf16.cuh"
+ 
+ static bool astra_nv_enabled() {
+     static const bool on = std::getenv("STRATA_IK2_ASTRA_NV") && std::strcmp(std::getenv("STRATA_IK2_ASTRA_NV"), "1") == 0;
+@@ -794,6 +795,7 @@
+     VFConvRows vf_rows{};
+     VFWinner* vf_tiles=nullptr;
+     int verify_max_t = 1;
++    bool verify_bf16_thin = false;
+     size_t layer_conv_floats = 0, local_conv_floats = 0;
+     std::vector<int> trace_slot;
+     SwaLayerPtrs swa_ptrs{};
+@@ -1383,6 +1385,15 @@
+         DeviceScope owner(device);
+         ctx = max_ctx;
+         verify_max_t = std::max(1, max_verify_t);
++        const char* thin = std::getenv("STRATA_IK2_VERIFY_BF16_THIN");
++        const char* bf16_tc = std::getenv("STRATA_BF16_TC");
++        if (thin && std::strcmp(thin, "1") == 0 && (!bf16_tc || !*bf16_tc || std::strcmp(bf16_tc, "0") == 0)) {
++            int major = 0, minor = 0;
++            CK(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device));
++            CK(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device));
++            verify_bf16_thin = major == 7 && minor == 5;
++            if (verify_bf16_thin) std::fprintf(stderr, "strata-inkling2: verify BF16 thin projection enabled on SM75 device %d\n", device);
++        }
+         tmax = std::max(max_t, verify_max_t);
+         kv_q8 = use_kv_q8;
+         const auto& hp = m->hp;
+@@ -1613,7 +1624,7 @@
+         }
+     }
+ 
+-    void project_preq(const float* X, const void* q8_ready, const DenseMat& W, float* Y, int T, int64_t N_out, int64_t K_in) {
++    void project_preq(const float* X, const void* q8_ready, const DenseMat& W, float* Y, int T, int64_t N_out, int64_t K_in, bool verify_thin = false) {
+         if (W.type == 0) {
+             project_f32(X, (const float*) W.d, Y, T, N_out, K_in);
+             return;
+@@ -1626,6 +1637,10 @@
+         }
+         if (W.type == 30) {
+             const uint16_t* wp = (const uint16_t*) W.d;
++            if (verify_thin && verify_bf16_thin && T >= 2 && T <= 5 && K_in == 2304 && N_out > 0 && N_out <= 64) {
++                astra_verify_bf16_thin<<<dim3((unsigned)N_out, (unsigned)T), 128, 0, st>>>(X, wp, Y, (int)N_out);
++                return;
++            }
+             if (T == 1) {
+                 K::bf16_gemv_fp32_mmvf(X, wp, Y, K_in, N_out, st);
+             } else {
+@@ -2389,7 +2404,7 @@
+             const void* xq_v_src = (inv_src == in_q) ? xq : (inv_src == ink_src ? xq_k_src : xq_v);
+             if (ink_src != in_q) prep_q8(ink_src, xq_k, T, N);
+             if (inv_src != in_q && inv_src != ink_src) prep_q8(inv_src, xq_v, T, N);
+-            project_preq(in_q, xq, L.attn_sink_proj, sink, T, hp.n_head, N);
++            project_preq(in_q, xq, L.attn_sink_proj, sink, T, hp.n_head, N, save_conv_trace);
+             float* pQ = Q;
+             float* pGate = att_gate;
+             float* pR = R;
+@@ -2424,7 +2439,7 @@
+                     project_preq(ink_src, xq_k_src, L.attn_kkc, kbuf, 1, L.attn_kkc.n_out, N);
+                 } else {
+                     project_preq(ink_src, xq_k_src, L.attn_k, K, T, kv_dim, N);
+-                    if (!is_swa) project_preq(ink_src, xq_k_src, L.attn_k_conv_proj, dyn_k, T, dyn_dim, N);
++                    if (!is_swa) project_preq(ink_src, xq_k_src, L.attn_k_conv_proj, dyn_k, T, dyn_dim, N, save_conv_trace);
+                 }
+                 if (!is_swa && T == 1 && L.attn_vvc.d != nullptr) {
+                     float* vbuf = qgr_t1 + 2 * q_dim + rel_dim + kv_dim + dyn_dim;
+@@ -2433,7 +2448,7 @@
+                     project_preq(inv_src, xq_v_src, L.attn_vvc, vbuf, 1, L.attn_vvc.n_out, N);
+                 } else {
+                     project_preq(inv_src, xq_v_src, L.attn_v, V, T, kv_dim, N);
+-                    if (!is_swa) project_preq(inv_src, xq_v_src, L.attn_v_conv_proj, dyn_v, T, dyn_dim, N);
++                    if (!is_swa) project_preq(inv_src, xq_v_src, L.attn_v_conv_proj, dyn_v, T, dyn_dim, N, save_conv_trace);
+                 }
+             }
+ 
+diff --git a/engine/src/inkling2/astra_verify_bf16.cuh b/engine/src/inkling2/astra_verify_bf16.cuh
+new file mode 100644
+--- /dev/null
++++ b/engine/src/inkling2/astra_verify_bf16.cuh
+@@ -0,0 +1,33 @@
++#pragma once
++
++// A tiny Turing GEMM can have a single cuBLAS CTA for the entire matrix.
++// Each CTA here gathers the two operands for one independent result. The
++// accumulator then visits K in order to avoid an extra parallel sum tree.
++__global__ void __launch_bounds__(128) astra_verify_bf16_thin(
++    const float* __restrict__ x, const uint16_t* __restrict__ w,
++    float* __restrict__ y, int rows) {
++    constexpr int width = 2304;
++    __shared__ float2 terms[width];
++    const int token = blockIdx.y, row = blockIdx.x;
++    const float* input = x + token * width;
++    const uint16_t* weight = w + row * width;
++    for (int k = threadIdx.x; k < width; k += blockDim.x) {
++        const unsigned bits = __float_as_uint(input[k]);
++        const unsigned rounded = (bits + 0x7fffu + ((bits >> 16) & 1)) & 0xffff0000u;
++        terms[k] = make_float2(__uint_as_float(rounded),
++                               __uint_as_float((unsigned)weight[k] << 16));
++    }
++    __syncthreads();
++    if (threadIdx.x == 0) {
++        float acc = 0;
++#pragma unroll 1
++        for (int base = 0; base < width; base += 32) {
++#pragma unroll
++            for (int j = 0; j < 32; ++j) {
++                const float2 p = terms[base + j];
++                acc = __fmaf_rn(p.x, p.y, acc);
++            }
++        }
++        y[token * rows + row] = acc;
++    }
++}
+diff --git a/engine/src/inkling2/verify_replay.cuh b/engine/src/inkling2/verify_replay.cuh
+--- a/engine/src/inkling2/verify_replay.cuh
++++ b/engine/src/inkling2/verify_replay.cuh
+@@ -25,7 +25,10 @@
+     }
+ };
+ int verify_replay(Engine& e,const std::vector<int32_t>& prompt,const char* path,int chunk) {
+-    if(!e.split_peer || !e.dspark || !e.kv_q8 || e.verify_max_t!=5 || chunk<1)return 11;
++    const int width = e.verify_max_t, spec = width - 1;
++    if(!e.split_peer || !e.dspark || !e.kv_q8 || width<2 || width>5 || chunk<1)return 11;
++    if(const char* v=std::getenv("VW_WIDTH")) if (std::atoi(v)!=width) return 20;
++    if(!std::getenv("VW_OUT"))return 12;
+     std::ifstream file(path);std::ofstream out(std::getenv("VW_OUT"));
+     if(!file || !out)return 12;
+     out<<"round\tpos\taccepted_frozen\trep\tverify_ms\tcommit_ms\tblock\tsingle\tnext_after_commit\tnext_single\n";
+@@ -50,40 +53,51 @@
+         windows.push_back(w);
+     }
+     if(windows.size()<25)return 16;
+-    const int count=std::min(40,(int)windows.size()-1);
++    const int requested=std::getenv("VW_ROUNDS") ? std::atoi(std::getenv("VW_ROUNDS")) : 40;
++    const int reps=std::getenv("VW_REPS") ? std::atoi(std::getenv("VW_REPS")) : 3;
++    if(requested<1 || requested>40 || reps<1 || reps>9)return 21;
++    const int count=std::min(requested,(int)windows.size()-1);
+     for(int i=0;i<count;++i){
+         const auto& w=windows[i]; const int next=windows[i+1].ids.front();
+         if(e.pos!=w.pos || windows[i+1].pos!=w.pos+1+w.count)return 17;
+         state(false);
+         std::vector<int32_t> singles;
+-        for(int32_t id:w.ids) singles.push_back(e.forward(&id,1,false,nullptr,false,true));
++        for(int j=0;j<width;++j) singles.push_back(e.forward(&w.ids[j],1,false,nullptr,false,true));
+         // Every reference row sees the same proposals, even beyond the first rejection.
+         state(true);
+         int reference_next=-1;
+-        if(w.count<4){
++        if(w.count<spec){
+             for(int j=0;j<=w.count;++j)e.forward(&w.ids[j],1,false,nullptr,false,true);
+             reference_next=e.forward(&next,1,false,nullptr,false,true);
+         }
+-        for(int rep=0;rep<3;++rep){
++        if(i==0) if(const char* file=std::getenv("VW_LOGITS_OUT")) {
++            state(true);
++            std::vector<float> logits;
++            e.forward(w.ids.data(),width,true,&logits,true,true,spec);
++            std::ofstream bin(file,std::ios::binary);
++            bin.write((const char*)logits.data(),(std::streamsize)(logits.size()*sizeof(float)));
++            if(!bin || logits.size()!=(size_t)width*e.m->hp.vocab_unpadded)return 22;
++        }
++        for(int rep=0;rep<reps;++rep){
+             state(true);
+             std::vector<int32_t> block;
+             auto start=Clock::now();
+-            e.forward(w.ids.data(),5,false,nullptr,false,true,4,&block);
++            e.forward(w.ids.data(),width,false,nullptr,false,true,spec,&block);
+             sync();
+             double verify=ms_since(start);
+             start=Clock::now();
+-            e.commit_verify(w.count,4,w.pos);
++            e.commit_verify(std::min(w.count,spec),spec,w.pos);
+             sync();
+             double commit=ms_since(start);
+-            if(block.size()!=5)return 18;
++            if((int)block.size()!=width)return 18;
+             // A sixth token can overwrite a sixth SWA ring cell. It is not part of
+             // the five-slot snapshot, so probe after a rejection only.
+             int probe=-1;
+-            if(w.count<4)probe=e.forward(&next,1,false,nullptr,false,true);
+-            out<<i<<'\t'<<w.pos<<'\t'<<w.count<<'\t'<<rep<<'\t'<<verify<<'\t'<<commit<<'\t';
+-            for(int j=0;j<5;++j)out<<(j?",":"")<<block[j];
+-            out<<'\t';for(int j=0;j<5;++j)out<<(j?",":"")<<singles[j];
+-            out<<'\t'<<probe<<'\t'<<(w.count<4?reference_next:-1)<<'\n';
++            if(w.count<spec)probe=e.forward(&next,1,false,nullptr,false,true);
++            out<<i<<'\t'<<w.pos<<'\t'<<std::min(w.count,spec)<<'\t'<<rep<<'\t'<<verify<<'\t'<<commit<<'\t';
++            for(int j=0;j<width;++j)out<<(j?",":"")<<block[j];
++            out<<'\t';for(int j=0;j<width;++j)out<<(j?",":"")<<singles[j];
++            out<<'\t'<<probe<<'\t'<<(w.count<spec?reference_next:-1)<<'\n';
+         }
+         state(true);
+         for(int j=0;j<=w.count;++j)e.forward(&w.ids[j],1,false,nullptr,false,true);

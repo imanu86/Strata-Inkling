@@ -1,0 +1,448 @@
+--- /dev/null
++++ b/engine/src/inkling2/astra_verify_gu.cuh
+@@ -0,0 +1,60 @@
++#pragma once
++
++static bool astra_verify_gu_enabled() {
++    static const bool enabled = [] {
++        const char* v = std::getenv("STRATA_IK2_VERIFY_FUSED_GU");
++        return v && std::strcmp(v, "1") == 0;
++    }();
++    return enabled;
++}
++
++// One CTA computes all 32 hidden values that share a Q8 scale. The eight
++// warps each own four distinct rows, with native's 32-lane FP32 tree. At
++// T<=5 a direct top-k entry has its own output slot and needs no grouping.
++__global__ void __launch_bounds__(256) astra_verify_gu_situ_q8(
++    const uint8_t* blobs, size_t stride, const int* slots, const int* ids,
++    K::NativeExpertLayout L, const AstraQ* input, AstraQ* hidden) {
++    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
++    const int entry = blockIdx.y, first = blockIdx.x * 32;
++    const uint8_t* blob = blobs + stride * slots[ids[entry]];
++    const float* scale = (const float*)(blob + L.tail_off);
++    __shared__ AstraQ x[72];
++    __shared__ float2 products[32];
++    const AstraQ* token = input + (entry / 8) * 72;
++    // No type aliasing or layout conversion: each lane copies q8 fields.
++    for (int b = warp; b < 72; b += 8) {
++        if (lane < 8) x[b].word[lane] = token[b].word[lane];
++        if (lane == 8) x[b].scale = token[b].scale;
++    }
++    __syncthreads();
++#pragma unroll 1
++    for (int sub = warp; sub < 32; sub += 8) {
++        const int r = first + sub;
++        const unsigned* g = (const unsigned*)(blob + r * L.gu_row);
++        const unsigned* u = (const unsigned*)(blob + L.up_off + r * L.gu_row);
++        float vg = 0.0f, vu = 0.0f;
++#pragma unroll
++        for (int base = 0; base < 72; base += 32) {
++            const int k = base + lane;
++            if (k < 72) {
++                const AstraQ a = x[k];
++                vg += astra_dot32(g, k, a);
++                vu += astra_dot32(u, k, a);
++            }
++        }
++#pragma unroll
++        for (int offset = 16; offset; offset >>= 1) {
++            vg += __shfl_xor_sync(0xffffffffu, vg, offset);
++            vu += __shfl_xor_sync(0xffffffffu, vu, offset);
++        }
++        if (lane == 0) products[sub] = make_float2(vg * scale[0], vu * scale[1]);
++    }
++    __syncthreads();
++    if (warp == 0) {
++        const float2 gu = products[lane];
++        const float beta = L.situ_beta, lb = L.situ_linear_beta;
++        const float tg = beta * tanhf(gu.x / beta) * (1.0f / (1.0f + __expf(-gu.x)));
++        const float tu = lb > 0.0f ? lb * tanhf(gu.y / lb) : gu.y;
++        astra_store_q(tg * tu, hidden, entry * 1152 + first + lane);
++    }
++}
+--- a/engine/src/inkling2/inkling2_dspark.cuh
++++ b/engine/src/inkling2/inkling2_dspark.cuh
+@@ -358,7 +358,7 @@
+ 
+ __global__ void k_dspark_prep_joint(const float* __restrict__ state, const void* __restrict__ markov_w1, int w1_type,
+                                     int prev_id, const float* __restrict__ hidden_i, const float* __restrict__ context,
+-                                    float* __restrict__ joint_inp, int rank, int N) {
++                                    float* __restrict__ joint_inp, int rank, int N, const int32_t* previous_device=nullptr) {
+     const int i = blockIdx.x * blockDim.x + threadIdx.x;
+     const int total = 2 * rank + 2 * N;
+     if (i >= total) return;
+@@ -366,7 +366,7 @@
+         joint_inp[i] = state[i];
+     } else if (i < 2 * rank) {
+         const int c = i - rank;
+-        const size_t idx = (size_t) prev_id * rank + c;
++        const size_t idx = (size_t) (previous_device ? *previous_device : prev_id) * rank + c;
+         if (w1_type == 30) joint_inp[i] = bf16_to_f32_d(((const uint16_t*) markov_w1)[idx]);
+         else if (w1_type == 1) joint_inp[i] = __half2float(((const __half*) markov_w1)[idx]);
+         else joint_inp[i] = ((const float*) markov_w1)[idx];
+@@ -1009,12 +1009,13 @@
+         // 3. Recurrent Markov chain for i = 1 .. n_draft
+         CK(cudaMemsetAsync(rnn_state, 0, (size_t) rank * sizeof(float), E.st));
+         int32_t prev_id = anchor;
++        const bool chain = E.vf_tiles && !out_logits && !dump;
+         const int joint_tot = 2 * rank + 2 * N;
+         for (int i = 0; i < n_draft; ++i) {
+             const std::string tag = dump ? "rnn" + std::to_string(i) : std::string();
+             const float* hi = block_cur + (size_t) (i + 1) * N;
+             dspark_detail::k_dspark_prep_joint<<<(unsigned) ((joint_tot + 255) / 256), 256, 0, E.st>>>(
+-                rnn_state, dm->markov_w1, dm->markov_w1_type, prev_id, hi, f_rnn_last, joint_inp, rank, N);
++                rnn_state, dm->markov_w1, dm->markov_w1_type, prev_id, hi, f_rnn_last, joint_inp, rank, N, chain && i>0 ? E.pick_d+i-1 : nullptr);
+             if (dump) snap(tag + ".joint_input", joint_inp, 1, joint_tot);
+             E.project(joint_inp, dm->joint_proj, joint_out, 1, 3 * rank, joint_tot);
+             if (dump) snap(tag + ".joint_out", joint_out, 1, 3 * rank);
+@@ -1042,6 +1043,10 @@
+                 prev_id = sample_fn(i, row_lg);
+             } else {
+                 if (dump) snap(tag + ".logits_raw", E.logits, 1, (int) hp.vocab_unpadded);
++                if(chain){
++                    vf_argmax(E.logits,E.vf_tiles,E.pick_d+i,(int)hp.vocab_unpadded,1,E.st);
++                    continue;
++                }
+                 k_argmax<<<1, 256, 0, E.st>>>(E.logits, E.pick_d, (int) hp.vocab_unpadded);
+                 int32_t next_id = 0;
+                 CK(cudaMemcpyAsync(&next_id, E.pick_d, sizeof(int32_t), cudaMemcpyDeviceToHost, E.st));
+@@ -1050,6 +1055,10 @@
+             }
+             out_tokens[(size_t) i] = prev_id;
+         }
++        if(chain){
++            CK(cudaMemcpyAsync(out_tokens.data(),E.pick_d,(size_t)n_draft*sizeof(int32_t),cudaMemcpyDeviceToHost,E.st));
++            CK(cudaStreamSynchronize(E.st));
++        }
+         if (dump) {
+             diagnostic.write("proposed_ids", out_tokens.data(), "i32", sizeof(int32_t), {n_draft}, E.st, false);
+             diagnostic.finish();
+--- a/engine/src/inkling2/inkling2_engine.cu
++++ b/engine/src/inkling2/inkling2_engine.cu
+@@ -36,6 +36,7 @@
+ #include <cstring>
+ #include <deque>
+ #include <filesystem>
++#include <fstream>
+ #include <map>
+ #include <memory>
+ #include <mutex>
+@@ -51,7 +52,10 @@
+ using Clock = std::chrono::steady_clock;
+ namespace K = strata::kernels;
+ #include "astra_nv.cuh"
++#include "verify_fusion.cuh"
++static bool verify_fusion_on() { static const bool on = std::getenv("STRATA_DSPARK_FUSION") && std::strcmp(std::getenv("STRATA_DSPARK_FUSION"),"1")==0;return on; }
+ #include "astra_pp_mma.cuh"
++#include "astra_verify_gu.cuh"
+ 
+ static bool astra_nv_enabled() {
+     static const bool on = std::getenv("STRATA_IK2_ASTRA_NV") && std::strcmp(std::getenv("STRATA_IK2_ASTRA_NV"), "1") == 0;
+@@ -787,6 +791,8 @@
+ 
+     // DSpark is allocated on the outer/head device; the core only captures its local taps/undo state.
+     DsparkEngine* dspark = nullptr;
++    VFConvRows vf_rows{};
++    VFWinner* vf_tiles=nullptr;
+     int verify_max_t = 1;
+     size_t layer_conv_floats = 0, local_conv_floats = 0;
+     std::vector<int> trace_slot;
+@@ -1346,7 +1352,7 @@
+         cudaFree(sampling_mass);
+         cudaFree(tok_d);
+         cudaFree(pos0_d);
+-        cudaFree(pick_d);
++        cudaFree(pick_d);cudaFree(vf_tiles);
+         cudaFree(d_miss);
+         cudaFree(ecpu);
+         cudaFreeHost(h_tok_buf);
+@@ -1491,6 +1497,7 @@
+         CK(cudaMalloc(&tok_d, (size_t) tmax * sizeof(int32_t)));
+         CK(cudaMalloc(&pos0_d, sizeof(int32_t)));
+         CK(cudaMalloc(&pick_d, (size_t) tmax * sizeof(int32_t)));
++        if(verify_fusion_on() && verify_max_t>1) CK(cudaMalloc(&vf_tiles, (size_t)64*verify_max_t*sizeof(VFWinner)));
+ 
+         CK(cudaMallocHost(&h_ids, (size_t) max_ent * sizeof(int32_t)));
+         CK(cudaEventCreateWithFlags(&ev_route, cudaEventDisableTiming));
+@@ -1547,6 +1554,11 @@
+         dspark = draft;
+         for (auto& p : d_tgt_feat) CK(cudaMalloc(&p, (size_t) tmax * m->hp.n_embd * sizeof(float)));
+         CK(cudaMalloc(&d_conv_trace, (size_t) verify_max_t * local_conv_floats * sizeof(float)));
++        if(verify_fusion_on()){
++            for(int il=0;il<m->hp.n_layer && m->hp.n_layer<=48;++il) if(owns_virtual(il)){
++                int i=vf_rows.n++;vf_rows.ptr[i]=conv_hist[(size_t)il];vf_rows.slot[i]=trace_slot[(size_t)il];
++            }
++        }
+         for (int il = 0; il < m->hp.n_layer; ++il) if (owns_virtual(il) && m->hp.is_swa(il)) {
+             const int s = swa_ptrs.n_swa_layers++;
+             swa_ptrs.kq[s] = kq[(size_t) il]; swa_ptrs.vq[s] = vq[(size_t) il];
+@@ -1576,7 +1588,8 @@
+     void commit_verify(int accepted, int K, int pos_pre) {
+         DeviceScope owner(device);
+         if (accepted < K) {
+-            for (int il = 0; il < m->hp.n_layer; ++il) if (owns_virtual(il))
++            if(vf_rows.n) vf_restore<<<dim3((unsigned)((layer_conv_floats+255)/256),(unsigned)vf_rows.n),256,0,st>>>(vf_rows,d_conv_trace,local_conv_floats,layer_conv_floats,accepted);
++            else for (int il = 0; il < m->hp.n_layer; ++il) if (owns_virtual(il))
+                 CK(cudaMemcpyAsync(conv_hist[(size_t) il], d_conv_trace + (size_t) accepted * local_conv_floats +
+                                    (size_t) trace_slot[(size_t) il] * layer_conv_floats,
+                                    layer_conv_floats * sizeof(float), cudaMemcpyDeviceToDevice, st));
+@@ -1922,7 +1935,7 @@
+         r.join_ms += ms_since(join_start);
+     }
+ 
+-    void run_moe(PhysLayer& L, int il, const float* x_norm, int T) {
++    void run_moe(PhysLayer& L, int il, const float* x_norm, int T, bool verify) {
+         const auto& hp = m->hp;
+         const int N = (int) hp.n_embd, Kp = (int) hp.n_expert_used;
+         const int n_ent = T * Kp;
+@@ -1939,6 +1952,18 @@
+         const bool has_gpu = L.n_slots > 0;
+         const bool need_cpu = L.n_slots < hp.n_expert;
+         const bool is_q5 = (L.L.gu_type == 13);
++        if (verify && T >= 2 && T <= 5 && !need_cpu && astra_verify_gu_enabled() &&
++            L.L.gu_type == 40 && L.L.d_type == 40 && N == 2304 && hp.n_ff == 1152 && Kp == 8 &&
++            L.L.tail_off && L.L.situ && !L.L.had_block && !L.L.gu_nib) {
++            AstraQ* hq = (AstraQ*)escr;
++            astra_pp_input<<<T * 9, 256, 0, st>>>(x_norm, (AstraQ*)xq);
++            astra_verify_gu_situ_q8<<<dim3(1152 / 32, n_ent), 256, 0, st>>>(
++                L.d_blobs, L.stride, L.d_slot_of, ids, L.L, (const AstraQ*)xq, hq);
++            astra_down<<<dim3(2304 / 16, n_ent), 256, 0, st>>>(
++                L.d_blobs, L.stride, L.d_slot_of, ids, L.L, hq, eparts);
++            k_combine_experts<<<dim3(9, T), 256, 0, st>>>(eparts, ewts, moe_raw, N, Kp);
++            return;
++        }
+         if (T == 1 && !need_cpu && astra_nv_enabled() && L.L.gu_type == 40 && L.L.d_type == 40 &&
+             N == 2304 && hp.n_ff == 1152 && Kp == 8 && L.L.tail_off && L.L.situ && L.L.had_block == 0) {
+             // The router IDs are unique. Each slot writes its own contribution in top-k order.
+@@ -2545,7 +2570,7 @@
+             float* hst = conv_hist[(size_t) il];
+             float* h_tr = save_conv_trace ? d_conv_trace + (size_t) trace_slot[(size_t) il] * layer_conv_floats : nullptr;
+             const bool is_hy = (L.n_slots < hp.n_expert);
+-            run_moe(L, il, in_ffn, T);
++            run_moe(L, il, in_ffn, T, save_conv_trace);
+             const auto tp_mp0 = Clock::now();
+             if (save_conv_trace)
+                 k_shortconv_trace<<<(unsigned) ((N + 255) / 256), 256, 0, st>>>(
+@@ -2747,7 +2772,9 @@
+             full_vocab_tile_mass<<<tiles, 256, 0, st>>>(logits, sampling_mass, hp.vocab_unpadded);
+             full_vocab_pick<<<1, 1, 0, st>>>(logits, sampling_mass, pick_d, hp.vocab_unpadded, tiles, sample_u);
+         } else {
+-            k_argmax<<<(unsigned)rows, 256, 0, st>>>(logits, pick_d, (int)hp.vocab_unpadded);
++            if(vf_tiles && out_picks && state.capture_dspark)
++                vf_argmax(logits,vf_tiles,pick_d,(int)hp.vocab_unpadded,rows,st);
++            else k_argmax<<<(unsigned)rows, 256, 0, st>>>(logits, pick_d, (int)hp.vocab_unpadded);
+         }
+         std::vector<int32_t> picks((size_t) rows);
+         if (copy_logits && out_logits) {
+@@ -3231,6 +3258,12 @@
+         smp.top_k == 0 && smp.min_p == 0.0f && smp.rep_pen == 1.0f && smp.pres_pen == 0.0f && smp.freq_pen == 0.0f;
+     const bool adaptive = E.dspark_adaptive && gpu_pq && E.sampling_mass;
+     DsparkWindowPolicy policy;
++    const char* vf_timing = std::getenv("VF_TIMING");
++    const char* vf_capture = std::getenv("VF_CAPTURE");
++    auto vf_sync=[&](){
++        {DeviceScope scope(E.device);CK(cudaStreamSynchronize(E.st));}
++        if(E.split_peer){DeviceScope scope(E.split_peer->device);CK(cudaStreamSynchronize(E.split_peer->st));}
++    };
+     auto uniform = [&]() { return std::uniform_real_distribution<double>(0.0, 1.0)(rng); };
+     if (out_hit_eos) *out_hit_eos = false;
+ 
+@@ -3265,6 +3298,10 @@
+ 
+         const int K = std::min(draft_max, rem - 1);
+         const int32_t anchor = next_tok;
++        const bool measure=vf_timing && E.pos>=3215;
++        double draft_elapsed=0,verify_elapsed=0,commit_elapsed=0;
++        Clock::time_point vf_start{};
++        if(measure){vf_sync();vf_start=Clock::now();}
+         if (gpu_pq) {
+             dspark->draft(E, anchor, K, d_toks, &d_logits, [&](int row, std::vector<float>&) {
+                 return E.gpu_pq->sample_proposal(row, E.logits, uniform(), E.st);
+@@ -3281,6 +3318,7 @@
+             dspark->draft(E, anchor, K, d_toks, nullptr, [&](int, std::vector<float>&) -> int32_t { return 0; });
+         }
+ 
++        if(measure){vf_sync();draft_elapsed=ms_since(vf_start);vf_start=Clock::now();}
+         if (is_stopped()) break;   // no target state was advanced by drafting
+ 
+         vtoks.resize((size_t) (1 + K));
+@@ -3291,6 +3329,7 @@
+         lg.clear();
+         E.forward(vtoks.data(), 1 + K, sample_on && !gpu_pq, &lg, sample_on, true, K, &t_picks);
+ 
++        if(measure){vf_sync();verify_elapsed=ms_since(vf_start);}
+         int m = 0;
+         bool hit_eos = false;
+         if (gpu_pq) {
+@@ -3339,10 +3378,18 @@
+ 
+         emitted += m;
+         dspark->dump_verify_logits(pos_pre, K, V, lg, m);
++        if(vf_capture && pos_pre>=3215 && K==4){
++            std::ofstream o(vf_capture,std::ios::app);o<<pos_pre<<" "<<m;
++            for(int id:vtoks)o<<" "<<id;for(int id:t_picks)o<<" "<<id;o<<"\n";
++        }
++        if(measure)vf_start=Clock::now();
+         E.commit_verify(m, K, pos_pre);
++        if(measure){vf_sync();commit_elapsed=ms_since(vf_start);vf_start=Clock::now();}
+         for (int i = 0; i < 1 + m; ++i) live_tokens.push_back(vtoks[(size_t) i]);
+         dspark->n_accepted += m;
+         dspark->inject(E, pos_pre, 1 + m);
++        if(measure){vf_sync();std::ofstream o(vf_timing,std::ios::app);
++            o<<pos_pre<<" "<<K<<" "<<m<<" "<<draft_elapsed<<" "<<verify_elapsed<<" "<<commit_elapsed<<" "<<ms_since(vf_start)<<"\n";}
+         if (adaptive) policy.observe(DsparkWindowPolicy::Speculative, 1 + m, K, m, ms_since(round_start),
+                                      K == draft_max && !hit_eos && !is_stopped());
+         if (is_stopped()) break;
+@@ -3364,6 +3411,7 @@
+ }
+ 
+ 
++#include "verify_replay.cuh"
+ // Opt-in diagnostic only. The prefix is reconstructed with the original prompt chunking
+ // followed by the requested singleton tail. The draft is loaded but never runs draft/inject.
+ int verify_row0_oracle(Engine& E, const std::vector<int32_t>& prefix, const std::vector<int32_t>& tail,
+@@ -3972,6 +4020,10 @@
+     }
+ 
+     std::vector<int32_t> prompt = parse_id_list(tokens_str);
++    if(const char* path=std::getenv("VW_PROMPT")){
++        std::ifstream f(path);prompt.clear();int id;while(f>>id)prompt.push_back(id);if(prompt.empty()||!f.eof())return 21;
++    }
++    if(const char* path=std::getenv("VW_REPLAY"))return verify_replay(E,prompt,path,chunk);
+     if (prompt.empty()) prompt = {1};
+     if (!oracle_tail.empty()) return verify_row0_oracle(E, prompt, parse_id_list(oracle_tail), oracle_force_t1, chunk);
+ 
+--- /dev/null
++++ b/engine/src/inkling2/verify_fusion.cuh
+@@ -0,0 +1,35 @@
++#pragma once
++struct VFConvRows { float* ptr[48]; int slot[48]; int n=0; };
++__global__ void vf_restore(VFConvRows p,const float* trace,size_t total,size_t width,int index){
++    const int l=blockIdx.y;const size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x;
++    if(l<p.n && i<width)p.ptr[l][i]=trace[(size_t)index*total+(size_t)p.slot[l]*width+i];
++}
++// Same winner as the legacy kernel, including tied maxima and ignored NaNs.
++struct VFWinner {float v;int id;};
++__device__ inline VFWinner vf_best(VFWinner a,VFWinner b) {
++    return b.v>a.v || (a.v==b.v && b.id<a.id) ? b : a;
++}
++__device__ inline VFWinner vf_warp(VFWinner x){
++    for(int d=16;d;d/=2){VFWinner b{__shfl_down_sync(~0u,x.v,d),__shfl_down_sync(~0u,x.id,d)};x=vf_best(x,b);}
++    return x;
++}
++template<bool Final>
++__global__ void vf_reduce(const float* logits,VFWinner* tiles,int* picks,int V,int ntiles){
++    __shared__ VFWinner warp[8];
++    int lane=threadIdx.x%32, w=threadIdx.x/32, row=blockIdx.y;
++    VFWinner x{-1.e30f,0};
++    if constexpr(Final){
++        for(int j=threadIdx.x;j<ntiles;j+=blockDim.x)x=vf_best(x,tiles[(size_t)row*ntiles+j]);
++    }else{
++        for(int j=blockIdx.x*blockDim.x+threadIdx.x;j<V;j+=gridDim.x*blockDim.x)
++            x=vf_best(x,{logits[(size_t)row*V+j],j});
++    }
++    x=vf_warp(x);if(!lane)warp[w]=x;__syncthreads();
++    if(w==0){x=lane<8?warp[lane]:VFWinner{-1.e30f,0};x=vf_warp(x);
++        if(lane==0){if constexpr(Final)picks[row]=x.id;else tiles[(size_t)row*ntiles+blockIdx.x]=x;}}
++}
++static void vf_argmax(const float* logits,VFWinner* tiles,int* picks,int V,int rows,cudaStream_t st) {
++    constexpr int tiles_per_row=64;
++    vf_reduce<false><<<dim3(tiles_per_row,rows),256,0,st>>>(logits,tiles,picks,V,tiles_per_row);
++    vf_reduce<true><<<dim3(1,rows),256,0,st>>>(logits,tiles,picks,V,tiles_per_row);
++}
+--- /dev/null
++++ b/engine/src/inkling2/verify_replay.cuh
+@@ -0,0 +1,92 @@
++struct ReplaySnapshot {
++    Engine& lane;
++    float* conv=nullptr;
++    uint8_t* ring=nullptr;
++    int mark=0;
++    explicit ReplaySnapshot(Engine& e):lane(e) {
++        DeviceScope owner(lane.device);
++        CK(cudaMalloc(&conv,lane.local_conv_floats*sizeof(float)));
++        const size_t bytes=2*lane.m->hp.kv_dim+2*lane.m->hp.n_head_kv*sizeof(__half);
++        if(lane.swa_ptrs.n_swa_layers) CK(cudaMalloc(&ring,5*lane.swa_ptrs.n_swa_layers*bytes));
++    }
++    ~ReplaySnapshot(){DeviceScope owner(lane.device);cudaFree(conv);cudaFree(ring);}
++    void transfer(bool restoring) {
++        DeviceScope owner(lane.device);
++        if(!restoring)mark=(int)lane.pos;
++        for(int i=0;i<lane.m->hp.n_layer;++i) if(lane.owns_virtual(i)) {
++            float* copy=conv+(size_t)lane.trace_slot[i]*lane.layer_conv_floats;
++            float* live=lane.conv_hist[i];
++            CK(cudaMemcpyAsync(restoring?live:copy,restoring?copy:live,lane.layer_conv_floats*sizeof(float),cudaMemcpyDeviceToDevice,lane.st));
++        }
++        if(ring)k_swa_q8_bak<<<dim3(5,lane.swa_ptrs.n_swa_layers),256,0,lane.st>>>(
++            lane.swa_ptrs,ring,(int)lane.m->hp.kv_dim,(int)lane.m->hp.n_head_kv,lane.swa_ring_cap,mark,0,5,(int)restoring);
++        if(restoring)lane.pos=mark;
++        CK(cudaStreamSynchronize(lane.st));
++    }
++};
++int verify_replay(Engine& e,const std::vector<int32_t>& prompt,const char* path,int chunk) {
++    if(!e.split_peer || !e.dspark || !e.kv_q8 || e.verify_max_t!=5 || chunk<1)return 11;
++    std::ifstream file(path);std::ofstream out(std::getenv("VW_OUT"));
++    if(!file || !out)return 12;
++    out<<"round\tpos\taccepted_frozen\trep\tverify_ms\tcommit_ms\tblock\tsingle\tnext_after_commit\tnext_single\n";
++    e.reset_state();
++    for(size_t off=0;off<prompt.size();off+=(size_t)chunk) {
++        const int n=(int)std::min<size_t>(chunk,prompt.size()-off);
++        e.forward(prompt.data()+off,n,false,nullptr,false,true);
++    }
++    ReplaySnapshot local(e),remote(*e.split_peer);
++    auto state=[&](bool restore){local.transfer(restore);remote.transfer(restore);};
++    auto sync=[&](){
++        {DeviceScope own(e.device);CK(cudaStreamSynchronize(e.st));}
++        {DeviceScope own(e.split_peer->device);CK(cudaStreamSynchronize(e.split_peer->st));}
++    };
++    struct Window {int pos,count;std::vector<int32_t> ids;};
++    std::vector<Window> windows;
++    for(std::string line;std::getline(file,line);) {
++        std::istringstream fields(line); Window w{};int id;
++        if(!(fields>>w.pos>>w.count)||w.count<0||w.count>4)return 13;
++        for(int col=0;col<10;++col){if(!(fields>>id))return 14;if(col<5)w.ids.push_back(id);}
++        if(fields>>id)return 15;
++        windows.push_back(w);
++    }
++    if(windows.size()<25)return 16;
++    const int count=std::min(40,(int)windows.size()-1);
++    for(int i=0;i<count;++i){
++        const auto& w=windows[i]; const int next=windows[i+1].ids.front();
++        if(e.pos!=w.pos || windows[i+1].pos!=w.pos+1+w.count)return 17;
++        state(false);
++        std::vector<int32_t> singles;
++        for(int32_t id:w.ids) singles.push_back(e.forward(&id,1,false,nullptr,false,true));
++        // Every reference row sees the same proposals, even beyond the first rejection.
++        state(true);
++        int reference_next=-1;
++        if(w.count<4){
++            for(int j=0;j<=w.count;++j)e.forward(&w.ids[j],1,false,nullptr,false,true);
++            reference_next=e.forward(&next,1,false,nullptr,false,true);
++        }
++        for(int rep=0;rep<3;++rep){
++            state(true);
++            std::vector<int32_t> block;
++            auto start=Clock::now();
++            e.forward(w.ids.data(),5,false,nullptr,false,true,4,&block);
++            sync();
++            double verify=ms_since(start);
++            start=Clock::now();
++            e.commit_verify(w.count,4,w.pos);
++            sync();
++            double commit=ms_since(start);
++            if(block.size()!=5)return 18;
++            // A sixth token can overwrite a sixth SWA ring cell. It is not part of
++            // the five-slot snapshot, so probe after a rejection only.
++            int probe=-1;
++            if(w.count<4)probe=e.forward(&next,1,false,nullptr,false,true);
++            out<<i<<'\t'<<w.pos<<'\t'<<w.count<<'\t'<<rep<<'\t'<<verify<<'\t'<<commit<<'\t';
++            for(int j=0;j<5;++j)out<<(j?",":"")<<block[j];
++            out<<'\t';for(int j=0;j<5;++j)out<<(j?",":"")<<singles[j];
++            out<<'\t'<<probe<<'\t'<<(w.count<4?reference_next:-1)<<'\n';
++        }
++        state(true);
++        for(int j=0;j<=w.count;++j)e.forward(&w.ids[j],1,false,nullptr,false,true);
++    }
++    out.flush();return out?0:19;
++}

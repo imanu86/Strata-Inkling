@@ -856,3 +856,20 @@ Ogni token generato coincide con il controllo in entrambe le prove. Il completam
 La v1 guadagnava il 10–11% ma divergeva al 45º token nel banco corto e al 167º nel lungo. La v2 ripristinava la parità osservata e perdeva il 4,4% sul banco corto. La v3 conserva lo stesso ordine di riduzione della v2 e abbassa il numero di registri per thread da 162–164 a 60 in gate/up e da 104 a 56 in down. Nei 49 chunk centrali, Nsight misura 1,62 s per le proiezioni della v3, rispetto a 2,63 s nel controllo e 3,08 s nella v2.
 
 Per riprodurre la build, applicare prima la patch del candidato coding della sezione precedente e poi la [patch prefill v3](bench-results/2026-11-22-inkling-coding-sm75-sm86/inkling-prefill-mma.patch). La sequenza è stata verificata confrontando i sorgenti risultanti con quelli compilati. Preset locale in `D:/ds4_work/inkling2/prefill-astra-1122/inkling-coding-prefill-v3.json`, risultati in `bench/` sotto la stessa cartella. SHA-256 dell'eseguibile `ed1b2d54f0ec23c5ebfd2d694cbf10a38b3b9aba4a6edd3b327bfebd05bc39f6`.
+
+## 22 novembre 2026 — Costo di verifica DSpark su codice
+
+Sulla stessa configurazione v3, il drafter Q8_0 propone fino a quattro token. Il banco usa una sola richiesta greedy, warmup separato, prefill integrale e tempi del server nativo. La generazione diretta (AR) serve da riferimento per il guadagno netto.
+
+| Prompt | Input / output | AR (t/s) | DSpark di controllo (t/s) | DSpark finale B1 / B2 (t/s) | Proposte accettate |
+|---|---:|---:|---:|---:|---:|
+| Scrittura della funzione Python free_windows | 136 / 321 | 91,20 | 109,47 | 127,57 / 128,47 | 246/300 |
+| Richiesta sul sorgente storico | 3.215 / 256 | 86,86 | 47,84 | 54,92 / 54,87 | 147/432 |
+
+Sul primo prompt, B–AR–B nello stesso eseguibile finale dà 2,828 / 3,891 / 2,828 s di richiesta completa. Tutti i 321 ID coincidono e ogni funzione supera 305/305 test. Sul secondo prompt il candidato conserva i 256 ID del controllo DSpark. Entrambi divergono da AR al 45º token. In questa riga AR e DSpark di controllo provengono dalla build combinata immediatamente precedente al kernel BF16.
+
+Con 2,36 token emessi per giro sul secondo prompt, raggiungere AR richiede meno di 27,2 ms per giro. Prima delle fusioni si misuravano 49,35 ms. La cronometria diagnostica sincronizzata attribuisce 41,49 ms alla verifica target, 6,60 alla bozza e 0,98 al ripristino/commit. La catena degli ID sulla GPU e il ripristino delle convoluzioni con un lancio per GPU riducono bozza e commit a 5,42 e 0,10 ms. Il solo kernel fuso gate/up, SITU e quantizzazione Q8 porta il decode da 47,84 a 47,93 t/s su questo prompt.
+
+La modifica più incisiva assegna un blocco CUDA a ogni coppia riga di output/token nelle piccole proiezioni BF16 della 2080 Ti. Sugli stessi prefissi, la mediana della verifica passa da 42,38 a 38,95–39,22 ms. I primi 5 × 200.058 logits coincidono bit per bit. Le 12 finestre riproducono tutte le 60 scelte del controllo e le sonde dopo il rifiuto. In generazione, isolando questo kernel nello stesso eseguibile con le altre fusioni attive, il B–A–B sul sorgente storico dà 54,92 / 50,10 / 54,87 t/s.
+
+Per riprodurre la build, dalla v3 applicare in ordine la [patch della catena GPU e degli esperti](bench-results/2026-11-22-inkling-dspark-fusion/dspark-gpu-chain-moe.patch) e la [patch delle proiezioni BF16](bench-results/2026-11-22-inkling-dspark-fusion/dspark-bf16-thin.patch). Le tre opzioni sono `STRATA_DSPARK_FUSION=1`, `STRATA_IK2_VERIFY_FUSED_GU=1` e `STRATA_IK2_VERIFY_BF16_THIN=1`. SHA-256 finale `d6bbe7d2d45b93b28812c4785ade201a6330038a9d89bd793cffce2dee1d870a`. Configurazione locale in `D:/ds4_work/inkling2/verify-fusion-1122/inkling-coding-dspark-k4.json`. La sottocartella `verify/` contiene comandi, token e dati grezzi.
