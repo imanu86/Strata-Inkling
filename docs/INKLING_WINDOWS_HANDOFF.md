@@ -685,3 +685,38 @@ Per token e passaggio il banco contiene due stati normalizzati da 2304 float, un
 | Tutti i 48 messaggi azzerati | 48/48 | 33,98% | 34 |
 
 Le modifiche mostrano causalità interna per questo token. Il primo token scelto dopo l'intervento rimane uguale, anche nel caso più forte. La configurazione proposta con tre rami perturbati in parallelo e un giro finale di fusione resta una diversa architettura da valutare. Per isolare l'effetto della diversità servono anche due giri senza rumore e tre rami identici con la stessa fusione. Artefatti locali in D:/ds4_work/inkling2/loop-message-causality-1122/result.json e mix.json.
+
+## Qualità della fusione di tre rami su Inkling-2-Mini
+
+22 novembre 2026. Prototipo isolato su RTX 3080 Ti e 2080 Ti con gli stessi pesi UD-Q3_K_XL. Tre esecuzioni del primo giro ricevono gli stessi token e conservano cache indipendenti. La prima usa lo stato iniziale originale, le altre due lo perturbano in direzioni opposte. Per ciascun token si mediano i due vettori di memoria corrispondenti dei tre rami. Il giro finale legge i vettori fusi con il proprio controllore appreso e il preambolo originale. La temperatura di campionamento non interviene. Il controllo a due giri esegue il primo e il terzo giro virtuale, saltando quello intermedio.
+
+Due ampiezze provate sullo sviluppo e una selezionata prima del test (0,12 volte la RMS dello stato, seed 1122). Sul controllo con tre rami identici, i punteggi per posizione coincidono byte per byte con quelli di due giri, sui tre esempi di verifica. Il banco ha controllato l’argmax del modello originale rispetto al binario di riferimento sui tre esempi.
+
+| Configurazione | ARC-Challenge /48 | MMLU /48 | Totale /96 | Argmax libero corretto /96 | Perplessità WikiText ↓ |
+|---|---:|---:|---:|---:|---:|
+| Un giro | 10 | 9 | 19 | 7 | 17,63 |
+| Due giri, primo e finale | 14 | 15 | 29 | 29 | 12,85 |
+| Tre rami fusi, poi giro finale | 13 | 16 | 29 | 29 | 12,82 |
+| Inkling originale, tre giri | 44 | 37 | 81 | 80 | 7,16 |
+
+Domande brevi dei test pubblici ARC-Challenge e MMLU, selezionate per hash, con risposta diretta fra quattro lettere, senza ragionamento esplicito. Perplessità su 32 estratti indipendenti di WikiText-2, 48 token valutati per estratto. I risultati descrivono questi campioni. [ARC-Challenge](https://huggingface.co/datasets/allenai/ai2_arc) · [MMLU](https://huggingface.co/datasets/cais/mmlu) · [WikiText](https://huggingface.co/datasets/Salesforce/wikitext)
+
+Rispetto a un giro la fusione corregge 13 domande e ne perde 3 (McNemar esatto bilaterale p = 0,021). Rispetto a due giri corregge 1 domanda e ne perde 1 (p = 1). Rispetto ai tre giri originali corregge 5 domande e ne perde 57. Tutte e cinque le correzioni si ottengono anche con due giri semplici, nell’ordine iniziale. La sola nuova risposta giusta rispetto a due giri riguarda il minimo intero che contiene la cifra 9 e il cui reciproco ha un decimale finito (4096). La risposta persa riguarda il gruppo dell’argon (18).
+
+Su tutte e cinque le correzioni rispetto all’originale abbiamo ripetuto le quattro presentazioni cicliche delle opzioni, mantenendo la chiave corretta. I conteggi per domanda comprendono l’ordine iniziale.
+
+| Domanda | Un giro /4 | Due giri /4 | Fusione /4 | Originale /4 |
+|---|---:|---:|---:|---:|
+| Origine del primo apparecchio acustico | 1 | 1 | 1 | 1 |
+| Recupero di energia in frenata | 1 | 2 | 2 | 0 |
+| Percentuale di tracce occupate su disco | 1 | 1 | 1 | 2 |
+| Consegna di quattro pacchi | 1 | 1 | 1 | 2 |
+| Campo di spezzamento e campo di 60 elementi | 1 | 1 | 1 | 0 |
+
+Su queste cinque domande fusione e due giri danno lo stesso esito di correttezza in tutte e 20 le presentazioni. La fusione sceglie A in 67 delle 96 domande del test, dove A è corretta 19 volte.
+
+ARC-AGI-1 è un test separato di trasformazioni di griglie. Sono stati scelti sei fallimenti documentati di Inkling XHigh (e6de6e8f, a8610ef7, bf32578f, 8597cfd7, 5207a7b5, ce039d91) e tre successi (66e6c45b, 00576224, be03b35f). Nel test locale tutte e quattro le configurazioni ottengono 0/9 nel formato griglia diretto. Sui sei fallimenti pubblici sia la fusione sia l’originale producono una cifra incompatibile con la soluzione. Il protocollo XHigh pubblico usa condizioni diverse. [Risultati per singola griglia](https://arcprize.org/results/thinky-inkling-2-mini)
+
+Su 12.698 posizioni, la distanza L2 relativa mediana dei messaggi interni rispetto al ramo neutro vale 8,25% e 8,37% per i due rami perturbati e 3,31% per la media. La fusione attenua buona parte della variazione e sul campione muove soltanto due esiti di correttezza rispetto a due giri. I rami sono stati eseguiti in sequenza per misurare la qualità. La latenza su tre GPU resta da misurare.
+
+Banco e risultati per domanda sulla workstation in `D:/ds4_work/inkling2/fusion-eval-1122` (protocollo, campioni, result.json, item-results.json, grid-certified.json, permutation-results.json, diagnostics.json). Patch e binario in `D:/ds4_work/inkling2/branch-fusion-quality-1122`.
