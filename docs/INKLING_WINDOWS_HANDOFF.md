@@ -720,3 +720,39 @@ ARC-AGI-1 è un test separato di trasformazioni di griglie. Sono stati scelti se
 Su 12.698 posizioni, la distanza L2 relativa mediana dei messaggi interni rispetto al ramo neutro vale 8,25% e 8,37% per i due rami perturbati e 3,31% per la media. La fusione attenua buona parte della variazione e sul campione muove soltanto due esiti di correttezza rispetto a due giri. I rami sono stati eseguiti in sequenza per misurare la qualità. La latenza su tre GPU resta da misurare.
 
 Banco e risultati per domanda sulla workstation in `D:/ds4_work/inkling2/fusion-eval-1122` (protocollo, campioni, result.json, item-results.json, grid-certified.json, permutation-results.json, diagnostics.json). Patch e binario in `D:/ds4_work/inkling2/branch-fusion-quality-1122`.
+
+## Verifica speculativa su finestre congelate di cinque token
+
+22 novembre 2026. RTX 3080 Ti e 2080 Ti, terza GPU dedicata al desktop. Stesso eseguibile per tutti i bracci, GGUF UD-Q3_K_XL, drafter DSpark Q8_0, KV Q8 di capacità 262144 e split per strati. Tutti i 3072 esperti sono residenti. B usa due modifiche ispirate a Maya. La full attention Q8 legge K/V una volta per cinque posizioni causali e il ripristino delle convoluzioni dopo un rifiuto usa un solo lancio per GPU. Il controllo R abilita solo il ripristino. La verifica del modello completo mantiene gli stessi strati ed esperti. Si cambiano i flag al lancio del processo per ricatturare i CUDA Graph. [Verificatore Maya](https://github.com/mw00/project-maya/pull/1095)
+
+Prefissi storici da 42 ID (prosa), 99 (italiano) e 10000 (contesto realmente occupato). Abbiamo registrato le finestre greedy del percorso ordinario, ciascuna formata da un token iniziale e quattro proposte reali. Per ciascun prefisso si riproducono le prime 40 finestre con tre ripetizioni. Lo stato canonico avanza con i token committati nel tracciato, uno per volta. Per ogni ripetizione si ripristinano su entrambe le GPU la posizione, le convoluzioni e gli slot della KV circolare sovrascrivibili. La verifica include il backup speculativo, l’intero forward e la lettura delle cinque scelte. Il commit comprende il ripristino in caso di rifiuto. I tempi escludono drafter, prefill, ripristino del banco e controlli di parità. Le prime quattro finestre sono escluse soltanto dalle statistiche di tempo. Mediana delle tre ripetizioni per finestra e successivamente mediana sulle 36 finestre.
+
+| Prefisso | Verifica B1 / A / B2, ms | Ripristino sui rifiuti B1 / A / B2, ms | Verifica + commit B1 / A / B2, ms |
+|---|---:|---:|---:|
+| prosa | 32,45 / 32,35 / 32,62 | 0,08 / 1,06 / 0,08 | 32,52 / 33,15 / 32,70 |
+| italiano | 32,97 / 33,18 / 33,04 | 0,08 / 1,07 / 0,08 | 33,02 / 34,10 / 33,12 |
+| 10k | 43,43 / 52,62 / 43,68 | 0,08 / 0,88 / 0,08 | 43,49 / 53,57 / 43,76 |
+
+| Prefisso | Scelte diverse B/A su 200 | Scelte diverse rispetto a cinque passaggi singoli A / B | Finestre con decisione di accettazione diversa B/A su 40 | Token di controllo diversi dopo il rifiuto B/A |
+|---|---:|---:|---:|---:|
+| prosa | 1 | 0 / 1 | 0 | 0/32 |
+| italiano | 0 | 2 / 2 | 0 | 0/35 |
+| 10k | 1 | 3 / 2 | 0 | 0/33 |
+
+Il solo ripristino R coincide con A in tutte le 600 scelte e nei 100 token di controllo dopo il rifiuto. Le cinque quantità di proposte accettate (da zero a quattro) sono tutte rappresentate. Per il candidato combinato, le due repliche B coincidono tra loro in tutte le scelte. Questi controlli misurano ID e decisioni, senza implicare identità bit per bit di tutta la cache.
+
+### Generazione sul banco storico
+
+Stesso binario e stessi ID dei prompt, warmup distinto, nessun riuso del prompt e prefill ricalcolato. Server nativo del banco Claude/Strata. Prosa greedy 384 token, italiano a temperatura 1 fino a 512, contesto 10k a temperatura 1 fino a 128. I tempi di decode sono (token generati meno uno) / secondi di decode. Il report generation.json comprende separatamente prefill e tempo totale della richiesta nativa.
+
+| Prefisso | B1 t/s | A t/s | B2 t/s | Senza draft t/s | Solo ripristino R t/s | Primo ID diverso B1/A (base 1) |
+|---|---:|---:|---:|---:|---:|---:|
+| prosa | 60,48 | 55,56 | 60,57 | 81,62 | 56,85 | 121 |
+| italiano | 38,75 | 48,80 | 38,57 | 82,52 | 49,59 | 29 |
+| 10k | 48,52 | 43,10 | 48,59 | 76,37 | 43,86 | 18 |
+
+Le due repliche B producono la stessa sequenza su ciascun prompt. Il confronto B/A diverge agli ID di output 121, 29, 18 rispettivamente, contando da 1. I tempi della generazione libera includono quindi anche un numero diverso di accettazioni e una diversa continuazione. R riproduce tutti gli ID di A su tutti e tre i prompt.
+
+A contesto breve la maggior parte del risparmio nel replay viene dal ripristino delle convoluzioni. A 10k la variante combinata risparmia circa 10 ms per finestra e vince su tutte le 36 finestre cronometrate. In generazione il decode diretto è il più veloce su tutti e tre i prompt. Il candidato resta nel laboratorio.
+
+Laboratorio in `D:/ds4_work/inkling2/verify-window-1122`. In `bank/` si trovano i token e le proposte. In `results/` le ripetizioni, gli ID e lo stato GPU. In `generation/` si trovano le richieste indipendenti del banco storico. Riepiloghi in `results.json` e `generation.json`, codice del candidato in `candidate/candidate.patch`. SHA256 del binario di misura `fdec2bf4553ca392c8344ea7d293c91d7b84823bb0da8af99e28942a288d9d8a`.
