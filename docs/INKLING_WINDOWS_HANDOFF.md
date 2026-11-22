@@ -756,3 +756,50 @@ Le due repliche B producono la stessa sequenza su ciascun prompt. Il confronto B
 A contesto breve la maggior parte del risparmio nel replay viene dal ripristino delle convoluzioni. A 10k la variante combinata risparmia circa 10 ms per finestra e vince su tutte le 36 finestre cronometrate. In generazione il decode diretto è il più veloce su tutti e tre i prompt. Il candidato resta nel laboratorio.
 
 Laboratorio in `D:/ds4_work/inkling2/verify-window-1122`. In `bank/` si trovano i token e le proposte. In `results/` le ripetizioni, gli ID e lo stato GPU. In `generation/` si trovano le richieste indipendenti del banco storico. Riepiloghi in `results.json` e `generation.json`, codice del candidato in `candidate/candidate.patch`. SHA256 del binario di misura `fdec2bf4553ca392c8344ea7d293c91d7b84823bb0da8af99e28942a288d9d8a`.
+
+## Confronto delle teste DSpark sul target UD-Q3_K_XL
+
+22 novembre 2026. Stesso target, verificatore ordinario, quattro proposte per round, stessa build Strata, RTX 3080 Ti e 2080 Ti in layer split, 3060 dedicata al desktop. Il test comprende i pesi originali in Q8 e BF16, una versione originale compressa in MLX a 4 bit e due varianti LookAtMyQuant distillate sui rispettivi target da 5,4 e 8,9 GB. I pesi del modello principale rimangono quelli del nostro Q3. [Unsloth DSpark](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF/blob/45fd08764f2b0bf16b03a5483a80e5c7aaec8772/dspark/README.md) · [LookAtMyQuant, pesi e ricette](https://huggingface.co/shinmegamiboson/Inkling-2-Mini-LookAtMyQuant-drafter/tree/a722e02a44b087697e4eeaf00d66a36a594ef3e2)
+
+Le tre varianti MLX sono state dequantizzate con i parametri affini originali, arrotondate al formato del template BF16 e convertite nello stesso layout CUDA del file Unsloth Q8. Le 27 proiezioni passano a Q8_0, gli altri 27 tensori conservano il tipo del template. La conversione di controllo BF16 originale → Q8 riproduce il file Unsloth con identico SHA256. Le misure MLX degli autori descrivono un runtime e target diversi.
+
+### Generazione libera
+
+Velocità di decode in token/s sul banco storico, pari a (output meno uno) / secondi di decode. Stessi token di input, seed 20261121, warmup indipendente, KV Q8 con capacità 262144, tutti i prompt letti interamente, senza restore SSD. La prosa usa greedy (384 output), la chat italiana temperatura 1 (512 output), il prompt lungo 10000 ID realmente occupati e temperatura 1 (128 output). I conteggi accettati/offerti nella colonna finale si riferiscono alla chat italiana. Ogni cella riporta la mediana delle repliche sullo stesso prompt. Senza draft una sola esecuzione. Il JSON conserva i singoli tempi di decode e di richiesta nativa, incluse le repliche di verifica delle teste originali.
+
+| Testa | Prosa t/s | Italiano t/s | 10k t/s | Accettati/offerti in italiano |
+|---|---:|---:|---:|---:|
+| Senza draft | 84,28 | 80,53 | 74,96 | — |
+| DSpark originale Q8 | 55,68 | 48,62 | 43,24 | 246/1058 |
+| DSpark originale BF16 | 43,81 | 33,62 | 40,39 | 203/1222 |
+| LAMQ 4-bit stock → Q8 | 53,10 | 41,74 | 45,94 | 204/1218 |
+| LAMQ 5.4 v2 → Q8 | 54,66 | 40,85 | 40,11 | 197/1246 |
+| LAMQ 8.9 v2 → Q8 | 52,93 | 38,74 | 47,65 | 180/1314 |
+
+### Confronto a prefisso identico
+
+Per ciascuno dei tre prompt il modello principale genera una continuazione greedy di 384 token successivi al primo token di ancoraggio. Ogni quattro token si confrontano le quattro proposte di ciascuna testa con i quattro token che il target sceglie uno alla volta. Le 288 finestre hanno gli stessi stati di ingresso del target e le stesse sequenze di riferimento fra le varianti, verificate tramite posizione, token di ancoraggio e quattro ID di riferimento. In tabella si conta una posizione solo se sono corretti anche tutti i token precedenti della finestra.
+
+| Testa | Almeno 1 / 288 | Almeno 2 / 288 | Almeno 3 / 288 | Tutti e 4 / 288 | Media consecutiva / 4 |
+|---|---:|---:|---:|---:|---:|
+| DSpark originale Q8 | 167 | 111 | 59 | 34 | 1,288 |
+| DSpark originale BF16 | 167 | 111 | 57 | 33 | 1,278 |
+| LAMQ 4-bit stock → Q8 | 162 | 102 | 54 | 32 | 1,215 |
+| LAMQ 5.4 v2 → Q8 | 161 | 100 | 44 | 23 | 1,139 |
+| LAMQ 8.9 v2 → Q8 | 155 | 97 | 48 | 26 | 1,132 |
+
+La migliore coppia scelta a posteriori è Q8+V8 con 1,382 proposte consecutive per finestra scegliendo sempre la testa che avrebbe dato il prefisso corretto più lungo. Scegliendo a posteriori fra tutte e cinque il limite osservato è 1,431. Questi due conteggi presuppongono di conoscere in anticipo la risposta e ignorano il costo delle teste. Le percentuali di accettazione su generazione libera dipendono anche dalla continuazione generata.
+
+Banco, ID, pesi, hash e log in `D:/ds4_work/inkling2/draft-heads-1122`. Riepilogo in `comparison.json`, validazione in `roundtrip.json`, `q8-conversion.json` e `lamq/conversion-summary.json`. Lo stock originale Q8 coincide con il file già usato nel Daily Inkling.
+
+### Due teste sulla stessa finestra
+
+Simulazione sui token già raccolti. La Q8 propone i primi due token. Se la seconda testa propone gli stessi due token, si usano le sue proposte tre e quattro. In caso di disaccordo si conserva la sequenza della Q8. La regola può decidere prima della verifica. Il tempo di esecuzione di due teste insieme resta da misurare.
+
+| Seconda testa | Finestre con accordo sui primi due / 288 | Almeno tre corretti | Tutti e quattro corretti | Media consecutiva |
+|---|---:|---:|---:|---:|
+| Solo Q8 | — | 59 | 34 | 1,288 |
+| DSpark originale BF16 | 282 | 58 | 34 | 1,285 |
+| LAMQ 4-bit stock → Q8 | 225 | 57 | 33 | 1,278 |
+| LAMQ 5.4 v2 → Q8 | 151 | 53 | 29 | 1,250 |
+| LAMQ 8.9 v2 → Q8 | 160 | 55 | 31 | 1,264 |
