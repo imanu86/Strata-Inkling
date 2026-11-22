@@ -616,3 +616,57 @@ python -m serve.server --engine strata --config D:/ds4_work/inkling2/config/inkl
 Il task Python con apertura visibile dà 81,46 t/s senza draft e 81,46/81,51 a K4 sulla build pubblicata, con tutti i 384 ID identici. Le 260 proposte accettate implicano 3,11 token per round e circa 38,2 ms per round compresa la proposta. A parità di accettazione servirebbero 20,8 ms per 150 t/s. La traccia più pertinente da portare da Maya è il suo verificatore dedicato alle finestre corte, con graph per larghezza e rollback delle convoluzioni in un lancio. [Codice del verificatore Maya](https://github.com/mw00/project-maya/blob/v1.1.72/src/ik2/ik2_main.cu#L2490).
 
 I processi HTTP di prova sulla porta 18166 sono stati scaricati e terminati. Preset originari e daily Qwen restano disponibili.
+
+## 22 novembre 2026 — Inkling sulle richieste del Daily Qwen
+
+I 160,55 t/s della prova precedente misurano la riproduzione di un documento fornito in input con una sostituzione. Per la velocità di conversazione usiamo il banco rapido del Daily Qwen, le sue richieste Standard-v1 e le richieste comunità archiviate in D1schermo3060. Le lunghezze nominate dai test si riferiscono al tokenizer di Qwen. Per Inkling riportiamo anche i token effettivi. Il Daily Qwen è il riferimento storico a tre GPU.
+
+Su Inkling UD-Q3_K_XL il motore Strata usa la 3080 Ti per il core a tre passaggi e la 2080 Ti per gli strati esterni e la proiezione finale. KV Q8, capacità 262144, prefill a blocchi di 64. Il banco salva stato RAM e GPU, corpi delle richieste, risposte SSE, contatori motore e tempi HTTP. La 3060 gestisce il desktop. Per il banco rapido abbiamo eseguito direttamente le funzioni chat e agente di tappa4c. Per Standard-v1 abbiamo riprodotto le nove richieste della sezione prestazioni con il sampling originale. Per comunità abbiamo usato gli stessi messaggi e nonce del Daily, temperatura zero, tre repliche del riferimento, cap 256 e contatore di riuso zero. Decode comunità = token generati / secondi motore; i tempi HTTP includono il prefill.
+
+| Banco | Decode Qwen storico, t/s | Input effettivo Inkling | Decode Inkling, t/s | Prefill Inkling, t/s | HTTP completo Inkling |
+|---|---:|---:|---:|---:|---:|
+| Rapido, chat (9 richieste) | 92 | 42 | 87,80 | 284,50 | 1,31 s |
+| Standard-v1 short | 113 | 42 | 80,55 | 267,67 | 6,53 s |
+| Standard-v1 4k | 105 | 3423 | 76,10 | 377,27 | 15,85 s |
+| Standard-v1 16k | 100 | 13775 | 69,15 | 351,44 | 46,65 s |
+| Comunità 4096 | 94,71 | 3213 | 81,19 | 390,11 | 11,43 s |
+| Comunità 32768 | 101,14 | 24965 | 67,28 | 321,60 | 81,48 s |
+| Comunità 128000 | 109,66 | 97793 | 43,11 | 215,56 | 459,75 s |
+
+Nel banco rapido agente i turni successivi al primo danno 78,7 t/s di decode contro i 102 t/s del riferimento Qwen. Il profilo agente misura una sessione multi-turno con strumenti e riuso del prefisso.
+
+La chat rapida conta nove risposte con cap 100 come previsto da quel banco. Le richieste Standard-v1 hanno prodotto 512 token ciascuna. Quattro risposte su nove contengono testo visibile. Nella serie comunità standard Inkling può esaurire i 256 token nel canale di ragionamento anche con effort none. Sullo stesso corpus comunità 4K abbiamo quindi provato anche un'apertura esplicita del canale testo: aggiunge solo due token di controllo, poi il modello scrive liberamente la spiegazione del codice. Tutte e tre le risposte hanno prodotto 256 token visibili. Decode mediano 80,77 t/s senza draft e 43,69 con DSpark K7. Tempo HTTP completo rispettivamente 11,46 e 14,17 secondi.
+
+### Maya e residenza degli esperti
+
+Maya originale rifiuta i GGUF locali UD-Q3_K_XL e UD-IQ3_XXS alla lettura delle quantizzazioni miste. Nel laboratorio abbiamo aggiunto i decoder mancanti, verificati contro GGUF, e portato due primitive CUDA su SM75 per la 2080 Ti. La build locale usa CUDA 12.6 e include SM75 e SM86. Corretto anche il prefill breve per rispettare l'assegnazione degli esperti alle GPU. Sullo stesso file Q3, a 262144 di capacità con KV FP8, tutte le prove seguenti usano gli stessi 3215 ID di input e generano 256 token visibili. Maya attribuisce il primo token al prefill e misura i successivi 255 nel decode.
+
+| Maya Q3, banco comunità 4K | Prefill t/s | Decode t/s | Miss esperti prefill / decode | Processo completo |
+|---|---:|---:|---:|---:|
+| 3080 Ti, esperti in RAM e 2,9 GiB di cache VRAM, una prova | 27,7 | 13,61 | 158332 / 21145 | 138,72 s |
+| 3080 Ti + 2080 Ti, mediana di tre prove | 127,0 | 19,97 | 0 / 0 | 45,81 s |
+| 2080 Ti, esperti precaricati, una prova | 120,3 | 35,46 | 0 / 0 | 41,28 s |
+
+Con due GPU il warmup colloca 572 esperti sulla 3080 Ti e 2500 sulla 2080 Ti; con la sola 2080 Ti ne carica 3072. Entrambe usano IK2_HOST=mmap: il GGUF è mappato e le pagine possono rimanere nella cache di Windows. Il runtime evita una copia pinned integrale dedicata e registra zero trasferimenti di pesi dopo il warmup nelle prove residenti. In dual-GPU il runtime ha segnalato peer access disabilitato: le attivazioni passano per l'host. La differenza fra dual e singola include anche kernel e modalità di esecuzione. Tempi Maya del processo intero includono il caricamento; i tempi HTTP Strata si riferiscono al server già carico. Per IQ3 abbiamo verificato il caricamento e il primo decode, senza misurarne la velocità.
+
+Sulla singola 2080 Ti il percorso CUDA Graph resta disattivato. Nel Q3 locale, 14 dei 24 layer hanno tipi di quantizzazione diversi fra proiezioni Q, K, V, rel e gate e il loader lascia le proiezioni separate. Il percorso veloce richiede matrici fuse. Un candidato per la prossima prova è catturare le proiezioni separate già presenti e verificare la parità degli ID. La PR 6506 contiene il graph per esperti residenti e staging delle attivazioni su host, ma il suo controllo per due GPU non verifica la presenza di quelle matrici fuse. Dettagli in maya-turing-ep-1122/dense-graph-audit.json e REPORT.md.
+
+### Kernel, draft e repository
+
+Il kernel Q8 full-attention T=1 di Kuraneko (23125db1) è stato portato isolatamente mantenendo lo split e i 12 blocchi del profilo locale. Nel B–A–B comunità 4K, con tre repliche per braccio, le mediane sono 80,81 / 81,19 / 80,82 t/s. Nel B–A–B comunità 32K si misurano 67,33 / 67,28 / 67,38 t/s, rispettivamente una, tre e una replica. L'output greedy cambia fra A e B. Il kernel usa aritmetica e ordine delle riduzioni differenti; nel vettore sintetico a cancellazione elevata il massimo scarto assoluto è 0,000108 e lo scarto L2 relativo arriva all'8,75%.
+
+Il prototipo di folding della proiezione del drafter ha effettivamente attivato la matrice FP32 aggiuntiva da 201 MiB. Sul primo prompt comunità 4K visibile produce gli stessi 256 ID del K7 ordinario, con 160 proposte accettate su 658. Entrambi divergono dal greedy senza draft al token 159. Il test diagnostico nativo misura 46,69 t/s per K7 e 47,63 con fold, contro 78,23 senza MTP. Le varianti restano nel laboratorio.
+
+Upstream Niko main 6e38f588a6. La PR 6506 al commit c7f7583a91 introduce decode resident su due GPU e verifica speculativa multi-token. L'autore riporta 80,7 t/s greedy e 62,8 con draft su RTX 5080 + 4060 Ti. La PR 6520 al commit 48febba2bb propone una strada distinta con i pesi ufficiali e offload su CPU per schede da 8–16 GB. Kuraneko main 0f98bdc839 include anche un ring di streaming per il prefill ibrido. [PR 6506, misure](https://github.com/Niko1221/Strata/pull/6506#issuecomment-7069371155) · [PR 6520](https://github.com/Niko1221/Strata/pull/6520) · [Benchmark Kuraneko](https://github.com/kuraneko1/Strata/blob/0f98bdc839/docs/bench-results/2026-11-22-rtx4070-inkling2-262k/README.md).
+
+Risultati e runner sulla workstation in D:/ds4_work/inkling2/qwen-comparison-20261122, maya-qwen-bench-1122 e maya-turing-ep-1122. I prototipi CUDA si trovano in kernel-standard-v1-1122 e dspark-folded-1122.
+
+### Parallelismo interno ai tre giri
+
+Inkling esegue gli strati fisici da 6 a 17 per tre volte. All'inizio dei giri 2 e 3 ripristina lo stato che entrava nel core. Per ciascuno dei 12 strati legge gli stati intermedi e quello finale del giro precedente e ricava quattro messaggi con pesi appresi. I messaggi modulano Q, K, V e il ramo MoE. Nel ramo MoE il controllo precede la selezione degli 8 esperti. La temperatura entra nel campionamento del prossimo token, dopo che il target ha calcolato i logits. [Architettura ufficiale](https://huggingface.co/thinkingmachines/Inkling-2-Mini#3-model-properties) · [Core del nostro fork](https://github.com/imanu86/Strata-Inkling/blob/54f713b6d/engine/src/inkling2/inkling2_engine.cu#L2206).
+
+Il prototipo loop-message-bank-1122 prepara i quattro messaggi di ciascuno dei 12 strati insieme all'inizio del giro, sulla GPU che possiede il core. Tutti i parziali e le uscite coincidono bit per bit nei test sintetici SM75 e SM86. Sul primo prompt visibile coincidono tutti i 256 ID e nelle tre repliche HTTP coincidono i testi a ogni cambio del kernel. Mediane B–A–B di 81,12 / 80,84 / 81,50 t/s. Il beneficio osservato su questo carico resta inferiore all'1%.
+
+Abbiamo misurato l'effetto dei messaggi su un router reale, strato fisico 6, per la stessa generazione libera da 256 token. Il controllo in parallelo ricostruisce tutti gli otto ID nell'ordine corretto in 510 decisioni su 510, e il motore emette gli stessi 256 ID del riferimento. Sostituendo il messaggio col corrispondente del token precedente, sui 254 confronti possibili per giro coincidono in media 4,44 esperti su 8, sia nel giro 2 sia nel giro 3. L'intero insieme coincide una sola volta per giro. Omettendo il contributo del messaggio le intersezioni medie scendono a 3,99 e salgono a 4,65 rispettivamente. Si tratta di perturbazioni locali con tutta la storia esatta. Non sono state misurate la qualità generativa di tre rami indipendenti o una fusione finale addestrata. I dati sono in qwen-comparison-20261122/idcheck-true-shadow/routing-summary.json.
+
+Infine abbiamo ripartito fra GPU i gruppi di teste di una vera full attention Q8 a T=1. Il core ha sei visite a questo tipo di attenzione. Il microbenchmark usa stati sintetici, KV storica residente e copie reali delle attivazioni via host. Le uscite sono bit per bit identiche per tutti i tagli. A posizione 97793, un'attenzione costa 1,261 ms sulla 3080 Ti sola; 1,461 ms con sei gruppi sulla 3080 Ti e due sulla 3060; 1,748 ms su 3080 Ti e 2080 Ti (5+3); 1,754 ms con tutte e tre (4+3+1). Con la terza scheda si è allungata l'attesa del risultato. Questi sono tempi del singolo strato con copie e sincronizzazioni. Proiezioni e MoE sono esclusi. Dettagli in loop-head-shard-1122/summary.csv.
