@@ -1,0 +1,526 @@
+--- /dev/null
++++ b/engine/src/inkling2/astra_nv.cuh
+@@ -0,0 +1,119 @@
++#pragma once
++
++// One complete warp per GU row and a half warp per down row. Activations are
++// byte-interleaved once per Q8 block to match PRMT's native FP4 pair order.
++struct AstraQ {
++    float scale;
++    unsigned word[8];
++};
++static_assert(sizeof(AstraQ) == 36);
++
++__device__ __forceinline__ void astra_store_q(float value, AstraQ* out, int index) {
++    const int lane = threadIdx.x & 31;
++    float amax = fabsf(value);
++    #pragma unroll
++    for (int d = 16; d; d >>= 1)
++        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, d));
++    const float d = K::q8_1_finite(amax / 127.0f);
++    const unsigned mybyte = (unsigned char)K::q8_1_quant(value, d, amax);
++    // word w spans two adjacent packed FP4 bytes (4 nibbles).
++    const int w = lane & 7;
++    const int first = (w >> 2) * 16 + (w & 3) * 2;
++    const unsigned q0 = __shfl_sync(0xffffffffu, mybyte, first);
++    const unsigned q1 = __shfl_sync(0xffffffffu, mybyte, first + 8);
++    const unsigned q2 = __shfl_sync(0xffffffffu, mybyte, first + 1);
++    const unsigned q3 = __shfl_sync(0xffffffffu, mybyte, first + 9);
++    AstraQ& b = out[index >> 5];
++    if (lane < 8) b.word[lane] = q0 | (q1 << 8) | (q2 << 16) | (q3 << 24);
++    if (lane == 0) b.scale = __half2float(__float2half(d));
++}
++
++__global__ void astra_input(const float* x, AstraQ* out) {
++    const int i = blockIdx.x * blockDim.x + threadIdx.x;
++    if (i < 2304) astra_store_q(x[i], out, i);
++}
++
++__device__ __forceinline__ unsigned astra_decode_four(unsigned nibbles) {
++    constexpr unsigned pos0 = 0x03020100u, pos1 = 0x0c080604u;
++    constexpr unsigned neg0 = 0xfdfeff00u, neg1 = 0xf4f8fafcu;
++    const unsigned pos = __byte_perm(pos0, pos1, nibbles);
++    const unsigned neg = __byte_perm(neg0, neg1, nibbles);
++    return __byte_perm(pos, neg, 0x3210u | ((nibbles & 0x8888u) >> 1));
++}
++
++__device__ __forceinline__ float astra_scale(unsigned x) {
++    const unsigned exp = (x >> 3) & 15, mantissa = x & 7;
++    if (x == 127) return 0;
++    return exp ? __uint_as_float(((119+exp) << 23) | (mantissa << 20))
++               : (float)mantissa * 0.0009765625f;
++}
++
++// NVFP4 stores four scale bytes followed by four 16-value blocks.
++__device__ __forceinline__ float astra_dot32(const unsigned* row, int k, const AstraQ& x) {
++    const unsigned* block = row + (k >> 1) * 9;
++    const unsigned scales = block[0] >> (16 * (k & 1));
++    const unsigned* qs = block + 1 + 4 * (k & 1);
++    float sum = 0;
++    #pragma unroll
++    for (int h=0; h<2; ++h) {
++        const unsigned q0 = qs[2*h], q1 = qs[2*h+1];
++        int v = __dp4a((int)astra_decode_four(q0), (int)x.word[4*h], 0);
++        v = __dp4a((int)astra_decode_four(q0>>16), (int)x.word[4*h+1], v);
++        v = __dp4a((int)astra_decode_four(q1), (int)x.word[4*h+2], v);
++        v = __dp4a((int)astra_decode_four(q1>>16), (int)x.word[4*h+3], v);
++        sum += (astra_scale((scales >> (8*h)) & 255) * x.scale) * (float)v;
++    }
++    return sum;
++}
++
++__global__ void astra_gate_up(const uint8_t* blobs, size_t stride, const int* slots, const int* ids,
++                               K::NativeExpertLayout L, const AstraQ* x, float* gate, float* up) {
++    const int row = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
++    const int lane = threadIdx.x & 31, top = blockIdx.y;
++    const uint8_t* blob = blobs + stride * slots[ids[top]];
++    const unsigned* g = (const unsigned*)(blob + row*L.gu_row);
++    const unsigned* u = (const unsigned*)(blob + L.up_off + row*L.gu_row);
++    float vg = 0, vu = 0;
++    #pragma unroll
++    for (int base=0; base<72; base+=32) {
++        const int k=base+lane;
++        if (k < 72) {
++            const AstraQ a = x[k];
++            vg += astra_dot32(g, k, a);
++            vu += astra_dot32(u, k, a);
++        }
++    }
++    #pragma unroll
++    for (int d=16; d; d>>=1) {
++        vg += __shfl_xor_sync(0xffffffffu,vg,d);
++        vu += __shfl_xor_sync(0xffffffffu,vu,d);
++    }
++    if (lane==0) {
++        const float* s = (const float*)(blob + L.tail_off);
++        gate[top*1152+row] = vg*s[0];
++        up[top*1152+row] = vu*s[1];
++    }
++}
++
++__global__ void astra_situ(const float* gate, const float* up, AstraQ* hq, float beta, float lb) {
++    const int i = blockIdx.x*blockDim.x + threadIdx.x;
++    const float g = gate[i], u = up[i];
++    const float tg = beta * tanhf(g / beta) * (1.0f / (1.0f + __expf(-g)));
++    const float tu = lb > 0.0f ? lb * tanhf(u / lb) : u;
++    astra_store_q(tg * tu, hq, i);
++}
++
++__global__ void astra_down(const uint8_t* blobs, size_t stride, const int* slots, const int* ids,
++                           K::NativeExpertLayout L, const AstraQ* hq, float* parts) {
++    const int row = blockIdx.x * (blockDim.x >> 4) + (threadIdx.x >> 4);
++    const int lane = threadIdx.x & 15, top = blockIdx.y;
++    const uint8_t* blob = blobs + stride * slots[ids[top]];
++    const unsigned* r = (const unsigned*)(blob + L.down_off + row*L.d_row);
++    const AstraQ* x = hq + top*36;
++    float v = astra_dot32(r,lane,x[lane]);
++    if (lane<4) v += astra_dot32(r,32+lane,x[32+lane]);
++    v += astra_dot32(r,lane+16,x[lane+16]);
++    #pragma unroll
++    for (int d=8; d; d>>=1) v += __shfl_xor_sync(0xffffffffu,v,d,16);
++    if (lane==0) parts[top*2304+row] = v * ((const float*)(blob+L.tail_off))[2];
++}
+--- /dev/null
++++ b/engine/src/inkling2/attention_prep_t1.cuh
+@@ -0,0 +1,127 @@
++#pragma once
++
++namespace strata::inkling2 {
++
++struct AttentionPrepT1 {
++    float *q, *r;
++    const float *k, *v, *q_scale, *r_scale, *k_weight, *v_weight, *k_dynamic, *v_dynamic;
++    float *hist;
++    int8_t *kq, *vq;
++    __half *ks, *vs;
++    const float *rel_bias, *sink;
++    float *rel_table;
++    const int32_t *pos;
++    int heads, kv_heads, cap, swa, floor_n, n_ext, max_rel;
++    float q_clip, r_clip, alpha, eps;
++};
++
++// Each lane owns the same components, and reduces its sum in the same order,
++// as k_clip_and_tau. R is also passed to the relative table through shared memory.
++template<int D>
++__device__ __forceinline__ void prep_clip_t1(float* x, const float* scale, float threshold, int head,
++                                             int pos, const AttentionPrepT1& a, float* shared_values) {
++    constexpr int Count = (D + 31) / 32;
++    int lane = threadIdx.x & 31;
++    int base = D * head;
++    float vals[Count], sq = 0.0f;
++#pragma unroll
++    for (int i = 0; i < Count; ++i) {
++        int c = 32 * i + lane;
++        float v = c < D ? x[base + c] : 0.0f;
++        if (c < D && scale) v *= scale[base + c];
++        vals[i] = v;
++        sq += v * v;
++    }
++#pragma unroll
++    for (int off = 16; off > 0; off >>= 1) sq += __shfl_xor_sync(0xffffffffu, sq, off);
++    float factor = fminf(1.0f, threshold / (sqrtf(sq) + 1e-6f));
++    if (!a.swa) {
++        float ratio = fmaxf(1.0f, (float)(pos + 1) / (float)a.floor_n);
++        factor *= (1.0f + a.alpha * logf(ratio));
++    }
++#pragma unroll
++    for (int i = 0; i < Count; ++i) {
++        int c = 32 * i + lane;
++        if (c < D) {
++            float result = vals[i] * factor;
++            x[base + c] = result;
++            if (shared_values) shared_values[c] = result;
++        }
++    }
++}
++
++__device__ __forceinline__ void prep_kv_t1(const AttentionPrepT1& a, int head, bool value, int pos, float* shared) {
++    int channel = head * 128 + threadIdx.x;
++    int kv_dim = 128 * a.kv_heads;
++    float* hist = a.hist + (size_t)(channel + (value ? kv_dim : 0)) * 3;
++    float h0 = hist[0], h1 = hist[1], h2 = hist[2];
++    const float4 w = ((const float4*)(value ? a.v_weight : a.k_weight))[channel];
++    const float* dyn = value ? a.v_dynamic : a.k_dynamic;
++    const float x = (value ? a.v : a.k)[channel];
++    float s = h0 * w.x + h1 * w.y + h2 * w.z + x * w.w;
++    if (dyn) {
++        const float* dt = dyn + head * 4;
++        s += x * dt[0] + h2 * dt[1] + h1 * dt[2] + h0 * dt[3];
++    }
++    shared[threadIdx.x] = (x + s) * rsqrtf(dyn ? 9.0f : 5.0f);
++    hist[0] = h1;
++    hist[1] = h2;
++    hist[2] = x;
++    __syncthreads();
++
++    if (threadIdx.x >= 32) return;
++    int lane = threadIdx.x;
++    float v[4], sq = 0.0f;
++#pragma unroll
++    for (int i = 0; i < 4; ++i) {
++        v[i] = shared[i * 32 + lane];
++        sq += v[i] * v[i];
++    }
++#pragma unroll
++    for (int o = 16; o > 0; o >>= 1) sq += __shfl_xor_sync(0xffffffffu, sq, o);
++    float factor = value ? rsqrtf(sq / 128.0f + a.eps) : fminf(1.0f, a.q_clip / (sqrtf(sq) + 1e-6f));
++    float peak = 0.0f;
++#pragma unroll
++    for (int i = 0; i < 4; ++i) {
++        v[i] *= factor;
++        peak = fmaxf(peak, fabsf(v[i]));
++    }
++#pragma unroll
++    for (int o = 16; o > 0; o >>= 1) peak = fmaxf(peak, __shfl_xor_sync(0xffffffffu, peak, o));
++    float inv = peak > 0.0f ? (127.0f / peak) : 0.0f;
++    int slot = a.swa ? (((a.cap & (a.cap - 1)) == 0) ? pos & (a.cap - 1) : pos % a.cap) : pos;
++    int8_t* dst = (value ? a.vq : a.kq) + ((size_t)slot * a.kv_heads + head) * 128;
++#pragma unroll
++    for (int i = 0; i < 4; ++i) dst[i * 32 + lane] = (int8_t)__float2int_rn(v[i] * inv);
++    if (!lane) (value ? a.vs : a.ks)[(size_t)slot * a.kv_heads + head] = __float2half(peak / 127.0f);
++}
++
++// Grid is constant across CUDA graph replays. Each CTA has independent output.
++__global__ __launch_bounds__(128) void k_attention_prep_t1(AttentionPrepT1 a) {
++    __shared__ __align__(16) float buf[128];
++    int h = blockIdx.x, pos = *a.pos;
++    if (h >= a.heads) {
++        int kv = h - a.heads;
++        bool value = kv >= a.kv_heads;
++        prep_kv_t1(a, value ? kv - a.kv_heads : kv, value, pos, buf);
++        return;
++    }
++    if (threadIdx.x < 32) prep_clip_t1<128>(a.q, a.q_scale, a.q_clip, h, pos, a, nullptr);
++    if (threadIdx.x >= 32 && threadIdx.x < 64) prep_clip_t1<16>(a.r, a.r_scale, a.r_clip, h, pos, a, buf);
++    __syncthreads();
++    const float4* sr = (const float4*)buf;
++    const float4 sr0 = sr[0], sr1 = sr[1], sr2 = sr[2], sr3 = sr[3];
++    float sk = a.sink[h];
++    int max_d = min(min(a.n_ext, a.max_rel), pos + 1);
++    for (int d = threadIdx.x; d < max_d; d += blockDim.x) {
++        const float4* rb = (const float4*)(a.rel_bias + (size_t)d * 16);
++        const float4 r0 = rb[0], r1 = rb[1], r2 = rb[2], r3 = rb[3];
++        const float dot = (sr0.x * r0.x + sr0.y * r0.y + sr0.z * r0.z + sr0.w * r0.w)
++                        + (sr1.x * r1.x + sr1.y * r1.y + sr1.z * r1.z + sr1.w * r1.w)
++                        + (sr2.x * r2.x + sr2.y * r2.y + sr2.z * r2.z + sr2.w * r2.w)
++                        + (sr3.x * r3.x + sr3.y * r3.y + sr3.z * r3.z + sr3.w * r3.w);
++        a.rel_table[(size_t)h * a.n_ext + d] = dot - sk;
++    }
++}
++
++} // namespace strata::inkling2
+--- a/engine/src/inkling2/inkling2_engine.cu
++++ b/engine/src/inkling2/inkling2_engine.cu
+@@ -4,12 +4,14 @@
+ #include "strata/inkling2/sampling.hpp"
+ #include "strata/inkling2/replica_policy.hpp"
+ #include "inkling2_kernels.cuh"
++#include "attention_prep_t1.cuh"
+ #include "inkling2_replica_async.cuh"
+ 
+ #include "strata/artifact/gguf_reader.hpp"
+ #include "strata/artifact/gguf_split.hpp"
+ #include "strata/kernels/bf16_gemv.hpp"
+ #include "strata/kernels/iq_kernels.hpp"
++#include "strata/kernels/q8_1_finite.hpp"
+ #include "strata/kernels/native_mmvq.hpp"
+ #include "strata/prefill/gemm.hpp"
+ #include "strata/quant/dequant.hpp"
+@@ -48,6 +50,26 @@
+ 
+ using Clock = std::chrono::steady_clock;
+ namespace K = strata::kernels;
++#include "astra_nv.cuh"
++
++static bool astra_nv_enabled() {
++    static const bool on = std::getenv("STRATA_IK2_ASTRA_NV") && std::strcmp(std::getenv("STRATA_IK2_ASTRA_NV"), "1") == 0;
++    return on;
++}
++
++// The launch grid is a graph parameter. Keep AR graphs for both context
++// bands so a reset, rewind, restore, or threshold crossing selects the
++// right grid without recapturing a valid graph.
++static int astra_time_splits() {
++    static const int count = [] {
++        const char* value=std::getenv("STRATA_IK2_ASTRA_TIME_SPLIT");
++        if (!value || !*value || std::strcmp(value,"0")==0 || std::strcmp(value,"12")==0) return kAttnSplit;
++        for(int n : {24,48,96,192}) if(std::to_string(n)==value) return n;
++        std::fprintf(stderr,"STRATA_IK2_ASTRA_TIME_SPLIT must be 0, 12, 24, 48, 96, or 192\n");
++        std::exit(2);
++    }();
++    return count;
++}
+ 
+ inline double ms_since(Clock::time_point t0) {
+     return std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+@@ -947,10 +969,15 @@
+     cudaGraphExec_t outer_graph[6] = {};          // prefix/suffix for AR, DSpark singleton and fixed verify
+     bool outer_graph_failed[6] = {};
+     std::vector<cudaGraphExec_t> layer_pre_graph;
++    cudaGraphExec_t long_core_graph = nullptr, long_capture_core_graph = nullptr;
++    cudaGraphExec_t long_outer_graph[6] = {};
++    bool long_outer_graph_failed[6] = {};
++    std::vector<cudaGraphExec_t> long_layer_pre_graph;
+     bool core_all_gpu = false;
+     bool split_core_graph = false;     // opt-in for the Core runtime; All keeps its existing graph policy
+     bool split_depth_mix = false; // opt-in short-row occupancy experiment
+     float* depth_mix_partials = nullptr;
++    bool fuse_attention_prep_t1 = false;
+     bool batch_qkv_control_t1 = false; // fixed before init/capture; all virtual owners receive it
+     bool split_outer_graph = false;
+     bool split_mtp_graph = false;
+@@ -1245,6 +1272,10 @@
+         }
+         if (core_graph) cudaGraphExecDestroy(core_graph);
+         if (capture_core_graph) cudaGraphExecDestroy(capture_core_graph);
++        if (long_core_graph) cudaGraphExecDestroy(long_core_graph);
++        if (long_capture_core_graph) cudaGraphExecDestroy(long_capture_core_graph);
++        for (auto g : long_outer_graph) if (g) cudaGraphExecDestroy(g);
++        for (auto g : long_layer_pre_graph) if (g) cudaGraphExecDestroy(g);
+         if (verify_core_graph) cudaGraphExecDestroy(verify_core_graph);
+         for (auto graph : outer_graph) if (graph) cudaGraphExecDestroy(graph);
+         for (auto g : layer_pre_graph) if (g) cudaGraphExecDestroy(g);
+@@ -1359,6 +1390,7 @@
+ 
+         // Allocate KV caches & recurrent history per virtual layer
+         layer_pre_graph.assign((size_t) hp.n_layer, nullptr);
++        if (astra_time_splits() > kAttnSplit) long_layer_pre_graph.assign((size_t) hp.n_layer,nullptr);
+         pp_layer_cnt.assign((size_t) hp.n_layer, 0);
+         kc.resize((size_t) hp.n_layer, nullptr);
+         vc.resize((size_t) hp.n_layer, nullptr);
+@@ -1433,7 +1465,7 @@
+         d_f32(&att_gate, (size_t) tmax * hp.q_dim);
+         d_f32(&wo, (size_t) tmax * N);
+         if (split_depth_mix) d_f32(&depth_mix_partials, (size_t) std::min(tmax, 16) * 4 * 8 * 8);
+-        d_f32(&attn_split, (size_t) kAttnSplit * hp.n_head * 130);
++        d_f32(&attn_split, (size_t) astra_time_splits() * hp.n_head * 130);
+ 
+         const int64_t max_ent = (int64_t) tmax * hp.n_expert_used;
+         d_f32(&router_logits, (size_t) tmax * hp.n_expert);
+@@ -1467,6 +1499,7 @@
+             CK(cudaEventCreateWithFlags(&ev_pp_copy[b], cudaEventDisableTiming));
+             CK(cudaEventCreateWithFlags(&ev_pp_used[b], cudaEventDisableTiming));
+         }
++        if (const char* v = std::getenv("STRATA_ATTN_PREP_T1")) fuse_attention_prep_t1 = std::strcmp(v, "1") == 0;
+         if (const char* v = std::getenv("STRATA_PP_STREAM_T")) pp_stream_t = std::max(1, std::atoi(v));
+         if (remote_full)
+             init_remote_full();
+@@ -1905,6 +1938,21 @@
+         const bool has_gpu = L.n_slots > 0;
+         const bool need_cpu = L.n_slots < hp.n_expert;
+         const bool is_q5 = (L.L.gu_type == 13);
++        if (T == 1 && !need_cpu && astra_nv_enabled() && L.L.gu_type == 40 && L.L.d_type == 40 &&
++            N == 2304 && hp.n_ff == 1152 && Kp == 8 && L.L.tail_off && L.L.situ && L.L.had_block == 0) {
++            // The router IDs are unique. Each slot writes its own contribution in top-k order.
++            // Native scratch has three float arrays, then Q8_1. Both Q8 layouts are 36 bytes.
++            auto* gate = (float*)escr;
++            auto* up = gate + 8 * 1152;
++            auto* hq = (AstraQ*)(up + 8 * 1152);
++            astra_input<<<9,256,0,st>>>(x_norm,(AstraQ*)xq);
++            astra_gate_up<<<dim3(1152/8,8),256,0,st>>>(L.d_blobs,L.stride,L.d_slot_of,ids,L.L,(AstraQ*)xq,gate,up);
++            astra_situ<<<8*1152/256,256,0,st>>>(gate,up,hq,L.L.situ_beta,L.L.situ_linear_beta);
++            astra_down<<<dim3(2304/16,8),256,0,st>>>(L.d_blobs,L.stride,L.d_slot_of,ids,L.L,hq,eparts);
++            k_combine_experts<<<9,256,0,st>>>(eparts, ewts, moe_raw, N, Kp);
++            return;
++        }
++
+ 
+         if (need_cpu && has_pending_rebal) {
+             CK(cudaStreamWaitEvent(st, ev_rebal, 0));
+@@ -2184,6 +2232,8 @@
+         DeviceScope owner(device);
+         const int T = state.T;
+         select_full_kv(T);
++        const bool long_full = astra_time_splits() > kAttnSplit && !remote_full && kv_q8 && T == 1 && pos+1 >= 2048;
++        auto& selected_layer_graph = long_full ? long_layer_pre_graph : layer_pre_graph;
+         const auto& hp = m->hp;
+         const int N = (int) hp.n_embd;
+         const int64_t kv_dim = hp.kv_dim, q_dim = hp.q_dim;
+@@ -2354,15 +2404,19 @@
+             if (save_conv_trace)
+                 k_shortconv_kv_trace<<<(unsigned) ((2 * kv_dim + 255) / 256), 256, 0, st>>>(
+                     pK, pV, hst, (int) kv_dim, T, h_tr, local_conv_floats);
+-            k_shortconv_kv<<<(unsigned) ((2 * kv_dim + 255) / 256), 256, 0, st>>>(
+-                pK, pV, L.attn_k_conv, L.attn_v_conv, is_swa ? nullptr : pDynK, is_swa ? nullptr : pDynV,
+-                hst, K_conv, V_conv, (int) kv_dim, (int) hp.n_head_kv, T);
+-
+-            const int apply_tau = is_swa ? 0 : 1;
+-            k_clip_and_tau<<<dim3((unsigned) hp.n_head, (unsigned) T), 32, 0, st>>>(
+-                pQ, L.attn_q_clip, hp.qk_clip, (int) hp.head_dim, (int) hp.n_head, apply_tau, pos0_d, (int) hp.log_scale_floor, hp.log_scale_alpha);
+-            k_clip_and_tau<<<dim3((unsigned) hp.n_head, (unsigned) T), 32, 0, st>>>(
+-                pR, L.attn_rel_clip, hp.rel_clip, (int) hp.n_rel, (int) hp.n_head, apply_tau, pos0_d, (int) hp.log_scale_floor, hp.log_scale_alpha);
++            const bool fused_prep = fuse_attention_prep_t1 && T == 1 && kv_q8 && !remote_full &&
++                                    hp.head_dim == 128 && hp.n_rel == 16 && hp.n_conv == 4;
++            if (!fused_prep) {
++                k_shortconv_kv<<<(unsigned) ((2 * kv_dim + 255) / 256), 256, 0, st>>>(
++                    pK, pV, L.attn_k_conv, L.attn_v_conv, is_swa ? nullptr : pDynK, is_swa ? nullptr : pDynV,
++                    hst, K_conv, V_conv, (int) kv_dim, (int) hp.n_head_kv, T);
++
++                const int apply_tau = is_swa ? 0 : 1;
++                k_clip_and_tau<<<dim3((unsigned) hp.n_head, (unsigned) T), 32, 0, st>>>(
++                    pQ, L.attn_q_clip, hp.qk_clip, (int) hp.head_dim, (int) hp.n_head, apply_tau, pos0_d, (int) hp.log_scale_floor, hp.log_scale_alpha);
++                k_clip_and_tau<<<dim3((unsigned) hp.n_head, (unsigned) T), 32, 0, st>>>(
++                    pR, L.attn_rel_clip, hp.rel_clip, (int) hp.n_rel, (int) hp.n_head, apply_tau, pos0_d, (int) hp.log_scale_floor, hp.log_scale_alpha);
++            }
+ 
+             if (remote_full && !is_swa && (!full_kv_local_prefix || full_kv_promoted)) {
+                 run_remote_full(il, T, pQ, pR, pGate);
+@@ -2373,7 +2427,17 @@
+                 auto &active_ks = local_full ? prefix_ks : this->ks;
+                 auto &active_vs = local_full ? prefix_vs : this->vs;
+                 auto &active_cap = local_full ? prefix_cap : this->kv_cap;
+-                if (kv_q8) {
++                const int max_rel = is_swa ? std::min<int>((int)hp.n_swa, (int)hp.n_rel_ext) : (int)hp.n_rel_ext;
++                if (fused_prep) {
++                    const AttentionPrepT1 prep{
++                        pQ, pR, pK, pV, L.attn_q_clip, L.attn_rel_clip, L.attn_k_conv, L.attn_v_conv,
++                        is_swa ? nullptr : pDynK, is_swa ? nullptr : pDynV, hst,
++                        active_kq[(size_t)il], active_vq[(size_t)il], active_ks[(size_t)il], active_vs[(size_t)il],
++                        L.attn_rel_bias, sink, rel_tab, pos0_d, (int)hp.n_head, (int)hp.n_head_kv, active_cap[(size_t)il],
++                        (int)is_swa, (int)hp.log_scale_floor, (int)hp.n_rel_ext, max_rel, hp.qk_clip,
++                        hp.rel_clip, hp.log_scale_alpha, hp.rms_eps};
++                    k_attention_prep_t1<<<(unsigned)(hp.n_head + 2 * hp.n_head_kv), 128, 0, st>>>(prep);
++                } else if (kv_q8) {
+                     k_clip_norm_kv_store_q8<<<dim3((unsigned)hp.n_head_kv, (unsigned)T), 32, 0, st>>>(
+                         K_conv, V_conv, active_kq[(size_t)il], active_ks[(size_t)il], active_vq[(size_t)il], active_vs[(size_t)il],
+                         (int)hp.n_head_kv, hp.qk_clip, hp.rms_eps, pos0_d, active_cap[(size_t)il], is_swa ? 1 : 0);
+@@ -2387,18 +2451,20 @@
+                         K_conv, V_conv, kc[(size_t)il], vc[(size_t)il], (int)kv_dim, pos0_d, active_cap[(size_t)il], is_swa ? 1 : 0);
+                 }
+ 
+-                const int max_rel = is_swa ? std::min<int>((int)hp.n_swa, (int)hp.n_rel_ext) : (int)hp.n_rel_ext;
+-                k_rel_table<<<dim3((unsigned)hp.n_head, (unsigned)T), kThreads, 0, st>>>(
+-                    pR, L.attn_rel_bias, sink, rel_tab, (int)hp.n_head, (int)hp.n_rel, (int)hp.n_rel_ext, max_rel, pos0_d, T);
++                if (!fused_prep) {
++                    k_rel_table<<<dim3((unsigned)hp.n_head, (unsigned)T), kThreads, 0, st>>>(
++                        pR, L.attn_rel_bias, sink, rel_tab, (int)hp.n_head, (int)hp.n_rel, (int)hp.n_rel_ext, max_rel, pos0_d, T);
++                }
+                 const float kq_scale = 1.0f / std::sqrt((float)hp.head_dim);
+                 if (kv_q8) {
+                     if (hp.n_head == 3 * hp.n_head_kv && hp.head_dim == 128) {
+                         if (T == 1) {
+-                            k_attn_q8_gqa3_split<<<dim3((unsigned)hp.n_head_kv, (unsigned)kAttnSplit), 128, 0, st>>>(
++                            const int count = long_full && !is_swa ? astra_time_splits() : kAttnSplit;
++                            k_attn_q8_gqa3_split<<<dim3((unsigned)hp.n_head_kv, (unsigned)count), 128, 0, st>>>(
+                                 pQ, active_kq[(size_t)il], active_ks[(size_t)il], active_vq[(size_t)il], active_vs[(size_t)il], rel_tab,
+                                 sink, attn_split, (int)hp.n_head, (int)hp.n_head_kv, (int)hp.n_rel_ext, active_cap[(size_t)il],
+-                                is_swa ? 1 : 0, (int)hp.n_swa, pos0_d, kq_scale, kAttnSplit);
+-                            k_attn_split_combine<<<(unsigned)hp.n_head, 128, 0, st>>>(attn_split, pGate, att, (int)hp.n_head, kAttnSplit);
++                                is_swa ? 1 : 0, (int)hp.n_swa, pos0_d, kq_scale, count);
++                            k_attn_split_combine<<<(unsigned)hp.n_head, 128, 0, st>>>(attn_split, pGate, att, (int)hp.n_head, count);
+                         } else {
+                             k_attn_q8_gqa3_pp<<<dim3((unsigned)hp.n_head_kv, (unsigned)T), 128, 0, st>>>(
+                                 pQ, active_kq[(size_t)il], active_ks[(size_t)il], active_vq[(size_t)il], active_vs[(size_t)il], rel_tab,
+@@ -2500,8 +2566,9 @@
+                 std::vector<float*>{norm_blk_buf[0], norm_blk_buf[5], norm_blk_buf[6], norm_blk_buf[7]};
+             const int next_in = outer_range == 0 ? 0 : 7, next_out = outer_range == 0 ? 1 : 8;
+             if (norm_blocks == expected_in && next_blk_buf == next_in) {
+-                auto& graph = outer_graph[graph_slot];
+-                if (!graph && !outer_graph_failed[graph_slot]) {
++                auto& graph = long_full ? long_outer_graph[graph_slot] : outer_graph[graph_slot];
++                auto& capture_failed = long_full ? long_outer_graph_failed[graph_slot] : outer_graph_failed[graph_slot];
++                if (!graph && !capture_failed) {
+                     const ForwardState saved_state = state;
+                     const int64_t saved_hits = hy_gpu, saved_misses = hy_cpu;
+                     const double saved_cpu_ms = hy_cpu_ms;
+@@ -2530,7 +2597,7 @@
+                                      end_layer - 1);
+                     } else {
+                         if (candidate) cudaGraphExecDestroy(candidate);
+-                        outer_graph_failed[graph_slot] = true;
++                        capture_failed = true;
+                         (void) cudaGetLastError();
+                         std::fprintf(stderr, "strata-inkling2: outer %s graph capture/instantiate failed on device %d: %s; using eager range\n",
+                                      outer_range == 0 ? "prefix" : "suffix", device, cudaGetErrorString(status));
+@@ -2562,7 +2629,9 @@
+             const bool graph_shape = T == 1 || (T == verify_max_t && state.capture_dspark && save_conv_trace);
+             if (core_graph_allowed && graph_shape && core_all_gpu && !prof_detail && il == (m->split_prelude ? 0 : hp.core_start) &&
+                 n_core > 0) {
+-                cudaGraphExec_t& cg = T != 1 ? verify_core_graph : (state.capture_dspark ? capture_core_graph : core_graph);
++                cudaGraphExec_t& cg = T != 1 ? verify_core_graph :
++                    (long_full ? (state.capture_dspark ? long_capture_core_graph : long_core_graph)
++                               : (state.capture_dspark ? capture_core_graph : core_graph));
+                 if (!cg) {
+                     cudaGraph_t g = nullptr;
+                     auto graph_check = [&](cudaError_t status, const char* phase) {
+@@ -2595,8 +2664,8 @@
+             const bool is_outer = (il < hp.core_start || il >= core_end_virt);
+             const bool use_pre_graph = (role == Role::All && T == 1 && hybrid && !prof_detail && !pp_streaming && !state.capture_dspark);
+             const auto tp_ly0 = Clock::now();
+-            if (use_pre_graph && (layer_pre_graph[(size_t) il] || !graph_oom)) {
+-                if (!layer_pre_graph[(size_t) il]) {
++            if (use_pre_graph && (selected_layer_graph[(size_t) il] || !graph_oom)) {
++                if (!selected_layer_graph[(size_t) il]) {
+                     const auto saved_nb = norm_blocks;
+                     const int saved_next = next_blk_buf;
+                     const auto saved_pnb = prelude_norm_blocks;
+@@ -2611,8 +2680,8 @@
+                     if (ce == cudaSuccess && g) ce = cudaGraphInstantiate(&ge, g, nullptr, nullptr, 0);
+                     if (g) cudaGraphDestroy(g);
+                     if (ce == cudaSuccess && ge) {
+-                        layer_pre_graph[(size_t) il] = ge;
+-                        CK(cudaGraphLaunch(layer_pre_graph[(size_t) il], st));
++                        selected_layer_graph[(size_t) il] = ge;
++                        CK(cudaGraphLaunch(selected_layer_graph[(size_t) il], st));
+                     } else {
+                         (void) cudaGetLastError();
+                         graph_oom = true;
+@@ -2624,7 +2693,7 @@
+                     }
+                 } else {
+                     advance_pre_meta(il);
+-                    CK(cudaGraphLaunch(layer_pre_graph[(size_t) il], st));
++                    CK(cudaGraphLaunch(selected_layer_graph[(size_t) il], st));
+                 }
+             } else {
+                 run_layer_pre(il);
+@@ -3366,6 +3435,8 @@
+ }  // namespace
+ 
+ int run(int argc, char** argv) {
++    if(astra_time_splits()>kAttnSplit) std::fprintf(stderr,"strata-inkling2: local full Q8 T=1, K/V length >=2048: %d temporal splits; separate short/long CUDA graphs\n",astra_time_splits());
++    if (astra_nv_enabled()) std::fprintf(stderr, "strata-inkling2: Astra NVFP4 T=1 resident experts enabled\n");
+     std::string model_path;
+     std::string draft_path;
+     std::string oracle_tail;

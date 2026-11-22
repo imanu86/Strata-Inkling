@@ -803,3 +803,39 @@ Simulazione sui token già raccolti. La Q8 propone i primi due token. Se la seco
 | LAMQ 4-bit stock → Q8 | 225 | 57 | 33 | 1,278 |
 | LAMQ 5.4 v2 → Q8 | 151 | 53 | 29 | 1,250 |
 | LAMQ 8.9 v2 → Q8 | 160 | 55 | 31 | 1,264 |
+
+## 22 novembre 2026 — Generazione di codice su Ampere e Turing
+
+RTX 3080 Ti per i 36 passaggi nel core, RTX 2080 Ti per prelude, coda e proiezione finale. GGUF UD-Q3_K_XL, tutti i 3.072 esperti in VRAM, 262144 di capacità KV Q8, seed 20261121. Generazione greedy, singola richiesta, B–A–B. Ogni passaggio apre un processo nuovo, ogni richiesta ha warmup indipendente da 128 token, prefill completo e zero riuso. I tempi totali sono quelli della richiesta al server nativo.
+
+| Compito | Input | Output B1/A/B2 | B1 t/s | A t/s | B2 t/s | Variazione | Richiesta B1/A/B2 (s) |
+|---|---:|---|---:|---:|---:|---:|---|
+| Modulo Python LRU con TTL | 46 | 512/512/512 | 88,75 | 79,12 | 88,69 | 12,13% | 5,92 / 6,66 / 5,92 |
+| Python, complemento di intervalli | 136 | 321/321/321 | 91,93 | 80,78 | 87,57 | 11,10% | 3,88 / 4,39 / 4,11 |
+| C# 5, confronto di versioni numeriche | 126 | 403/403/403 | 91,47 | 82,07 | 90,47 | 10,84% | 4,78 / 5,28 / 4,84 |
+| Python su sorgente lungo, risposta aperta | 25067 | 1000/1000/1000 | 77,65 | 62,45 | 77,97 | 24,59% | 90,62 / 94,11 / 90,83 |
+| Python su sorgente lungo, completamento di funzione | 25075 | 281/296/281 | 80,83 | 65,26 | 80,33 | 23,47% | 81,45 / 82,52 / 81,50 |
+
+Decode nativo = (token generati meno uno) / secondi motore. Per i tre casi brevi B attiva due modifiche, il percorso diretto DP4A degli esperti NVFP4 e il kernel che unisce la preparazione di Q/K/V e bias. La combinazione riproduce tutti gli ID di controllo nei tre casi. I 200058 logits di ciascuno dei due prefissi da 65 e 257 ID coincidono bit per bit.
+
+Il modulo LRU raggiunge il limite di 512 token a metà del sorgente. La funzione Python termina e passa 305/305 casi con intervalli disordinati, sovrapposti e iteratori monouso. Il C# consegnato fallisce la compilazione con CS0103 su Math.Max in tutti e tre i passaggi. Aggiungendo la sola direttiva using System il compilatore C# 5 produce un eseguibile che passa 306/306 casi.
+
+Per i due casi lunghi abbiamo preso il sorgente Python sintetico del primo fixture Community 32768 e sostituito la richiesta di spiegazione con la scrittura di due funzioni, inclusa l’inversione di una congruenza modulare. Il contesto effettivo è indicato in tabella. La risposta aperta esaurisce 1000 token spiegando il problema senza consegnare un modulo eseguibile. Nel completamento forniamo esclusivamente l’import di math e l’inizio della dichiarazione di apply_task. I corpi delle funzioni sono generati dal modello.
+
+Tutte e tre le generazioni del completamento superano 335/335 casi. I due candidati generano gli stessi 281 token. Il controllo usa 296 token per un’implementazione diversa che passa gli stessi test.
+
+Sui casi lunghi B attiva anche 48 partizioni temporali per le full attention Q8 locali T=1 oltre i 2047 token. Scelta tramite microbenchmark a posizione 24965, con riferimento FP64 su 384 componenti e controllo di tutte le 3072 uscite contro il kernel originale. La prima versione del banco aveva una corsa durante l’upload della cache; i valori utilizzati provengono dalla seconda versione, dopo la sincronizzazione e il controllo di ripetibilità. La riduzione FP32 può cambiare con il numero di partizioni.
+
+### Confronti sul parallelismo
+
+Dividere la proiezione finale fra 2080 Ti e 3060 produce gli stessi token. Sul fixture Community con 3215 ID e 256 output la baseline gira a 78,83 t/s e la divisione a 40,65 e 40,10. Nsight rileva kernel simultanei in 127/127 passi, con sovrapposizione media 0,435 ms. Nella pipeline fisica di cinque posizioni già proposte, a 10k la verifica con commit costa 48,31 ms, contro 68,92 per cinque T1 seriali, 51,80 per il blocco T5 ordinario e 42,83–43,05 per il T5 ottimizzato misurato in precedenza sulle stesse finestre. Sono misure di verifica, distinte dalla generazione libera.
+
+Nel microbenchmark di una full attention a posizione 97793 la 3060, con un terzo della KV residente, porta il tempo da 1267,1 a 873,3 µs. Sulla sola 3080 Ti, nella prova dedicata alle larghezze, 192 partizioni portano da 1423,8 a 470,75 µs. Sono microbenchmark con confronti intercalati e input sintetici. Il banco end-to-end a 25k usa 48 partizioni.
+
+Le richieste HTTP originali del Daily chiedono una spiegazione del sorgente. A parità di testo generato, la sola combinazione dei primi due kernel passa da 80,70 a 86,99–87,42 t/s a 4k e da 67,53 a 71,91–72,12 t/s a 32k. Il tempo completo a 32k resta circa 81 s per il peso del prefill. Il Qwen storico riporta rispettivamente 94,71 e 101,14 t/s sui suoi stessi messaggi.
+
+### Riproduzione
+
+La [patch CUDA del candidato](bench-results/2026-11-22-inkling-coding-sm75-sm86/inkling-coding.patch) si applica al commit 5ae3782ec4847321559fc97a8fdc8baad3a6d5b4. Il preset di laboratorio è in D:/ds4_work/inkling2/astra-parallel-1122/bench/inkling-coding-lab.json. I tre controlli sono STRATA_IK2_ASTRA_NV=1, STRATA_ATTN_PREP_T1=1 e STRATA_IK2_ASTRA_TIME_SPLIT=48. L’eseguibile finale ha SHA256 348fc866f6f040eb530cb2a923bc92e610096510063c4f922441c1b2e245867b.
+
+Runner, input, output token per token, file C#/Python e risultati dei test sono sotto D:/ds4_work/inkling2/astra-parallel-1122/bench. Risultati di generazione in coding.json, qualità in tests-summary.json e tempi dei kernel in results.json.
