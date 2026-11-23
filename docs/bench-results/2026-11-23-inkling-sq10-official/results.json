@@ -1,0 +1,436 @@
+{
+  "rows": [
+    {
+      "group": "B1",
+      "case": "python",
+      "input": 136,
+      "generated": 295,
+      "prefill_tps": 208.3971805087343,
+      "output_tps": 68.78319256954354,
+      "prefill_s": 0.6526000000000001,
+      "decode_s": 4.2743,
+      "native_request_s": 4.952999999979511,
+      "accepted": 233,
+      "offered": 405,
+      "reused": 0,
+      "finish": "stop",
+      "score": {
+        "passed": 305,
+        "total": 305,
+        "first_error": null
+      },
+      "output_ids_sha256": "5a46ecf92304d61942557a11a4a398b8c292935e26c2b4d902c4ffc4cd6b0823"
+    },
+    {
+      "group": "B1",
+      "case": "community",
+      "input": 3215,
+      "generated": 256,
+      "prefill_tps": 249.6505668582078,
+      "output_tps": 51.85245434950588,
+      "prefill_s": 12.878,
+      "decode_s": 4.917800000000001,
+      "native_request_s": 17.859000000054948,
+      "accepted": 155,
+      "offered": 344,
+      "reused": 0,
+      "finish": "length",
+      "score": null,
+      "output_ids_sha256": "c9c6c15c5acf576152c6e008f09c1f9616eda75cb8f99ebdc915b2d1daea5c5b"
+    },
+    {
+      "group": "A",
+      "case": "python",
+      "input": 136,
+      "generated": 295,
+      "prefill_tps": 204.23487010061572,
+      "output_tps": 16.009583968634285,
+      "prefill_s": 0.6658999999999999,
+      "decode_s": 18.364,
+      "native_request_s": 19.04700000002049,
+      "accepted": 0,
+      "offered": 0,
+      "reused": 0,
+      "finish": "stop",
+      "score": {
+        "passed": 305,
+        "total": 305,
+        "first_error": null
+      },
+      "output_ids_sha256": "5a46ecf92304d61942557a11a4a398b8c292935e26c2b4d902c4ffc4cd6b0823"
+    },
+    {
+      "group": "A",
+      "case": "community",
+      "input": 3215,
+      "generated": 256,
+      "prefill_tps": 250.50061164223996,
+      "output_tps": 14.121165134566397,
+      "prefill_s": 12.834299999999999,
+      "decode_s": 18.058,
+      "native_request_s": 30.953000000095926,
+      "accepted": 0,
+      "offered": 0,
+      "reused": 0,
+      "finish": "length",
+      "score": null,
+      "output_ids_sha256": "3d7f98709b99912bd14e4b66fc027b3d3971734d79be931efe6b292ea8792d42"
+    },
+    {
+      "group": "B2",
+      "case": "python",
+      "input": 136,
+      "generated": 295,
+      "prefill_tps": 206.4986334649256,
+      "output_tps": 69.00274602764804,
+      "prefill_s": 0.6586000000000001,
+      "decode_s": 4.2607,
+      "native_request_s": 4.937000000034459,
+      "accepted": 233,
+      "offered": 405,
+      "reused": 0,
+      "finish": "stop",
+      "score": {
+        "passed": 305,
+        "total": 305,
+        "first_error": null
+      },
+      "output_ids_sha256": "5a46ecf92304d61942557a11a4a398b8c292935e26c2b4d902c4ffc4cd6b0823"
+    },
+    {
+      "group": "B2",
+      "case": "community",
+      "input": 3215,
+      "generated": 256,
+      "prefill_tps": 249.6971014942993,
+      "output_tps": 51.630929964162064,
+      "prefill_s": 12.8756,
+      "decode_s": 4.938899999999999,
+      "native_request_s": 17.890999999945052,
+      "accepted": 155,
+      "offered": 344,
+      "reused": 0,
+      "finish": "length",
+      "score": null,
+      "output_ids_sha256": "c9c6c15c5acf576152c6e008f09c1f9616eda75cb8f99ebdc915b2d1daea5c5b"
+    },
+    {
+      "group": "long3080/dspark",
+      "case": "20000",
+      "input": 20000,
+      "generated": 256,
+      "prefill_tps": 189.14568568148243,
+      "output_tps": 26.690112098470813,
+      "prefill_s": 105.7386,
+      "decode_s": 9.5541,
+      "native_request_s": 115.375,
+      "accepted": 181,
+      "offered": 345,
+      "reused": 0,
+      "finish": "length",
+      "score": null,
+      "output_ids_sha256": "19b3b71b2b04884482e51dbd79081616b7c82c549c68b2238dd861734df40960"
+    },
+    {
+      "group": "single2080/dspark",
+      "case": "python",
+      "input": 136,
+      "generated": 295,
+      "prefill_tps": 296.0383108402264,
+      "output_tps": 119.79951917199789,
+      "prefill_s": 0.4594,
+      "decode_s": 2.4541,
+      "native_request_s": 2.922000000020489,
+      "accepted": 233,
+      "offered": 386,
+      "reused": 0,
+      "finish": "stop",
+      "score": {
+        "passed": 305,
+        "total": 305,
+        "first_error": null
+      },
+      "output_ids_sha256": "5a46ecf92304d61942557a11a4a398b8c292935e26c2b4d902c4ffc4cd6b0823"
+    },
+    {
+      "group": "single2080/dspark",
+      "case": "community",
+      "input": 3215,
+      "generated": 256,
+      "prefill_tps": 306.0797044878996,
+      "output_tps": 74.1020574218296,
+      "prefill_s": 10.5038,
+      "decode_s": 3.4412,
+      "native_request_s": 13.98499999998603,
+      "accepted": 149,
+      "offered": 381,
+      "reused": 0,
+      "finish": "length",
+      "score": null,
+      "output_ids_sha256": "6dc404d0c4b63bf6b603fe3900efe673ea66baba07638644465ba5c17b01f517"
+    },
+    {
+      "group": "astra-control/AR",
+      "case": "python",
+      "input": 136,
+      "generated": 321,
+      "prefill_tps": 348.3695791388099,
+      "output_tps": 93.41429238673517,
+      "prefill_s": 0.39038999999999996,
+      "decode_s": 3.4255999999999998,
+      "native_request_s": 3.827999999979511,
+      "accepted": 0,
+      "offered": 0,
+      "reused": 0,
+      "finish": "stop",
+      "score": {
+        "passed": 305,
+        "total": 305,
+        "first_error": null
+      },
+      "output_ids_sha256": "64f7ebd202c3383d1233197e5b17c0c09d340b5867e458c1904c22b807406b7a"
+    },
+    {
+      "group": "astra-control/AR",
+      "case": "community",
+      "input": 3215,
+      "generated": 256,
+      "prefill_tps": 446.5240567439715,
+      "output_tps": 86.00569323961523,
+      "prefill_s": 7.200060000000001,
+      "decode_s": 2.96492,
+      "native_request_s": 10.170999999972992,
+      "accepted": 0,
+      "offered": 0,
+      "reused": 0,
+      "finish": "length",
+      "score": null,
+      "output_ids_sha256": "7673f29eb7aca51984e13d28468089268d2f385f14a7bb3ef57182737de10a33"
+    },
+    {
+      "group": "long2080/dspark",
+      "case": "20000",
+      "input": 20000,
+      "generated": 256,
+      "prefill_tps": 269.5544938103549,
+      "output_tps": 61.00624416852078,
+      "prefill_s": 74.1965,
+      "decode_s": 4.1799,
+      "native_request_s": 78.46900000004098,
+      "accepted": 151,
+      "offered": 404,
+      "reused": 0,
+      "finish": "length",
+      "score": null,
+      "output_ids_sha256": "50410eebd1354de4ea122a82fc67c573cfc8862c70a913cb94d59955a6d3c85e"
+    },
+    {
+      "group": "long2080/dspark",
+      "case": "40000",
+      "input": 40000,
+      "generated": 256,
+      "prefill_tps": 238.09722223875676,
+      "output_tps": 58.678693881307964,
+      "prefill_s": 167.9986,
+      "decode_s": 4.3457,
+      "native_request_s": 172.39000000001397,
+      "accepted": 167,
+      "offered": 364,
+      "reused": 0,
+      "finish": "length",
+      "score": null,
+      "output_ids_sha256": "d87ff507bc92d9ef1d983e7a2981806c01faf0023fde2e5729d2cd4d5876a0f7"
+    }
+  ],
+  "peaks": {
+    ".": {
+      "max_gpu_memory_MiB": {
+        "GPU-d945c2f8-983f-1aed-1e7d-5ba1510f13aa": 10144.0,
+        "GPU-aab7a70b-b795-9b37-f317-1423f89733be": 965.0,
+        "GPU-3ec189a9-0fe7-a128-af2c-8df8fb3e15c7": 0
+      },
+      "max_engine_rss_bytes": 6955810816,
+      "min_system_available_bytes": 71510953984
+    },
+    "A": {
+      "max_gpu_memory_MiB": {
+        "GPU-d945c2f8-983f-1aed-1e7d-5ba1510f13aa": 10046.0,
+        "GPU-aab7a70b-b795-9b37-f317-1423f89733be": 959.0,
+        "GPU-3ec189a9-0fe7-a128-af2c-8df8fb3e15c7": 0
+      },
+      "max_engine_rss_bytes": 7017054208,
+      "min_system_available_bytes": 71741763584
+    },
+    "B1": {
+      "max_gpu_memory_MiB": {
+        "GPU-d945c2f8-983f-1aed-1e7d-5ba1510f13aa": 10144.0,
+        "GPU-aab7a70b-b795-9b37-f317-1423f89733be": 959.0,
+        "GPU-3ec189a9-0fe7-a128-af2c-8df8fb3e15c7": 0
+      },
+      "max_engine_rss_bytes": 7041982464,
+      "min_system_available_bytes": 71710732288
+    },
+    "B2": {
+      "max_gpu_memory_MiB": {
+        "GPU-d945c2f8-983f-1aed-1e7d-5ba1510f13aa": 10144.0,
+        "GPU-aab7a70b-b795-9b37-f317-1423f89733be": 967.0,
+        "GPU-3ec189a9-0fe7-a128-af2c-8df8fb3e15c7": 0
+      },
+      "max_engine_rss_bytes": 7041204224,
+      "min_system_available_bytes": 71553675264
+    },
+    "astra-control\\AR": {
+      "max_gpu_memory_MiB": {
+        "GPU-d945c2f8-983f-1aed-1e7d-5ba1510f13aa": 10556.0,
+        "GPU-aab7a70b-b795-9b37-f317-1423f89733be": 973.0,
+        "GPU-3ec189a9-0fe7-a128-af2c-8df8fb3e15c7": 7180.0
+      },
+      "max_engine_rss_bytes": 14724538368,
+      "min_system_available_bytes": 64091537408
+    },
+    "long2080\\dspark": {
+      "max_gpu_memory_MiB": {
+        "GPU-d945c2f8-983f-1aed-1e7d-5ba1510f13aa": 0,
+        "GPU-aab7a70b-b795-9b37-f317-1423f89733be": 959.0,
+        "GPU-3ec189a9-0fe7-a128-af2c-8df8fb3e15c7": 12514.0
+      },
+      "max_engine_rss_bytes": 1481285632,
+      "min_system_available_bytes": 77288493056
+    },
+    "long3080\\dspark": {
+      "max_gpu_memory_MiB": {
+        "GPU-d945c2f8-983f-1aed-1e7d-5ba1510f13aa": 10208.0,
+        "GPU-aab7a70b-b795-9b37-f317-1423f89733be": 974.0,
+        "GPU-3ec189a9-0fe7-a128-af2c-8df8fb3e15c7": 0
+      },
+      "max_engine_rss_bytes": 7040544768,
+      "min_system_available_bytes": 71635369984
+    },
+    "single2080\\dspark": {
+      "max_gpu_memory_MiB": {
+        "GPU-d945c2f8-983f-1aed-1e7d-5ba1510f13aa": 0,
+        "GPU-aab7a70b-b795-9b37-f317-1423f89733be": 959.0,
+        "GPU-3ec189a9-0fe7-a128-af2c-8df8fb3e15c7": 11842.0
+      },
+      "max_engine_rss_bytes": 1487986688,
+      "min_system_available_bytes": 77310009344
+    }
+  },
+  "parity": {
+    "3080-DSpark-vs-AR": {
+      "python": {
+        "equal": true,
+        "lengths": [
+          295,
+          295
+        ],
+        "first_difference_zero_based": null
+      },
+      "community": {
+        "equal": false,
+        "lengths": [
+          256,
+          256
+        ],
+        "first_difference_zero_based": 51
+      }
+    },
+    "3080-DSpark-repeat": {
+      "python": {
+        "equal": true,
+        "lengths": [
+          295,
+          295
+        ],
+        "first_difference_zero_based": null
+      },
+      "community": {
+        "equal": true,
+        "lengths": [
+          256,
+          256
+        ],
+        "first_difference_zero_based": null
+      }
+    },
+    "2080-vs-3080": {
+      "python": {
+        "equal": true,
+        "lengths": [
+          295,
+          295
+        ],
+        "first_difference_zero_based": null
+      },
+      "community": {
+        "equal": false,
+        "lengths": [
+          256,
+          256
+        ],
+        "first_difference_zero_based": 11
+      }
+    },
+    "20k-2080-vs-3080": {
+      "20000": {
+        "equal": false,
+        "lengths": [
+          256,
+          256
+        ],
+        "first_difference_zero_based": 4
+      }
+    }
+  },
+  "note": "Output throughput=(emitted-1)/decode_s; not target-forward rate for DSpark. Native times, no HTTP measurements.",
+  "schema_version": 1,
+  "date": "2026-11-23",
+  "artifact_root": "D:\\ds4_work\\inkling2\\sq10-official-1123",
+  "runtime": {
+    "release": "v0.2.20",
+    "engine": "0.1.66",
+    "source": "2e87c08db18a",
+    "cuda": "12.9",
+    "archive_sha256": "afa34ae5af2c11b9bbdf259d94554c3fcdb43b8640c15a6c5d4fa0b435950421"
+  },
+  "model": {
+    "repo": "strata-engine/Inkling-2-Mini-Strata",
+    "revision": "04996a1e2c45009b6a04f2af126cb6bdb2ba3587",
+    "file": "Inkling-2-Mini-SQ-10.strata",
+    "size_bytes": 10471526400,
+    "sha256": "ac4d452ad03e4930abd9d46f9c5eec22b2f75a1da45a1e49bd24ccd58b065934"
+  },
+  "settings": {
+    "capacity": 262144,
+    "max_completed_input": 40000,
+    "kv": "k8v8",
+    "kv_offload": "auto",
+    "parallel": 1,
+    "chunk": 64,
+    "temperature": 0,
+    "top_p": 1,
+    "top_k": 1,
+    "min_p": 0,
+    "seed": 20261121,
+    "warmup_output": 128,
+    "python_max_output": 1000,
+    "community_max_output": 256,
+    "protocol": "native pipes, no HTTP"
+  },
+  "aborted_3080_40000": {
+    "reason": "ABORTED_BY_COORDINATOR: prioritize short residency and same-day controls; not OOM/crash",
+    "last_prefill_tokens": 22400,
+    "requested_input_tokens": 40000,
+    "last_prefill_elapsed_ms": 146770.4,
+    "latest_chunk_tps": 50.9,
+    "final_metrics": null
+  },
+  "cleanup": {
+    "inference_gpu_memory_MiB": [
+      0,
+      0
+    ],
+    "owned_processes_remaining": 0,
+    "daily_unchanged": true
+  }
+}
