@@ -737,7 +737,12 @@ __global__ void update_loop_residual(float* residual, const float* actual, const
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) residual[i] = actual[i] - (predicted[i] - 0.25f * residual[i]);
 }
+__global__ void set_split_position(int32_t* destination, int32_t position) {
+    *destination = position;
+}
 struct Engine {
+    cudaEvent_t handoff_ready = nullptr;  // recorded after this device's D2H copy
+
     std::unique_ptr<GpuPqSampler> gpu_pq;
     double *sampling_mass = nullptr;
     double sample_u = -1.0;
@@ -1338,6 +1343,10 @@ struct Engine {
         cudaFreeHost(h_h);
         cudaFreeHost(cpu_out);
         cudaFreeHost(h_miss);
+        if (handoff_ready) {
+            cudaStreamSynchronize(st);
+            cudaEventDestroy(handoff_ready);
+        }
         cudaFreeHost(split_handoff);
         std::free(acts);
         if (ev_route) cudaEventDestroy(ev_route);
@@ -2698,12 +2707,14 @@ struct Engine {
         return next_id;
     }
 
-    // A synchronization at each boundary makes the portable host buffer reusable on either
-    // device without peer access, cross-device event assumptions or foreign device pointers.
+    // The default synchronizes both streams at each boundary. The optional T=1
+    // handoff orders the same host staging copies with cross-device events.
     void handoff(ForwardState& source, Engine& destination, ForwardState& target) {
         const int T = source.T;
         const size_t elems = (size_t) T * m->hp.n_embd;
         float* host = role == Role::Outer ? split_handoff : split_peer->split_handoff;
+        const bool use_event = handoff_ready && T == 1 && !source.capture_dspark && !source.save_conv_trace &&
+                               !remote_full && !destination.remote_full;
         std::vector<int> block_ids;
         for (float* p : source.norm_blocks) {
             int id = -1;
@@ -2735,7 +2746,11 @@ struct Engine {
                 for (int i = 0; i < 2; ++i)
                     CK(cudaMemcpyAsync(features + (size_t) i * elems, d_tgt_feat[i + 1], elems * sizeof(float), cudaMemcpyDeviceToHost, st));
             }
-            CK(cudaStreamSynchronize(st));
+            if (use_event) {
+                CK(cudaEventRecord(handoff_ready, st));
+            } else {
+                CK(cudaStreamSynchronize(st));
+            }
         }
         target.T = T;
         target.capture_dspark = source.capture_dspark;
@@ -2748,6 +2763,11 @@ struct Engine {
         destination.pos = pos;
         {
             DeviceScope owner(destination.device);
+            // The next handoff reverses source and destination. Its D2H copy shares
+            // this stream with the current H2D, so it can safely reuse the pinned buffer.
+            if (use_event) {
+                CK(cudaStreamWaitEvent(destination.st, handoff_ready, 0));
+            }
             CK(cudaMemcpyAsync(destination.cur, host, elems * sizeof(float), cudaMemcpyHostToDevice, destination.st));
             for (size_t i = 0; i < block_ids.size(); ++i) {
                 float* p = destination.norm_blk_buf[block_ids[i]];
@@ -2755,13 +2775,17 @@ struct Engine {
                 target.norm_blocks.push_back(p);
             }
             const int32_t pos32 = (int32_t) pos;
-            CK(cudaMemcpyAsync(destination.pos0_d, &pos32, sizeof pos32, cudaMemcpyHostToDevice, destination.st));
+            if (use_event) {
+                set_split_position<<<1, 1, 0, destination.st>>>(destination.pos0_d, pos32);
+            } else {
+                CK(cudaMemcpyAsync(destination.pos0_d, &pos32, sizeof pos32, cudaMemcpyHostToDevice, destination.st));
+            }
             if (role == Role::Core && source.capture_dspark && dspark) {
                 for (int i = 0; i < 2; ++i)
                     CK(cudaMemcpyAsync(destination.d_tgt_feat[i + 1], destination.split_features + (size_t) i * elems,
                                        elems * sizeof(float), cudaMemcpyHostToDevice, destination.st));
             }
-            CK(cudaStreamSynchronize(destination.st));
+            if (!use_event) CK(cudaStreamSynchronize(destination.st));
         }
     }
 
@@ -3396,6 +3420,7 @@ int run(int argc, char** argv) {
     std::string draft_path;
     std::string oracle_tail;
     std::string loop_matrix;
+    bool split_handoff_events = false;
     int loop_cut = -1;
     int exact_every = 0;
     int oracle_force_t1 = 0;
@@ -3477,6 +3502,7 @@ int run(int argc, char** argv) {
         else if (a == "--split-full-attn-remote")
             split_full_attn_remote = true;
         else if (a == "--dspark-gpu-pq") dspark_gpu_pq = true;
+        else if (a == "--split-handoff-events") split_handoff_events = true;
         else if (a == "--loop-exact-every") {
             const std::string text = next_arg();
             const char* end = text.data() + text.size();
@@ -3519,7 +3545,7 @@ int run(int argc, char** argv) {
         std::fprintf(
             stderr,
             "usage: strata-inkling2 --model <file.gguf> [--max-context N] [--kv-q8|--kv-f16] [--tokens IDS] [--max-new N] [--dump-logits "
-            "PATH] [--layer-split-device N [--split-core-graph] [--split-outer-graph] [--split-full-attn-remote [--full-kv-local-prefix N] "
+            "PATH] [--layer-split-device N [--split-core-graph] [--split-outer-graph] [--split-handoff-events] [--split-full-attn-remote [--full-kv-local-prefix N] "
             "[--split-prelude-core]]] [--loop-predict CUT MATRIX [--loop-exact-every N]] [--dspark-adaptive] [--dspark-outer-graph] [--dspark-gpu-pq] [--gpu-full-vocab] [--split-depth-mix] [--batch-qkv-control-t1] [--expert-dense-device N --expert-replica-device N "
             "--expert-hot-mib MiB [--expert-replica-async]] [--draft DRAFT.gguf --spec K] [--bench] [--serve]\n");
         return 2;
@@ -3534,6 +3560,10 @@ int run(int argc, char** argv) {
     }
     if (split_full_attn_remote && (layer_split_device < 0 || !kv_q8 || !draft_path.empty() || expert_replica_device >= 0)) {
         std::fprintf(stderr, "strata-inkling2: remote full attention requires layer split, Q8, no DSpark or replica\n");
+        return 2;
+    }
+    if (split_handoff_events && layer_split_device < 0) {
+        std::fprintf(stderr, "--split-handoff-events requires --layer-split-device N\n");
         return 2;
     }
     if (exact_every > 0 && loop_cut < 0) {
@@ -3643,6 +3673,12 @@ int run(int argc, char** argv) {
                      "strata-inkling2: actual placement main=%d virtual=%s+head fast=%d virtual=%s full_KV_for_fast_layers=%s local_prefix=%d\n",
                      E.device, split_prelude ? "42..47" : "0..5,42..47", split_core->device, split_prelude ? "0..41" : "6..41",
                      split_full_attn_remote ? "main" : "fast", full_kv_local_prefix);
+        if (split_handoff_events) {
+            for (Engine* half : {&E, split_core.get()}) {
+                DeviceScope owner(half->device);
+                CK(cudaEventCreateWithFlags(&half->handoff_ready, cudaEventDisableTiming));
+            }
+        }
         E.split_peer = split_core.get();
         split_core->split_peer = &E;
         {

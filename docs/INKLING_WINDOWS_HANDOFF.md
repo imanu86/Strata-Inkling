@@ -18,6 +18,8 @@ Occorrono `--serve`, `--kv-q8`, `--layer-split-device`, tutti gli esperti del co
 
 Con `--loop-exact-every N` il motore usa lo stato reale nei passi di decode N, 2N e successivi multipli. Dopo ogni passo esatto azzera la correzione residua. Il conteggio riparte dopo il prefill di ogni richiesta. Il valore 0 mantiene la predizione a ogni passo. Il profilo con taglio 0 e intervallo 4 usa la matrice calibrata sul preludio.
 
+Con `--split-handoff-events` il decode a un token ordina le copie tra GPU tramite un evento CUDA per scheda. I dati passano attraverso la stessa memoria host pinned usata dal percorso sincrono. L'opzione può essere usata anche con il decode esatto. Il prefill a blocchi, la verifica con cattura DSpark e la full attention remota conservano la sincronizzazione ordinaria.
+
 ## Perimetro
 
 - Repository: https://github.com/imanu86/Strata-Inkling, branch `main`.
