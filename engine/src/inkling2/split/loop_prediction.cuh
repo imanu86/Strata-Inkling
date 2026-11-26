@@ -3,6 +3,8 @@
 bool predict_during_decode = false;
 bool predicted_boundary = false;
 int predict_after = -1;
+int loop_exact_every = 0;
+int loop_step = 0;
 float *loop_weights = nullptr, *loop_bias = nullptr, *loop_input = nullptr;
 float *loop_prediction = nullptr, *loop_residual = nullptr, *loop_saved_cur = nullptr;
 cudaGraphExec_t loop_graphs[4]{};

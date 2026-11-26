@@ -16,6 +16,8 @@ Nel server CUDA a due schede `--loop-predict CUT MATRIX` anticipa il terzo giro 
 
 Occorrono `--serve`, `--kv-q8`, `--layer-split-device`, tutti gli esperti del core residenti e DSpark spento. Senza la nuova opzione si usa il decode ordinario. Usare la matrice calibrata per il proprio taglio e modello. Il formato consiste in 4608 × 4608 float32 little-endian ordinati per riga (ingressi per uscite), seguiti da 4608 bias. Il vettore di ingresso concatena l'ultimo blocco residuo normalizzato disponibile e lo stato corrente normalizzato; l'uscita stima le due componenti all'ingresso del terzo giro. I benchmark devono confrontare i token su prefissi identici e valutare separatamente la generazione libera.
 
+Con `--loop-exact-every N` il motore usa lo stato reale nei passi di decode N, 2N e successivi multipli. Dopo ogni passo esatto azzera la correzione residua. Il conteggio riparte dopo il prefill di ogni richiesta. Il valore 0 mantiene la predizione a ogni passo. Il profilo con taglio 0 e intervallo 4 usa la matrice calibrata sul preludio.
+
 ## Perimetro
 
 - Repository: https://github.com/imanu86/Strata-Inkling, branch `main`.

@@ -34,6 +34,7 @@
 #include <cstring>
 #include <deque>
 #include <filesystem>
+#include <charconv>
 #include <fstream>
 #include <map>
 #include <memory>
@@ -2792,11 +2793,14 @@ struct Engine {
                 run_layers(state, 0, begin);
             ForwardState core_state;
             handoff(state, *split_peer, core_state);
-            if (predict_during_decode && T == 1) {
+            const bool predict_step = predict_during_decode && T == 1;
+            const bool refresh = predict_step && loop_exact_every > 0 && ++loop_step % loop_exact_every == 0;
+            if (predict_step && !refresh) {
                 split_peer->forward_predicted_core(core_state, *this, state);
             } else {
                 split_peer->run_layers(core_state, m->split_prelude ? 0 : begin, end);
                 split_peer->handoff(core_state, *this, state);
+                if (refresh) split_peer->clear_loop_feedback();
             }
             run_layers(state, end, (int) m->hp.n_layer);
         } else {
@@ -3393,6 +3397,7 @@ int run(int argc, char** argv) {
     std::string oracle_tail;
     std::string loop_matrix;
     int loop_cut = -1;
+    int exact_every = 0;
     int oracle_force_t1 = 0;
     int draft_max = 3;
     std::string tokens_str = "1,2";
@@ -3472,6 +3477,15 @@ int run(int argc, char** argv) {
         else if (a == "--split-full-attn-remote")
             split_full_attn_remote = true;
         else if (a == "--dspark-gpu-pq") dspark_gpu_pq = true;
+        else if (a == "--loop-exact-every") {
+            const std::string text = next_arg();
+            const char* end = text.data() + text.size();
+            const auto parsed = std::from_chars(text.data(), end, exact_every);
+            if (parsed.ec != std::errc{} || parsed.ptr != end || exact_every < 0) {
+                std::fprintf(stderr, "--loop-exact-every expects a nonnegative integer\n");
+                return 2;
+            }
+        }
         else if (a == "--loop-predict") {
             std::string cut = next_arg();
             if (cut != "0" && cut != "4" && cut != "8" && cut != "12") {
@@ -3506,7 +3520,7 @@ int run(int argc, char** argv) {
             stderr,
             "usage: strata-inkling2 --model <file.gguf> [--max-context N] [--kv-q8|--kv-f16] [--tokens IDS] [--max-new N] [--dump-logits "
             "PATH] [--layer-split-device N [--split-core-graph] [--split-outer-graph] [--split-full-attn-remote [--full-kv-local-prefix N] "
-            "[--split-prelude-core]]] [--loop-predict CUT MATRIX] [--dspark-adaptive] [--dspark-outer-graph] [--dspark-gpu-pq] [--gpu-full-vocab] [--split-depth-mix] [--batch-qkv-control-t1] [--expert-dense-device N --expert-replica-device N "
+            "[--split-prelude-core]]] [--loop-predict CUT MATRIX [--loop-exact-every N]] [--dspark-adaptive] [--dspark-outer-graph] [--dspark-gpu-pq] [--gpu-full-vocab] [--split-depth-mix] [--batch-qkv-control-t1] [--expert-dense-device N --expert-replica-device N "
             "--expert-hot-mib MiB [--expert-replica-async]] [--draft DRAFT.gguf --spec K] [--bench] [--serve]\n");
         return 2;
     }
@@ -3520,6 +3534,10 @@ int run(int argc, char** argv) {
     }
     if (split_full_attn_remote && (layer_split_device < 0 || !kv_q8 || !draft_path.empty() || expert_replica_device >= 0)) {
         std::fprintf(stderr, "strata-inkling2: remote full attention requires layer split, Q8, no DSpark or replica\n");
+        return 2;
+    }
+    if (exact_every > 0 && loop_cut < 0) {
+        std::fprintf(stderr, "--loop-exact-every requires --loop-predict CUT MATRIX\n");
         return 2;
     }
     if (loop_cut >= 0 && (!serve || layer_split_device < 0 || split_full_attn_remote ||
@@ -3658,6 +3676,7 @@ int run(int argc, char** argv) {
         std::fprintf(stderr, "strata-inkling2: expert placement failed: %s\n", err.c_str());
         return 1;
     }
+    E.loop_exact_every = exact_every;
     if (loop_cut >= 0 && !split_core->load_loop_predictor(loop_cut,loop_matrix)) return 2;
     if (split_core) {
         if (split_mtp_graph)
@@ -3863,6 +3882,7 @@ int run(int argc, char** argv) {
                 if (loop_cut >= 0) {
                     split_core->clear_loop_feedback();
                     E.predict_during_decode = true;
+                    E.loop_step = 0;
                 }
                 const double pp_ms = ms_since(t_pp0);
                 if (sample_on && !stop_req.load(std::memory_order_acquire)) {
