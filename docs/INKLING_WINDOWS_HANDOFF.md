@@ -2,6 +2,14 @@
 
 Checkpoint del 21 novembre 2026. Questo documento distingue le verifiche completate dal lavoro ancora in corso.
 
+## Sincronizzazione del 26 novembre 2026
+
+Il fork incorpora il commit upstream `22ce0b8c2d605f265421d893541663c1843301cd`. Su CUDA si possono compilare due eseguibili con `cmake --build <build> --target strata-inkling2 strata-inkling2-upstream`.
+
+- `strata-inkling2` conserva il layer split del fork. Il codice specifico risiede in `engine/src/inkling2/split/`.
+- `strata-inkling2-upstream` usa il runtime Inkling della base aggiornata e le librerie comuni del fork. Serve per i confronti a una GPU.
+- Le modifiche upstream a Engine e DSpark sono disponibili nel secondo eseguibile. Il porting nel motore a due schede va verificato funzionalità per funzionalità.
+
 ## Perimetro
 
 - Repository: https://github.com/imanu86/Strata-Inkling, branch `main`.

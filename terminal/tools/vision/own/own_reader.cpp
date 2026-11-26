@@ -80,7 +80,7 @@ int own_reader_run(const OwnReaderOptions& o) {
     if (!o.gpu) {
         // the CPU path of the own tower is the fast tower (VitCpu); STRATA_VIT_CPU=ref selects the float32 reference (VitRef: the oracle, for tests)
         const char* sel = std::getenv("STRATA_VIT_CPU");
-        if (!(sel && std::string(sel) == "ref")) {
+        if (!geo.is_inkling2v() && !(sel && std::string(sel) == "ref")) {
             fast.reset(new VitCpu());
             if (!fast->load(gg, geo, err)) return fail("cannot load the vision encoder " + o.mmproj + " (" + err + ")", 1);
         } else {
@@ -102,15 +102,16 @@ int own_reader_run(const OwnReaderOptions& o) {
 #ifdef STRATA_VIT_GPU
     if (gpu) {   // warm up at the largest picture before READY: the work buffers are taken now, not at the first real picture
         const auto w0 = clock::now();
+        const int warm_side = geo.is_inkling2v() ? (geo.image_size > 0 ? geo.image_size : 640) : 2048;
         ImageU8 gray;
-        gray.w = gray.h = 2048;
-        gray.rgb.assign((size_t) 2048 * 2048 * 3, 128);
+        gray.w = gray.h = warm_side;
+        gray.rgb.assign((size_t) warm_side * warm_side * 3, 128);
         PreparedImage wp;
         std::vector<float> rows;
         int nx = 0, ny = 0;
         err.clear();
         if (own_reader_inject_failure("warmup")) err = "out of GPU memory" + injected;
-        if (err.empty() && prepare_image(gray, geo, o.min_tokens, o.max_tokens, wp, err) && encode(wp, rows, nx, ny, err))
+        if (err.empty() && prepare_image_u8(gray, geo, o.min_tokens, o.max_tokens, wp, err) && encode(wp, rows, nx, ny, err))
             std::fprintf(stderr, "strata-vision: warmed up at %d image tokens in %.1f s, %.0f MiB of GPU memory\n", nx * ny,
                          std::chrono::duration<double>(clock::now() - w0).count(), (double) gpu->device_bytes() / 1048576.0);
         else
@@ -130,7 +131,13 @@ int own_reader_run(const OwnReaderOptions& o) {
         ImageU8 src;
         PreparedImage prep;
         if (!image_load_file(img, src, err)) { std::printf("ERR cannot read the image %s\n", img.c_str()); std::fflush(stdout); continue; }
-        if (!prepare_image(src, geo, o.min_tokens, o.max_tokens, prep, err)) { std::printf("ERR the image could not be preprocessed (%s)\n", err.c_str()); std::fflush(stdout); continue; }
+#ifdef STRATA_VIT_GPU
+        const bool prep_ok = gpu ? prepare_image_u8(src, geo, o.min_tokens, o.max_tokens, prep, err)
+                                 : prepare_image(src, geo, o.min_tokens, o.max_tokens, prep, err);
+#else
+        const bool prep_ok = prepare_image(src, geo, o.min_tokens, o.max_tokens, prep, err);
+#endif
+        if (!prep_ok) { std::printf("ERR the image could not be preprocessed (%s)\n", err.c_str()); std::fflush(stdout); continue; }
         const int n_expect = (prep.w / geo.align()) * (prep.h / geo.align());
         // never silently produce many times the budget (I7, #3690): over the limit (a rounding margin of an eighth) the picture is refused
         if (o.max_tokens > 0 && n_expect > o.max_tokens + o.max_tokens / 8) {

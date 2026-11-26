@@ -5,7 +5,7 @@
 #include <cstdlib>
 #include <vector>
 #include <cstring>
-#include "../src/inkling2/inkling2_kernels.cuh"
+#include "../src/inkling2/split/inkling2_kernels.cuh"
 using namespace strata::inkling2;
 #define CHECK(x) do { auto e=(x); if(e!=cudaSuccess) { std::fprintf(stderr,"%s\n",cudaGetErrorString(e)); std::exit(2); } } while(0)
 template<class T> struct Buf {

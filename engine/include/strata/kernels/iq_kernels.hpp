@@ -58,6 +58,15 @@ struct NativeExpertLayout {
     bool situ = false;
     float situ_beta = 4.0f;
     float situ_linear_beta = 25.0f;
+    // Coalesced K-Tile layout for NVFP4 (type == 40) expert blobs (exact same byte size & tail_off):
+    // GU   [0 .. down_off)       : [n_ff/64,    n_embd/64, 4608 B] (wr=0..63 gate, wr=64..127 up)
+    // DOWN [down_off .. tail_off): [n_embd/128, n_ff/64,   4608 B] (wr=0..127 down)
+    bool nvfp4_ktile = false;
+    // Coalesced K-Tile layouts for Q5_K GU (type == 13) & Q8_0 DOWN (type == 8) (exact same byte size):
+    // Q5_K GU   [0 .. down_off)     : [n_ff/64,    n_embd/256, 22528 B] (wr=0..63 gate, wr=64..127 up)
+    // Q8_0 DOWN [down_off .. bytes) : [n_embd/128, n_ff/64,     8704 B] (wr=0..127 down)
+    bool q5k_ktile = false;
+    bool q8_0_ktile = false;
 };
 NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff);
 /// STRATA_EXPERT_NIBBLE: a converted VRAM slot - gate/up as 4-bit codes, scales and d (expert_nibble.hpp's layout:
@@ -71,6 +80,8 @@ bool native_expert_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_
 
 /// Bytes of scratch `native_expert_grouped` needs for `cap_entries` entries.
 size_t native_expert_scratch_bytes(int64_t cap_entries, int64_t n_ff);
+/// Compact scratch for fused SiTU WMMA (`wmma_grouped_gu_situ_{64,128}`): only tile list + FP16 h16 (no FP32 gate/up).
+size_t native_expert_wmma_fused_scratch_bytes(int64_t cap_entries, int64_t cap_groups, int64_t n_ff);
 
 /// A770 port (STRATA_PF_XMX=2): up to kXmxGroupMax experts' products in one XMX launch, the weights decoded from the
 /// quantized rows into local memory.  Expert i: Y_i[cnt[i]][N] = X_i . W_i^T (X FP16, Y FP32, rows back to back).
@@ -90,6 +101,20 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
                            const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
                            int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream,
                            int64_t grid_groups = 0);
+/// Volta+ (sm_70+) FP16 WMMA grouped MoE for prefill (`x_f16` is [n_tok, n_embd] __half): dequantizes each active
+/// expert's weight superblocks once per BM=32 entry tile into shared memory instead of iterating 1-4 entries at a time.
+/// Returns false cleanly (caller falls back to native_expert_grouped) on unsupported CC (<7.0) or shapes/types.
+bool native_expert_wmma_supported(const NativeExpertLayout& L) noexcept;
+bool native_expert_grouped_wmma(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
+                                const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok,
+                                int64_t cap_groups, int64_t cap_entries, const void* x_f16, void* scratch, float* out,
+                                void* stream, int64_t expected_entries = 0, const float* ent_weights = nullptr,
+                                float* zero_moe_out = nullptr, size_t zero_moe_floats = 0);
+/// Exact FP32-activation x BF16-weight grouped MoE for decode/verify (`gu_type == 30 && d_type == 30`, zero activation quantization).
+void native_expert_grouped_bf16_f32(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
+                                    const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok,
+                                    int64_t cap_groups, int64_t cap_entries, const float* x_f32, void* scratch, float* out,
+                                    void* stream);
 /// OWN-I8 (research, off by default): the same call as `native_expert_grouped` on our own int8 dot-product kernels - a tile of
 /// 64 weight rows x 32..64 entries per block, each weight sub-block decoded once per tile into int8 in shared memory, `dp4a`
 /// products, SwiGLU and the q8_1 quantization of H in the gate/up epilogue (gate/up never go to memory).  For cards with no

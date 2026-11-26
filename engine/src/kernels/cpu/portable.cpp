@@ -160,7 +160,16 @@ void q8k_quant_avx2(const float*, void*, int64_t) { unsupported("the AVX-2 Q8_K 
 void kq256_gu_rows(int, const uint8_t*, size_t, size_t, int, const void* const*, int, float* const*, int, int) {
     unsupported("the AVX-2 k-quant kernel");
 }
+void kq256_gu_rows_situ(int, const uint8_t*, size_t, size_t, int, const void* const*, int, float* const*, int, int, float, float) {
+    unsupported("the AVX-2 k-quant kernel");
+}
+void kq256_ktile_gu_rows_situ(const uint8_t*, int, const void* const*, int, float* const*, int, int, float, float) {
+    unsupported("the AVX-2 k-quant kernel");
+}
 void kq256_rows(int, const uint8_t*, size_t, int, const void* const*, int, float* const*, int, int) {
+    unsupported("the AVX-2 k-quant kernel");
+}
+void kq256_ktile_rows(const uint8_t*, int, const void* const*, int, float* const*, int, int) {
     unsupported("the AVX-2 k-quant kernel");
 }
 void kq512_gu_rows(int, const uint8_t*, size_t, size_t, int, const void* const*, int, float* const*, int, int) {
@@ -221,6 +230,9 @@ bool bf16_256_fits(int n) { return false; }
 void bf16_256_gu_rows(const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act, int nt, float* const* ff, int r0, int r1, bool situ, float beta, float lb) { cpu_kernel_unreachable("bf16_256_gu_rows"); }
 void bf16_256_rows(const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt, float* const* out, int r0, int r1) { cpu_kernel_unreachable("bf16_256_rows"); }
 void nvfp4_256_rows(const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt, float* const* out, int r0, int r1, float scale) { cpu_kernel_unreachable("nvfp4_256_rows"); }
+void nvfp4_256_ktile_gu_rows(const uint8_t* blob, int n, const void* const* act, int nt, float* const* ff, int r0, int r1, float s_gate, float s_up) { cpu_kernel_unreachable("nvfp4_256_ktile_gu_rows"); }
+void nvfp4_256_ktile_gu_rows_situ(const uint8_t* blob, int n, const void* const* act, int nt, float* const* ff, int r0, int r1, float s_gate, float s_up, float beta, float lb) { cpu_kernel_unreachable("nvfp4_256_ktile_gu_rows_situ"); }
+void nvfp4_256_ktile_rows(const uint8_t* w, int n, const void* const* act, int nt, float* const* out, int r0, int r1, float scale) { cpu_kernel_unreachable("nvfp4_256_ktile_rows"); }
 bool nvfp4_512_fits(int n) { return false; }
 void nvfp4_512_gu_rows(const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act, int nt, float* const* ff, int r0, int r1, float s_gate, float s_up) { cpu_kernel_unreachable("nvfp4_512_gu_rows"); }
 void nvfp4_512_rows(const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt, float* const* out, int r0, int r1, float scale) { cpu_kernel_unreachable("nvfp4_512_rows"); }

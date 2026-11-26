@@ -1008,6 +1008,9 @@ class StrataEngine:
         log = getattr(self, "log", None)                # retain this process's log across a restart
         line = None
         for line in proc.stdout:
+            if line.startswith("T "):
+                lines.put(line)
+                continue
             # stderr already reaches the log; native ERR diagnostics use the protocol pipe.
             if line.startswith("ERR ") and log not in (None, subprocess.DEVNULL):
                 try:
@@ -2900,6 +2903,7 @@ class Vision:
         self.elastic = cfg.get("elastic") is True
         self.elastic_mib = self.elastic_ask_mib(cfg, self.max_tokens)
         self.elastic_idle_s = float(cfg.get("elastic_idle_s") or 120)
+        self.release_after_encode = cfg.get("release_after_encode") is True
         if not lazy and not self.elastic:
             self._start()
 
@@ -4317,6 +4321,21 @@ class Service:
         elif note:
             print(f"[strata] images: the expert cache did not make room for the image encoder{note}; starting it anyway", flush=True)
 
+    def _vision_down_locked(self, reason: str) -> str:
+        """Stop an elastic encoder and give its VRAM back to the expert cache (caller holds self.fifo)."""
+        v = self.vision
+        if not getattr(v, "elastic", False) or not (self.vision_held or v.alive()):
+            return "nothing"
+        v.unload()
+        back = ""
+        if self.vision_held and hasattr(self.engine, "vram") and self.loaded():
+            out = self.engine.vram(self._engine_reserve())
+            back = (f"; the expert cache took its VRAM back ({out.get('expert_cache_mib')} of "
+                    f"{out.get('expert_cache_full_mib')} MiB)")
+        print(f"[strata] images: the image encoder stopped {reason}{back}", flush=True)
+        self.vision_held = False
+        return "down"
+
     def _vision_idle_down(self, force: bool = False) -> str:
         """An elastic encoder idle for elastic_idle_s (or force) stops, and the expert cache takes its VRAM back:
         "down", "busy" (a request holds the turn, or a picture came more recently) or "nothing" (not elastic or not
@@ -4329,17 +4348,7 @@ class Service:
         if not self.fifo.acquire(blocking=False):
             return "busy"
         try:
-            v.unload()
-            back = ""
-            if self.vision_held and hasattr(self.engine, "vram") and self.loaded():
-                out = self.engine.vram(self._engine_reserve())
-                back = (f"; the expert cache took its VRAM back ({out.get('expert_cache_mib')} of "
-                        f"{out.get('expert_cache_full_mib')} MiB)")
-            # also when the cache never made room (a layer split, an engine without --vram-elastic): the stop happened
-            print(f"[strata] images: the image encoder stopped after {v.elastic_idle_s:g} s without a picture{back}",
-                  flush=True)
-            self.vision_held = False
-            return "down"
+            return self._vision_down_locked(f"after {v.elastic_idle_s:g} s without a picture")
         finally:
             self.fifo.release()
 
@@ -5070,8 +5079,17 @@ class Service:
                     if src.startswith(("http://", "https://")) else src
             images = [fetch(src) for src in images]
         if images:
-            pad = self.tok.encode(IMAGE_PAD, parse_special=True)[0]
-            start = self.tok.encode(VISION_START, parse_special=True)[0]
+            v_start_s, v_pad_s = VISION_START, IMAGE_PAD
+            pad_ids = self.tok.encode(v_pad_s, parse_special=True)
+            start_ids = self.tok.encode(v_start_s, parse_special=True)
+            if len(pad_ids) != 1 or len(start_ids) != 1:
+                alt_pad = self.tok.encode("<|unused_200054|>", parse_special=True)
+                alt_start = self.tok.encode("<|content_image|>", parse_special=True)
+                if len(alt_pad) == 1 and len(alt_start) == 1:
+                    v_start_s, v_pad_s = "<|content_image|>", "<|unused_200054|>"
+                    pad_ids, start_ids = alt_pad, alt_start
+            pad = pad_ids[0]
+            start = start_ids[0]
             # Encode only while the engine is idle: the engine and the image encoder (a separate process) must not
             # run on the GPU at the same time - an encode during a running request left that request stuck at
             # "reading the prompt" with CPU and GPU busy, for good (reproduced).  So encoding takes its turn in the
@@ -5084,10 +5102,13 @@ class Service:
                                else [self.vision.encode(src) for src in images])
                 finally:
                     self.last_image_at = time.time()
-            # one <|image_pad|> per image -> one per image token.  Only the markers the template writes for an image
-            # (right after <|vision_start|>) are images: the same text inside a message (an agent reading these docs,
-            # #150) is kept as plain text, or it took an image's place and the counts no longer matched.
-            literal = self.tok.encode(IMAGE_PAD, parse_special=False)
+                    if getattr(self.vision, "release_after_encode", False):
+                        self._vision_down_locked("right after encoding (release_after_encode)")
+            # one <|image_pad|> (or <|unused_200054|>) per image -> one per image token.  Only the markers the template
+            # writes for an image (right after <|vision_start|> or <|content_image|>) are images: the same text inside a
+            # message (an agent reading these docs, #150) is kept as plain text, or it took an image's place and the
+            # counts no longer matched.
+            literal = self.tok.encode(v_pad_s, parse_special=False)
             out, k = [], 0
             for j, t in enumerate(ids):
                 if t == pad and j > 0 and ids[j - 1] == start:
@@ -6370,6 +6391,7 @@ def body_limit() -> int:
 
 def make_handler(svc: Service):
     class Handler(BaseHTTPRequestHandler):
+        disable_nagle_algorithm = True
         timeout = PEER_STALL_S
         protocol_version = "HTTP/1.0"                       # SSE ends by closing the connection
 

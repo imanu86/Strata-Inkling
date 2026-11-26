@@ -9,7 +9,7 @@
 #include <cstdint>
 #include <vector>
 #include <cuda_runtime.h>
-#include "../src/inkling2/inkling2_kernels.cuh"
+#include "../src/inkling2/split/inkling2_kernels.cuh"
 
 using namespace strata::inkling2;
 #define CUDA_OK(x) do { cudaError_t e = (x); if (e != cudaSuccess) { \

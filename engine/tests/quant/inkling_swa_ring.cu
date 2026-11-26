@@ -1,5 +1,5 @@
 // Standalone SWA batched-store regression: no model, Engine, or cuBLAS required.
-#include "../../src/inkling2/inkling2_kernels.cuh"
+#include "../../src/inkling2/split/inkling2_kernels.cuh"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
