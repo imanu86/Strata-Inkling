@@ -3755,7 +3755,11 @@ int run(int argc, char** argv) {
                 if (!line.empty() && line.back() != '\n' && !std::feof(stdin)) continue;
                 while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) line.pop_back();
                 if (line == "STOP") {
-                    stop_req.store(true, std::memory_order_release);
+                    {
+                        std::lock_guard<std::mutex> lk(q_mu);
+                        stop_req.store(true, std::memory_order_release);
+                    }
+                    q_cv.notify_one();
                     line.clear();
                     continue;
                 }
@@ -3778,7 +3782,7 @@ int run(int argc, char** argv) {
                     E.placed_slots, (long long) m.hp.n_phys * m.hp.n_expert,
                     (long long) (E.placed_bytes >> 20), (long long) (E.vram_free_after_place >> 20),
                     E.pool_workers, dspark ? "on" : "off", dspark ? draft_max : 0);
-        std::printf("READY %d stop\n", max_ctx);
+        std::printf("READY %d stop%s\n", max_ctx, dspark ? "" : " budget_splice");
         std::fflush(stdout);
 
         std::vector<float> lg;
@@ -3813,6 +3817,7 @@ int run(int argc, char** argv) {
                 int req_new = 0;
                 iss >> req_new;
                 SamplingParams smp;
+                int budget_check = 0;
                 std::vector<int32_t> prompt;
                 std::string tok;
                 while (iss >> tok) {
@@ -3829,6 +3834,7 @@ int run(int argc, char** argv) {
                         else if (k == "penalty_present") smp.pres_pen = std::strtof(v.c_str(), nullptr);
                         else if (k == "penalty_last_n") smp.pen_last_n = std::atoi(v.c_str());
                         else if (k == "seed") smp.seed = (uint64_t) std::strtoull(v.c_str(), nullptr, 10);
+                        else if (k == "budget_check") budget_check = std::atoi(v.c_str());
                         continue;
                     }
                     for (int32_t id : parse_id_list(tok)) prompt.push_back(id);
@@ -3943,11 +3949,38 @@ int run(int argc, char** argv) {
                     if (stop_req.load(std::memory_order_acquire)) finish = "cancel";
                     else if (hit_eos) finish = "stop";
                 } else {
+                    std::vector<int32_t> splice;
+                    size_t splice_pos = 0;
                     for (int step = 0; step < limit; ++step) {
                         if (stop_req.load(std::memory_order_acquire)) {
                             finish = "cancel";
                             break;
                         }
+                        if (budget_check > 0 && step == budget_check) {
+                            // The frontend has consumed every preceding T when it answers this barrier.
+                            // Keep both GPUs' live decode state, including the loop predictor phase.
+                            std::printf("BUDGET_WAIT\n"); std::fflush(stdout);
+                            std::unique_lock<std::mutex> lk(q_mu);
+                            q_cv.wait(lk, [&] { return stop_req.load() || stdin_eof || !q_lines.empty(); });
+                            if (stop_req.load() || q_lines.empty() || q_lines.front().rfind("BUDGET_RESUME ", 0) != 0) {
+                                finish = "cancel";
+                                break;
+                            }
+                            std::istringstream reply(q_lines.front().substr(14));
+                            q_lines.pop_front();
+                            lk.unlock();
+                            int more = 0;
+                            std::string ids;
+                            reply >> more >> ids;
+                            budget_check = more > 0 && more < limit - step ? step + more : 0;
+                            splice = parse_id_list(ids);
+                            splice_pos = 0;
+                            if (splice.size() >= static_cast<size_t>(limit - step) ||
+                                std::any_of(splice.begin(), splice.end(), [&](int32_t t) {
+                                    return t < 0 || t >= m.hp.vocab_unpadded;
+                                })) break;
+                        }
+                        if (splice_pos < splice.size()) next_tok = splice[splice_pos++];
                         std::printf("T %d\n", (int) next_tok);
                         std::fflush(stdout);
                         ++emitted;

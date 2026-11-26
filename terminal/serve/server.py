@@ -313,7 +313,7 @@ from serve.server_parts.openai_api import (  # noqa: F401  (moved unchanged, fil
     openai_collect,
 )
 from serve.frontend import (CALL_END, CALL_START, FUNC_END, FUNC_START, THINK_END, ChatTemplate, Event, InklingOutputParser, OutputParser,  # noqa: E402
-                            parser_for_template, anthropic_to_messages, anthropic_tools,
+                            parser_for_template, anthropic_to_messages, anthropic_tools, inkling_reasoning_close,
                             forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages, require_messages,
                             tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, hub_from_config, resolve_image_results  # noqa: E402
@@ -766,6 +766,7 @@ class StrataEngine:
         self.can_stop = False            # the engine honours a STOP line mid-request (READY <ctx> stop)
         self.can_hold = False            # the engine takes GEN hold=N:ID (READY <ctx> ... hold)
         self.can_hold_batch = False      # ... and its --batch slots end at the hold too, BDONE hold (READY ... holdb)
+        self.can_budget_splice = False   # the solo engine can insert channel tokens without ending its GEN
         self.last = {}
         self.info = {}                   # INFO key=value facts (engine 0.1.8+): kv, expert slots, ... (Monitor tab)
         self.terminal_stages: list[dict] = []  # final layer ranges from this engine start's bounded stderr log
@@ -852,6 +853,7 @@ class StrataEngine:
                 self.max_context = int(f[1])
                 self.can_stop = "stop" in f[2:]
                 self.can_hold = "hold" in f[2:]
+                self.can_budget_splice = "budget_splice" in f[2:]
                 self.can_hold_batch = "holdb" in f[2:]
                 break
         loading.set()
@@ -2442,7 +2444,7 @@ class StrataEngine:
                          "tok_s": round(r["generated"] / max(1e-6, now - ft), 1) if ft else None})
         return view
 
-    def generate(self, ids, max_new, sampling, cancel, embeddings=None, prefill_only=False):
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None, prefill_only=False, budget_boundary=None):
         """Yields token ids, and None as a heartbeat every 10 s while the engine is quiet (reading a long prompt):
         the HTTP layer turns it into an SSE comment, which keeps clients' watchdogs calm and notices a client that
         has gone.  A consumer that stops early (or `cancel`) makes the engine STOP, so it does not run to max_new."""
@@ -2470,6 +2472,8 @@ class StrataEngine:
             if embeddings or int(max_new) != 0:
                 raise ValueError("prefill_only is a text prompt and max_new 0")
             head = "GEN 0 prefill=1"
+        if budget_boundary:
+            head += f" budget_check={budget_boundary[0]}"
         line = f"{head} {','.join(str(int(t)) for t in ids)}\n"   # (a bad id stays the request's own ValueError)
         try:
             self.proc.stdin.write(line)
@@ -2523,6 +2527,13 @@ class StrataEngine:
                 beat = heard
                 if stall_state:
                     stall_state.clear()
+                if budget_boundary and line.startswith("BUDGET_WAIT"):
+                    if cancel.is_set():
+                        return
+                    more, tokens = budget_boundary[1]()
+                    proc0.stdin.write(f"BUDGET_RESUME {more} {','.join(map(str, tokens))}\n")
+                    proc0.stdin.flush()
+                    continue
                 if line.startswith("T "):
                     allow = silence
                     if cancel.is_set():
@@ -5507,6 +5518,22 @@ class Service:
                     before = getattr(self.engine, "last", None)
                     last_print = time.time()
                     prompt, thought = ids, 0            # thought: the reasoning tokens so far (the budget's count)
+                    inline_budget = (self.family == "inkling2" and not emb and not par
+                                     and getattr(self.engine, "can_budget_splice", False) is True)
+
+                    def at_budget_boundary():
+                        nonlocal budget, force
+                        if answered or not budget:
+                            return 0, ()
+                        if thought < budget or parser.state != "reasoning" or not parser.clean or detok.pending():
+                            return max(1, budget - thought), ()
+                        tokens = self.tok.encode(inkling_reasoning_close(force, tools), parse_special=True)
+                        print(f"[strata] thinking budget reached ({thought} tokens): continuing in the live decode",
+                              flush=True)
+                        budget = st["thinking_budget"] = None
+                        force = None
+                        return 0, tokens
+
                     # the engine stops at the budget itself (HOLD_KEY), when it can and </think> is one token: a --batch engine
                     # only when its slots say they hold too (READY holdb)
                     hold_end = None
@@ -5528,8 +5555,10 @@ class Service:
                             pass_sampling = {k: v for k, v in sampling.items() if k != HOLD_KEY}
                         else:
                             pass_sampling = sampling   # no hold: the engine gets the caller's own sampler object, as before P2
-                        gen = self.engine.generate(prompt, max_new - n, pass_sampling, cancel, embeddings=emb) if emb \
-                            else self.engine.generate(prompt, max_new - n, pass_sampling, cancel)
+                        gen_options = {"embeddings": emb} if emb else {}
+                        if inline_budget and budget:
+                            gen_options["budget_boundary"] = (max(1, budget - thought), at_budget_boundary)
+                        gen = self.engine.generate(prompt, max_new - n, pass_sampling, cancel, **gen_options)
                         recover_prompt = None
                         seg, wrap, leaving = [], False, False   # this pass's tokens; the budget is reached; closed
                         nonfinite = False               # #879: the engine ended this pass on non-finite logits
@@ -5608,7 +5637,7 @@ class Service:
                                 if budget and parser.state == "reasoning":
                                     thought += 1
                                     # at a clean point: no tag held back, no character split across tokens
-                                    if thought >= budget and parser.clean and not detok.pending():
+                                    if not inline_budget and thought >= budget and parser.clean and not detok.pending():
                                         wrap = True
                                         break
                                 if force:

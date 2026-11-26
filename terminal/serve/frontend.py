@@ -1344,6 +1344,12 @@ def forced_call(tool_choice, tools: list[dict] | None, callable_tools: list[dict
     return None
 
 
+def inkling_reasoning_close(force: str | None, tools) -> str:
+    """Close the thinking message and open the next native message. With tools in auto mode
+    the model still chooses the channel and (for a call) the tool name."""
+    return _INK_END + (force or (_INK_MSG if tools else _INK_MSG + _INK_TEXT))
+
+
 def inkling_force_text(force: str | None) -> str | None:
     """Translate forced_call's validated opening into Inkling's native JSON tool channel."""
     if force is None:

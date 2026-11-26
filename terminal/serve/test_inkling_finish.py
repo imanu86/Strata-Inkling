@@ -1,8 +1,11 @@
 """Inkling DONE stop propagation, including a native iterator that consumes EOS itself (CPU only)."""
 import json
 from pathlib import Path
+import subprocess
+import sys
 import threading
 import unittest
+from unittest import mock
 import urllib.request
 
 from serve import frontend
@@ -52,6 +55,60 @@ class InklingFinish(unittest.TestCase):
 
     def run_service(self, cancel=None):
         return list(self.svc.run(self.tok.encode("prompt"), False, None, 256, {}, cancel or threading.Event()))
+
+    def test_pipe_budget_reply_reaches_waiting_engine(self):
+        script = """
+import sys
+print('READY 4096 stop budget_splice', flush=True)
+assert 'budget_check=2' in input().split()
+print('T 17\\nT 18\\nBUDGET_WAIT', flush=True)
+assert input().split() == ['BUDGET_RESUME', '0', '20,21']
+print('T 20\\nT 21\\nT 22\\nDONE 5 1 0 0 stop', flush=True)
+"""
+        with mock.patch("serve.server.popen", side_effect=lambda what, args, **kw:
+                        subprocess.Popen([sys.executable, "-u", "-c", script], **kw)):
+            engine = StrataEngine("test-budget-pipe", [])
+        self.addCleanup(engine.close)
+        self.assertTrue(engine.can_budget_splice)
+        engine.silence_s = 2
+        tokens = engine.generate([1], 5, {}, threading.Event(), budget_boundary=(2, lambda: (0, [20, 21])))
+        self.assertEqual(list(tokens), [17, 18, 20, 21, 22])
+
+    def test_budget_splices_native_channels_in_one_generation(self):
+        self.engine.can_budget_splice = True
+        for tools, force, after_header, expected_header in (
+            (None, None, "Roma", "<|message_model|><|content_text|>"),
+            ([{"name": "lookup"}], None, "<|content_text|>Roma", "<|message_model|>"),
+            ([{"name": "lookup"}], frontend.inkling_force_text("<tool_call>\n<function=lookup>"),
+             '{}}', '<|message_model|>lookup<|content_invoke_tool_json|>{"name":"lookup","args":'),
+        ):
+            with self.subTest(header=expected_header):
+                splices = []
+                passes = []
+                def generate(ids, max_new, sampling, cancel, budget_boundary=None):
+                    passes.append(1)
+                    at, decide = budget_boundary
+                    stream = iter(self.tok.encode("<|message_model|><|content_thinking|>" + "abc" * 100))
+                    for pos in range(max_new):
+                        if pos == at:
+                            more, tokens = decide()
+                            at = pos + more if more else None
+                            if tokens:
+                                splices.append(self.tok.decode(tokens))
+                                stream = iter(list(tokens) + self.tok.encode(after_header + "<|end_message|>"))
+                        token = next(stream, None)
+                        if token is None:
+                            return
+                        yield token
+                self.engine.generate = generate
+                events = list(self.svc.run(self.tok.encode("prompt"), True, tools, 512,
+                                           {"reasoning_budget_tokens": 64}, threading.Event(), force=force))
+                self.assertEqual(passes, [1])
+                self.assertEqual(splices, ["<|end_message|>" + expected_header])
+                if force is None:
+                    self.assertEqual("".join(e.text for k, e in events if k == "event" and e.kind == "content"), "Roma")
+                else:
+                    self.assertTrue(any(k == "event" and e.kind == "tool_call" for k, e in events))
 
     def test_native_stop_without_eos_is_a_stop_for_service_and_history(self):
         for native_finish in ("stop", "eos"):
