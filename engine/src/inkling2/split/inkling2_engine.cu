@@ -34,6 +34,7 @@
 #include <cstring>
 #include <deque>
 #include <filesystem>
+#include <fstream>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -727,6 +728,14 @@ bool load_model(const std::string& path, Model& m, std::string& err) {
 
 #include "inkling2_pq.cuh"
 
+__global__ void add_loop_bias(float* predicted, const float* bias, const float* residual, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) predicted[i] += bias[i] + 0.25f * residual[i];
+}
+__global__ void update_loop_residual(float* residual, const float* actual, const float* predicted, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) residual[i] = actual[i] - (predicted[i] - 0.25f * residual[i]);
+}
 struct Engine {
     std::unique_ptr<GpuPqSampler> gpu_pq;
     double *sampling_mass = nullptr;
@@ -1232,6 +1241,12 @@ struct Engine {
 
     ~Engine() {
         DeviceScope owner(device);
+        if (loop_weights) {
+            cudaStreamSynchronize(st);
+            for (auto graph : loop_graphs) if (graph) cudaGraphExecDestroy(graph);
+            cudaFree(loop_weights); cudaFree(loop_bias); cudaFree(loop_input); cudaFree(loop_prediction);
+            cudaFree(loop_residual); cudaFree(loop_saved_cur);
+        }
         gpu_pq.reset();
         if (replica) {
             cudaStreamSynchronize(st);
@@ -2148,6 +2163,7 @@ struct Engine {
         std::vector<float*> norm_blocks, prelude_norm_blocks, norm_bank;
     };
 
+#include "loop_prediction.cuh"
     void begin_forward(const int32_t* tokens, int T, ForwardState& state) {
         DeviceScope owner(device);
         state = ForwardState{};
@@ -2219,7 +2235,9 @@ struct Engine {
                     } else {
                         norm_bank.clear();
                         for (size_t bi = prelude_norm_blocks.size() + 1; bi < norm_blocks.size(); ++bi) norm_bank.push_back(norm_blocks[bi]);
-                        k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(cur, nullptr, bank_last_norm, N, hp.rms_eps);
+                        if (predicted_boundary)
+                            CK(cudaMemcpyAsync(bank_last_norm, cur, N * sizeof(float), cudaMemcpyDeviceToDevice, st));
+                        else k_rms_norm<<<(unsigned) T, kThreads, 0, st>>>(cur, nullptr, bank_last_norm, N, hp.rms_eps);
                         norm_blocks = prelude_norm_blocks;
                         CK(cudaMemcpyAsync(cur, prelude_cur, (size_t) T * N * sizeof(float), cudaMemcpyDeviceToDevice, st));
                     }
@@ -2560,7 +2578,7 @@ struct Engine {
             }
             const bool core_graph_allowed = role == Role::All || (role == Role::Core && split_core_graph);
             const bool graph_shape = T == 1 || (T == verify_max_t && state.capture_dspark && save_conv_trace);
-            if (core_graph_allowed && graph_shape && core_all_gpu && !prof_detail && il == (m->split_prelude ? 0 : hp.core_start) &&
+            if (end_layer >= core_end_virt && core_graph_allowed && graph_shape && core_all_gpu && !prof_detail && il == (m->split_prelude ? 0 : hp.core_start) &&
                 n_core > 0) {
                 cudaGraphExec_t& cg = T != 1 ? verify_core_graph : (state.capture_dspark ? capture_core_graph : core_graph);
                 if (!cg) {
@@ -2774,8 +2792,12 @@ struct Engine {
                 run_layers(state, 0, begin);
             ForwardState core_state;
             handoff(state, *split_peer, core_state);
-            split_peer->run_layers(core_state, m->split_prelude ? 0 : begin, end);
-            split_peer->handoff(core_state, *this, state);
+            if (predict_during_decode && T == 1) {
+                split_peer->forward_predicted_core(core_state, *this, state);
+            } else {
+                split_peer->run_layers(core_state, m->split_prelude ? 0 : begin, end);
+                split_peer->handoff(core_state, *this, state);
+            }
             run_layers(state, end, (int) m->hp.n_layer);
         } else {
             run_layers(state, 0, (int) m->hp.n_layer);
@@ -3369,6 +3391,8 @@ int run(int argc, char** argv) {
     std::string model_path;
     std::string draft_path;
     std::string oracle_tail;
+    std::string loop_matrix;
+    int loop_cut = -1;
     int oracle_force_t1 = 0;
     int draft_max = 3;
     std::string tokens_str = "1,2";
@@ -3448,6 +3472,15 @@ int run(int argc, char** argv) {
         else if (a == "--split-full-attn-remote")
             split_full_attn_remote = true;
         else if (a == "--dspark-gpu-pq") dspark_gpu_pq = true;
+        else if (a == "--loop-predict") {
+            std::string cut = next_arg();
+            if (cut != "0" && cut != "4" && cut != "8" && cut != "12") {
+                std::fprintf(stderr,"--loop-predict expects 0, 4, 8 or 12 followed by its matrix file\n");
+                return 2;
+            }
+            loop_cut = std::stoi(cut);
+            loop_matrix = next_arg();
+        }
         else if (a == "--split-depth-mix") split_depth_mix = true;
         else if (a == "--gpu-full-vocab")
             gpu_full_vocab = true;
@@ -3473,7 +3506,7 @@ int run(int argc, char** argv) {
             stderr,
             "usage: strata-inkling2 --model <file.gguf> [--max-context N] [--kv-q8|--kv-f16] [--tokens IDS] [--max-new N] [--dump-logits "
             "PATH] [--layer-split-device N [--split-core-graph] [--split-outer-graph] [--split-full-attn-remote [--full-kv-local-prefix N] "
-            "[--split-prelude-core]]] [--dspark-adaptive] [--dspark-outer-graph] [--dspark-gpu-pq] [--gpu-full-vocab] [--split-depth-mix] [--batch-qkv-control-t1] [--expert-dense-device N --expert-replica-device N "
+            "[--split-prelude-core]]] [--loop-predict CUT MATRIX] [--dspark-adaptive] [--dspark-outer-graph] [--dspark-gpu-pq] [--gpu-full-vocab] [--split-depth-mix] [--batch-qkv-control-t1] [--expert-dense-device N --expert-replica-device N "
             "--expert-hot-mib MiB [--expert-replica-async]] [--draft DRAFT.gguf --spec K] [--bench] [--serve]\n");
         return 2;
     }
@@ -3487,6 +3520,11 @@ int run(int argc, char** argv) {
     }
     if (split_full_attn_remote && (layer_split_device < 0 || !kv_q8 || !draft_path.empty() || expert_replica_device >= 0)) {
         std::fprintf(stderr, "strata-inkling2: remote full attention requires layer split, Q8, no DSpark or replica\n");
+        return 2;
+    }
+    if (loop_cut >= 0 && (!serve || layer_split_device < 0 || split_full_attn_remote ||
+        split_prelude || !kv_q8 || !draft_path.empty() || profile || profile_detail || loop_matrix.empty())) {
+        std::fprintf(stderr,"--loop-predict requires --serve with a local Q8 KV layer split and draft off\n");
         return 2;
     }
     if (split_core_graph && layer_split_device < 0) {
@@ -3620,6 +3658,7 @@ int run(int argc, char** argv) {
         std::fprintf(stderr, "strata-inkling2: expert placement failed: %s\n", err.c_str());
         return 1;
     }
+    if (loop_cut >= 0 && !split_core->load_loop_predictor(loop_cut,loop_matrix)) return 2;
     if (split_core) {
         if (split_mtp_graph)
             std::fprintf(stderr, "strata-inkling2: DSpark outer graphs requested, eligible=%d, verify T=%d\n",
@@ -3752,13 +3791,15 @@ int run(int argc, char** argv) {
                 }
 
                 // Prefix / KV cache reuse along live_tokens & saved SWA/conv checkpoints
+                const bool exact_live_prefix = !E.predict_during_decode;
+                E.predict_during_decode = false;
                 const size_t max_possible = prompt.size() - 1;
                 size_t lcp_live = 0;
                 const size_t lim_live = std::min(live_tokens.size(), max_possible);
                 while (lcp_live < lim_live && live_tokens[lcp_live] == prompt[lcp_live]) ++lcp_live;
 
                 size_t reuse = 0;
-                if (lcp_live == live_tokens.size()) {
+                if (exact_live_prefix && lcp_live == live_tokens.size()) {
                     reuse = lcp_live;
                 } else {
                     int best_idx = -1;
@@ -3818,6 +3859,10 @@ int run(int argc, char** argv) {
                         snaps.push_back(E.save_checkpoint(live_tokens));
                         if (snaps.size() > kMaxSnaps) snaps.erase(snaps.begin());
                     }
+                }
+                if (loop_cut >= 0) {
+                    split_core->clear_loop_feedback();
+                    E.predict_during_decode = true;
                 }
                 const double pp_ms = ms_since(t_pp0);
                 if (sample_on && !stop_req.load(std::memory_order_acquire)) {

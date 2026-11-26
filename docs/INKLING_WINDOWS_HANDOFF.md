@@ -10,6 +10,12 @@ Il fork incorpora il commit upstream `22ce0b8c2d605f265421d893541663c1843301cd`.
 - `strata-inkling2-upstream` usa il runtime Inkling della base aggiornata e le librerie comuni del fork. Serve per i confronti a una GPU.
 - Le modifiche upstream a Engine e DSpark sono disponibili nel secondo eseguibile. Il porting nel motore a due schede va verificato funzionalità per funzionalità.
 
+### Predizione opzionale del terzo giro
+
+Nel server CUDA a due schede `--loop-predict CUT MATRIX` anticipa il terzo giro dopo 0, 4, 8 o 12 layer del primo. Il prefill rimane completo. Durante il decode, la GPU del core esegue il terzo giro sullo stato stimato e consegna il risultato alla GPU esterna. Quest'ultima esegue gli ultimi sei layer e la testa di uscita mentre il core completa il lavoro differito. Il residuo misurato corregge la stima del token successivo. Il token emesso può differire dal greedy del percorso sequenziale.
+
+Occorrono `--serve`, `--kv-q8`, `--layer-split-device`, tutti gli esperti del core residenti e DSpark spento. Senza la nuova opzione si usa il decode ordinario. Usare la matrice calibrata per il proprio taglio e modello. Il formato consiste in 4608 × 4608 float32 little-endian ordinati per riga (ingressi per uscite), seguiti da 4608 bias. Il vettore di ingresso concatena l'ultimo blocco residuo normalizzato disponibile e lo stato corrente normalizzato; l'uscita stima le due componenti all'ingresso del terzo giro. I benchmark devono confrontare i token su prefissi identici e valutare separatamente la generazione libera.
+
 ## Perimetro
 
 - Repository: https://github.com/imanu86/Strata-Inkling, branch `main`.
